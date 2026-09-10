@@ -4,15 +4,16 @@ import { ShotError, fail } from './errors.js';
 import { NotionStore, databaseIdFromUrl } from './notion.js';
 import { ChatGPTBrowser } from './browser.js';
 import { call, ensureService, healthy, login, runService, stopService } from './http-service.js';
+import { installCancellationHandler } from './cancellation.js';
 const out = (value: string) => process.stdout.write(`${value}\n`);
 async function main(args: string[]) {
   const [command, ...rest] = args;
   if (command === 'config') {
     const [action, key, ...valueParts] = rest; const state = paths();
     if (action === 'path' && !key) return out(state.envPath);
-    if (action === 'show' && !key) { const values = readConfigValues(state); return out(`configuration: ${state.envPath}\nNOTION_TOKEN: ${values.NOTION_TOKEN ? 'set' : 'missing'}\nCHATGPT_SHOT_NOTION_DATABASE_URL: ${values.CHATGPT_SHOT_NOTION_DATABASE_URL ? 'set' : 'missing'}`); }
-    if (action === 'set' && (key === 'NOTION_TOKEN' || key === 'CHATGPT_SHOT_NOTION_DATABASE_URL') && valueParts.length) { setConfigValue(key as ConfigKey, valueParts.join(' '), state); return out(`saved ${key}`); }
-    return fail('CONFIG_INVALID', 'Usage: chatgpt-shot config <path|show|set NOTION_TOKEN <value>|set CHATGPT_SHOT_NOTION_DATABASE_URL <url>>');
+    if (action === 'show' && !key) { const values = readConfigValues(state); return out(`configuration: ${state.envPath}\nNOTION_TOKEN: ${values.NOTION_TOKEN ? 'set' : 'missing'}\nCHATGPT_SHOT_NOTION_DATABASE_URL: ${values.CHATGPT_SHOT_NOTION_DATABASE_URL ? 'set' : 'missing'}\nCHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS: ${values.CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS ?? '45000 (default)'}\nCHATGPT_SHOT_EXECUTION_TIMEOUT_MS: ${values.CHATGPT_SHOT_EXECUTION_TIMEOUT_MS ?? '900000 (default)'}`); }
+    if (action === 'set' && (key === 'NOTION_TOKEN' || key === 'CHATGPT_SHOT_NOTION_DATABASE_URL' || key === 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS' || key === 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS') && valueParts.length) { setConfigValue(key as ConfigKey, valueParts.join(' '), state); return out(`saved ${key}`); }
+    return fail('CONFIG_INVALID', 'Usage: chatgpt-shot config <path|show|set KEY VALUE>');
   }
   const config = loadConfig(); const databaseId = databaseIdFromUrl(config.databaseUrl);
   if (command === '__service') return runService();
@@ -24,7 +25,7 @@ async function main(args: string[]) {
   if (command === 'port') { const record = await healthy(config); if (!record) return fail('BROWSER_UNAVAILABLE', 'No healthy chatgpt-shot Service is running.'); out(String(record.port)); return; }
   if (command === 'stop') { await stopService(config); out('chatgpt-shot Service stopped.'); return; }
   if (command === 'doctor') { const store = new NotionStore(config.notionToken); store.validateSchema(await store.database(databaseId)); const browser = new ChatGPTBrowser(config.browserProfilePath); await browser.withBrowser(async () => { await browser.ensureAvailable(); await browser.ensureAuthenticated(); await browser.openFreshContext(); }); out('OK: user configuration, Invocation database, browser profile, authenticated ChatGPT session, and composer are available. ChatGPT-to-Notion write access is not verified; confirm it with a smoke submit.'); return; }
-  if (command === 'submit') { const prompt = rest.length === 1 ? rest[0] : undefined; if (!prompt) return fail('CONFIG_INVALID', 'Usage: chatgpt-shot submit "<prompt>"'); const record = await ensureService(config); out((await call<{ result: string }>(record, '/submit', { prompt })).result); return; }
+  if (command === 'submit') { const prompt = rest.length === 1 ? rest[0] : undefined; if (!prompt) return fail('CONFIG_INVALID', 'Usage: chatgpt-shot submit "<prompt>"'); const record = await ensureService(config); const controller = new AbortController(); const remove = installCancellationHandler(async () => controller.abort()); try { out((await call<{ result: string }>(record, '/submit', { prompt }, controller.signal)).result); } finally { remove(); } return; }
   fail('CONFIG_INVALID', 'Usage: chatgpt-shot <config|init|login|doctor|start|status|port|submit|stop>');
 }
 main(process.argv.slice(2)).catch(e => { if (e instanceof ShotError) { process.stderr.write(`${e.code}: ${e.message}\n`); process.exitCode = 1; } else { process.stderr.write(`INTERNAL_ERROR: ${e instanceof Error ? e.message : String(e)}\n`); process.exitCode = 1; } });

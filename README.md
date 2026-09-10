@@ -22,6 +22,13 @@ chatgpt-shot config set CHATGPT_SHOT_NOTION_DATABASE_URL 'https://www.notion.so/
 chatgpt-shot config show
 ```
 
+Optional user-level lifecycle limits are milliseconds; defaults are 45 seconds for acknowledgement and 15 minutes for execution:
+
+```sh
+chatgpt-shot config set CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS 45000
+chatgpt-shot config set CHATGPT_SHOT_EXECUTION_TIMEOUT_MS 1800000
+```
+
 `config show` deliberately reports only whether values are set; it never prints the token. `config path` prints the actual configuration-file path if you need it. The file is user-owned and mode `0600`; its default location is `~/.config/chatgpt-shot/.env` (or `$XDG_CONFIG_HOME/chatgpt-shot/.env`). Do not commit it. A running Service reloads this file for every newly accepted submission, so the next `submit` uses a successfully saved token/database setting; work already accepted keeps its own original Invocation configuration.
 
 Create or validate the configured Invocation database, then log in to ChatGPT once in normal headed Chrome:
@@ -61,5 +68,15 @@ chatgpt-shot stop
 ```
 
 The Service binds only `127.0.0.1` on an OS-selected port. Its owner-only discovery record supplies an ephemeral bearer credential; independent local consumers use that authenticated HTTP contract for health, submission, and stop operations. Persistent Chrome session data lives at `~/.local/share/chatgpt-shot/chrome-profile` by default and runtime discovery at `~/.cache/chatgpt-shot/runtime.json`; XDG overrides apply.
+
+## Local HTTP contract
+
+The discovery record is JSON at `$XDG_CACHE_HOME/chatgpt-shot/runtime.json` (default `~/.cache/chatgpt-shot/runtime.json`), mode `0600`. It contains `{ pid, host, port, protocolVersion, credential }`. Treat it as discovery only: call health before trusting it. All requests use `Authorization: Bearer <credential>` and bind to the record's `127.0.0.1:port`.
+
+- `GET /health` returns `200 { "pid", "protocolVersion", "accepting" }` for the current Service.
+- `POST /submit` accepts `{ "prompt": "..." }` and keeps the response open for that invocation's configured lifecycle. It returns `200 { "result": "completed Notion Result" }`. Concurrent requests receive distinct Invocations and never share results.
+- `POST /stop` accepts `{}` and returns `200 { "stopping": true }`; new submissions are rejected while accepted work drains.
+
+Service failures return JSON `{ "code", "message" }` with a non-200 status. Defined application codes—including `CHATGPT_AUTH_REQUIRED`, `SUBMISSION_UNCERTAIN`, `ACKNOWLEDGMENT_TIMEOUT`, `EXECUTION_TIMEOUT`, `INVOCATION_FAILED`, and `INVOCATION_CANCELLED`—must be handled by consumers rather than collapsed into a generic transport error. A client disconnect cancels that client’s local Invocation wait and closes only its browser page; it does not stop other submissions or the Service. A prompt already accepted by ChatGPT may still have remote effects, so do not automatically resubmit an `INVOCATION_CANCELLED` or `SUBMISSION_UNCERTAIN` request.
 
 The local `NOTION_TOKEN` and ChatGPT account's Notion connection are separate. `doctor` checks local Notion access and browser readiness, but one manually authenticated `submit` is the authoritative check that ChatGPT can update the Notion record and publish its Result.

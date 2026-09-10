@@ -5,7 +5,7 @@ import dotenv from 'dotenv';
 import { fail } from './errors.js';
 
 export type Paths = { configDirectory: string; dataDirectory: string; runtimeDirectory: string; envPath: string; browserProfilePath: string; discoveryPath: string; lockPath: string };
-export type Config = Paths & { notionToken: string; databaseUrl: string };
+export type Config = Paths & { notionToken: string; databaseUrl: string; acknowledgementMs: number; executionMs: number };
 const xdg = (variable: 'XDG_CONFIG_HOME'|'XDG_DATA_HOME'|'XDG_CACHE_HOME', fallback: string) => process.env[variable]?.trim() || join(homedir(), fallback);
 export function paths(): Paths {
   const configDirectory = join(xdg('XDG_CONFIG_HOME', '.config'), 'chatgpt-shot');
@@ -20,10 +20,11 @@ export function loadConfig(): Config {
   const env = dotenv.parse(readFileSync(envPath));
   if (!env.NOTION_TOKEN?.trim()) fail('CONFIG_INVALID', 'NOTION_TOKEN is required in the chatgpt-shot user configuration.');
   if (!env.CHATGPT_SHOT_NOTION_DATABASE_URL?.trim()) fail('CONFIG_INVALID', 'CHATGPT_SHOT_NOTION_DATABASE_URL is required in the chatgpt-shot user configuration.');
-  return { ...state, notionToken: env.NOTION_TOKEN, databaseUrl: env.CHATGPT_SHOT_NOTION_DATABASE_URL };
+  const timeout = (key: ConfigKey, fallback: number) => { const raw = env[key]?.trim(); if (!raw) return fallback; const value = Number(raw); if (!Number.isSafeInteger(value) || value <= 0) fail('CONFIG_INVALID', `${key} must be a positive integer in milliseconds.`); return value; };
+  return { ...state, notionToken: env.NOTION_TOKEN, databaseUrl: env.CHATGPT_SHOT_NOTION_DATABASE_URL, acknowledgementMs: timeout('CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS', 45_000), executionMs: timeout('CHATGPT_SHOT_EXECUTION_TIMEOUT_MS', 15 * 60_000) };
 }
-export type ConfigKey = 'NOTION_TOKEN' | 'CHATGPT_SHOT_NOTION_DATABASE_URL';
-const keys: ConfigKey[] = ['NOTION_TOKEN', 'CHATGPT_SHOT_NOTION_DATABASE_URL'];
+export type ConfigKey = 'NOTION_TOKEN' | 'CHATGPT_SHOT_NOTION_DATABASE_URL' | 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS' | 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS';
+const keys: ConfigKey[] = ['NOTION_TOKEN', 'CHATGPT_SHOT_NOTION_DATABASE_URL', 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS', 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS'];
 export function readConfigValues(state = paths()): Partial<Record<ConfigKey, string>> {
   if (!existsSync(state.envPath)) return {};
   const parsed = dotenv.parse(readFileSync(state.envPath));
@@ -31,7 +32,7 @@ export function readConfigValues(state = paths()): Partial<Record<ConfigKey, str
 }
 export function setConfigValue(key: ConfigKey, value: string, state = paths()): void {
   if (!keys.includes(key)) fail('CONFIG_INVALID', `Unsupported configuration key ${key}.`);
-  if (!value.trim()) fail('CONFIG_INVALID', `${key} cannot be empty.`);
+  if (!value.trim()) fail('CONFIG_INVALID', `${key} cannot be empty.`); if ((key === 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS' || key === 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS') && (!Number.isSafeInteger(Number(value)) || Number(value) <= 0)) fail('CONFIG_INVALID', `${key} must be a positive integer in milliseconds.`);
   const values = { ...readConfigValues(state), [key]: value.trim() };
   const body = keys.filter(name => values[name]).map(name => `${name}=${JSON.stringify(values[name])}`).join('\n').concat('\n');
   const temporary = `${state.envPath}.${process.pid}.tmp`;
