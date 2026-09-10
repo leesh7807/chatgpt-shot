@@ -17,22 +17,32 @@ function removeDiscovery(config: Config, credential?: string) { const current = 
 export async function call<T>(record: Discovery, path: string, body?: unknown): Promise<T> { return await new Promise<T>((resolve, reject) => { const payload = body === undefined ? undefined : JSON.stringify(body); const req = httpRequest({ host: record.host, port: record.port, path, method: body === undefined ? 'GET' : 'POST', headers: { authorization: `Bearer ${record.credential}`, ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}) }, timeout: 10_000 }, res => { let text = ''; res.setEncoding('utf8'); res.on('data', c => text += c); res.on('end', () => { try { const parsed = JSON.parse(text); if (res.statusCode !== 200) { const error: any = new Error(parsed.message); error.code = parsed.code; reject(error); } else resolve(parsed as T); } catch (error) { reject(error); } }); }); req.once('error', reject); req.once('timeout', () => req.destroy(new Error('Service request timed out.'))); if (payload) req.write(payload); req.end(); }); }
 export async function healthy(config = loadConfig()): Promise<Discovery | undefined> { const record = readDiscovery(config); if (!record) return undefined; try { const status = await call<{ pid: number; protocolVersion: number }>(record, '/health'); return status.pid === record.pid && status.protocolVersion === 1 ? record : undefined; } catch { return undefined; } }
 function processAlive(pid: number) { try { process.kill(pid, 0); return true; } catch { return false; } }
-function lock(config: Config): number | undefined { try { return openSync(config.lockPath, 'wx', 0o600); } catch { return undefined; } }
+type StartupRecord = { pid: number; token: string };
+type StartupLock = StartupRecord & { fd: number };
+function readStartup(config: Config): StartupRecord | undefined { try { const record = JSON.parse(readFileSync(config.lockPath, 'utf8')); return Number.isInteger(record?.pid) && typeof record?.token === 'string' ? record : undefined; } catch { return undefined; } }
+function lock(config: Config): StartupLock | undefined { try { const fd = openSync(config.lockPath, 'wx', 0o600); const record = { pid: process.pid, token: randomBytes(24).toString('base64url') }; writeFileSync(fd, JSON.stringify(record)); chmodSync(config.lockPath, 0o600); return { fd, ...record }; } catch { return undefined; } }
+function releaseStartup(config: Config, token: string, fd?: number) { try { if (readStartup(config)?.token === token) unlinkSync(config.lockPath); } catch {} finally { if (fd !== undefined) try { closeSync(fd); } catch {} } }
+function reclaimStaleStartup(config: Config): boolean { const owner = readStartup(config); if (owner && processAlive(owner.pid)) return false; try { unlinkSync(config.lockPath); return true; } catch { return false; } }
+function claimStartup(config: Config, token: string): boolean { const owner = readStartup(config); if (owner?.token !== token) return false; writeFileSync(config.lockPath, JSON.stringify({ pid: process.pid, token }), { mode: 0o600 }); chmodSync(config.lockPath, 0o600); return true; }
 export async function ensureService(config = loadConfig()): Promise<Discovery> {
-  const existing = await healthy(config); if (existing) return existing;
-  const fd = lock(config);
-  if (fd !== undefined) {
-    try { removeDiscovery(config); const child = spawn(process.execPath, [...process.execArgv, process.argv[1], '__service'], { detached: true, stdio: 'ignore', env: process.env }); child.unref(); }
-    finally { closeSync(fd); try { unlinkSync(config.lockPath); } catch {} }
+  for (let n = 0; n < 100; n++) {
+    const existing = await healthy(config); if (existing) return existing;
+    const stale = readDiscovery(config); if (stale && !processAlive(stale.pid)) removeDiscovery(config);
+    const startup = lock(config);
+    if (!startup) { reclaimStaleStartup(config); await delay(100); continue; }
+    const child = spawn(process.execPath, [...process.execArgv, process.argv[1], '__service'], { detached: true, stdio: 'ignore', env: { ...process.env, CHATGPT_SHOT_STARTUP_TOKEN: startup.token } }); child.unref();
+    try {
+      for (let wait = 0; wait < 100; wait++) { const found = await healthy(config); if (found) return found; await delay(100); }
+      if (child.exitCode === null) child.kill('SIGTERM');
+    } finally { releaseStartup(config, startup.token, startup.fd); }
   }
-  for (let n = 0; n < 100; n++) { const found = await healthy(config); if (found) return found; const stale = readDiscovery(config); if (stale && !processAlive(stale.pid)) removeDiscovery(config); await delay(100); }
   return fail('BROWSER_UNAVAILABLE', 'Could not start a healthy chatgpt-shot Service.') as never;
 }
 export async function stopService(config = loadConfig()): Promise<void> { const record = await healthy(config); if (!record) { removeDiscovery(config); return; } await call(record, '/stop', {}); for (let n = 0; n < 100; n++) { if (!await healthy(config)) return; await delay(100); } fail('BROWSER_UNAVAILABLE', 'Service did not stop cleanly.'); }
 export async function login(config = loadConfig()) { await stopService(config); await manualLogin(config.browserProfilePath); }
 export async function runService(): Promise<void> {
-  const config = loadConfig(); const credential = randomBytes(32).toString('base64url'); let stopping = false; let active = 0; let server: ReturnType<typeof createServer>;
-  const stop = async () => { if (stopping) return; stopping = true; if (active) await new Promise<void>(resolve => { const timer = setInterval(() => { if (!active) { clearInterval(timer); resolve(); } }, 25); }); await shutdownBroker(config.browserProfilePath); await new Promise<void>(resolve => server.close(() => resolve())); removeDiscovery(config, credential); };
+  const config = loadConfig(); const startupToken = process.env.CHATGPT_SHOT_STARTUP_TOKEN; if (!startupToken || !claimStartup(config, startupToken)) return fail('BROWSER_UNAVAILABLE', 'Service startup ownership was superseded.') as never; const credential = randomBytes(32).toString('base64url'); let stopping = false; let active = 0; let server: ReturnType<typeof createServer>;
+  const stop = async () => { if (stopping) return; stopping = true; if (active) await new Promise<void>(resolve => { const timer = setInterval(() => { if (!active) { clearInterval(timer); resolve(); } }, 25); }); await shutdownBroker(config.browserProfilePath); await new Promise<void>(resolve => server.close(() => resolve())); removeDiscovery(config, credential); releaseStartup(config, startupToken); };
   server = createServer(async (req, res) => { const unauthorized = () => { res.writeHead(401, { 'content-type': 'application/json' }); res.end(JSON.stringify({ code: 'UNAUTHORIZED', message: 'A current service credential is required.' })); };
     if (req.headers.authorization !== `Bearer ${credential}`) return unauthorized();
     if (req.url === '/health' && req.method === 'GET') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ pid: process.pid, protocolVersion: 1, accepting: !stopping })); }
