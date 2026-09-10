@@ -3,11 +3,10 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { call, SUBMIT_TRANSPORT_TIMEOUT_MS } from '../src/http-service.js';
-import { DEFAULT_ACKNOWLEDGEMENT_MS, DEFAULT_EXECUTION_MS } from '../src/service.js';
 import { ShotError } from '../src/errors.js';
 
-test('keeps submit transport open beyond the defined invocation lifecycle', () => {
-  assert.ok(SUBMIT_TRANSPORT_TIMEOUT_MS >= DEFAULT_ACKNOWLEDGEMENT_MS + DEFAULT_EXECUTION_MS);
+test('does not give submit a shorter client-side transport timeout', () => {
+  assert.equal(SUBMIT_TRANSPORT_TIMEOUT_MS, 0);
 });
 
 test('restores a defined Service failure code at the HTTP client boundary', async () => {

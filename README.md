@@ -49,7 +49,7 @@ printf '%s\n' "$result"
 
 Behind the command, the Service creates a fresh Notion Invocation record with its own UUID, opens a fresh ChatGPT page, and sends ChatGPT the record link and delivery protocol. ChatGPT first acknowledges the record by changing `pending` to `in_progress`, then writes the complete Result into that same page and changes it to `completed`. The CLI reads that completed page body back; it does not treat the ChatGPT assistant message as the result. On success, standard output contains only that Result; errors are reported on standard error.
 
-If the request cannot be safely confirmed after browser submission, `submit` fails rather than silently sending a duplicate prompt. A failure state includes the Invocation Error; an execution timeout means the local wait ended and the Notion record can be inspected for later progress. The submit transport remains open for the full defined acknowledgment/execution lifecycle rather than using the short control-request timeout.
+If the request cannot be safely confirmed after browser submission, `submit` fails rather than silently sending a duplicate prompt. A failure state includes the Invocation Error; an execution timeout means the local wait ended and the Notion record can be inspected for later progress. Unlike short health/control requests, submit has no separate client-side HTTP timeout: its Invocation lifecycle defines the normal terminal outcome.
 
 `submit` starts the local Service when necessary. You normally do not need to manage it. For diagnostics or an orderly shutdown:
 
