@@ -1,34 +1,53 @@
 # chatgpt-shot
 
-Standalone local utility for a one-shot ChatGPT task whose authoritative result is read from its completed Notion Invocation record.
+`chatgpt-shot` is a local, one-shot task utility. You submit a prompt; ChatGPT Web performs the work; the completed Result is read back from the matching Notion Invocation record and returned to you.
 
-Install and build:
+It is not tied to the directory you run it from. Your project files, Git repository, and project `.env` are never used.
+
+## First-time setup
+
+Install from this repository, then build it:
 
 ```sh
 npm ci
 npm run build
 ```
 
-Configure only the user-owned file `$XDG_CONFIG_HOME/chatgpt-shot/.env` (default: `~/.config/chatgpt-shot/.env`):
-
-```dotenv
-NOTION_TOKEN=...
-CHATGPT_SHOT_NOTION_DATABASE_URL=https://www.notion.so/...
-```
-
-Persistent Chrome data is `$XDG_DATA_HOME/chatgpt-shot/chrome-profile`; runtime discovery is the owner-only `$XDG_CACHE_HOME/chatgpt-shot/runtime.json` (with conventional `~/.local/share` and `~/.cache` fallbacks). No caller repository file, working directory, or `.env` is used.
+Set the two required values without opening an editor or locating a dotfile:
 
 ```sh
-chatgpt-shot init
-chatgpt-shot login
-chatgpt-shot start
-chatgpt-shot status
-chatgpt-shot port
-chatgpt-shot doctor
-chatgpt-shot submit 'your task'
-chatgpt-shot stop
+node dist/cli.js config set NOTION_TOKEN 'secret_notion_token'
+node dist/cli.js config set CHATGPT_SHOT_NOTION_DATABASE_URL 'https://www.notion.so/your-invocation-database'
+node dist/cli.js config show
 ```
 
-The Service binds only `127.0.0.1` on an OS-selected port. Consumers read the discovery record and must send its ephemeral bearer credential to `/health`, `/submit`, or `/stop`; `submit` uses this same HTTP boundary and starts a healthy service when necessary. `stop` stops accepting work, waits for accepted work, then releases Chrome and the profile.
+`config show` deliberately reports only whether values are set; it never prints the token. `config path` prints the actual configuration-file path if you need it. The file is user-owned and mode `0600`; its default location is `~/.config/chatgpt-shot/.env` (or `$XDG_CONFIG_HOME/chatgpt-shot/.env`). Do not commit it.
 
-`login` opens headed system Chrome for manual authentication and first stops the Service to hand off profile ownership safely. The Notion API token and the ChatGPT account's Notion connection are separate authorizations. `doctor` checks local configuration and browser readiness, but a manually authenticated `submit` remains the authoritative verification of ChatGPT-to-Notion write access.
+Create or validate the configured Invocation database, then log in to ChatGPT once in normal headed Chrome:
+
+```sh
+node dist/cli.js init
+node dist/cli.js login
+node dist/cli.js doctor
+```
+
+`login` waits for you to finish manual authentication and close Chrome. It never enters credentials for you.
+
+## Everyday use
+
+```sh
+node dist/cli.js submit 'Summarize the attached material and write the result to the Invocation record.'
+```
+
+`submit` starts the local Service when necessary. You normally do not need to manage it. For diagnostics or an orderly shutdown:
+
+```sh
+node dist/cli.js start
+node dist/cli.js status
+node dist/cli.js port
+node dist/cli.js stop
+```
+
+The Service binds only `127.0.0.1` on an OS-selected port. Its owner-only discovery record supplies an ephemeral bearer credential; independent local consumers use that authenticated HTTP contract for health, submission, and stop operations. Persistent Chrome session data lives at `~/.local/share/chatgpt-shot/chrome-profile` by default and runtime discovery at `~/.cache/chatgpt-shot/runtime.json`; XDG overrides apply.
+
+The local `NOTION_TOKEN` and ChatGPT account's Notion connection are separate. `doctor` checks local Notion access and browser readiness, but one manually authenticated `submit` is the authoritative check that ChatGPT can update the Notion record and publish its Result.

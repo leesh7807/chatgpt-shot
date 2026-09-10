@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, chmodSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import dotenv from 'dotenv';
@@ -21,4 +21,19 @@ export function loadConfig(): Config {
   if (!env.NOTION_TOKEN?.trim()) fail('CONFIG_INVALID', 'NOTION_TOKEN is required in the chatgpt-shot user configuration.');
   if (!env.CHATGPT_SHOT_NOTION_DATABASE_URL?.trim()) fail('CONFIG_INVALID', 'CHATGPT_SHOT_NOTION_DATABASE_URL is required in the chatgpt-shot user configuration.');
   return { ...state, notionToken: env.NOTION_TOKEN, databaseUrl: env.CHATGPT_SHOT_NOTION_DATABASE_URL };
+}
+export type ConfigKey = 'NOTION_TOKEN' | 'CHATGPT_SHOT_NOTION_DATABASE_URL';
+const keys: ConfigKey[] = ['NOTION_TOKEN', 'CHATGPT_SHOT_NOTION_DATABASE_URL'];
+export function readConfigValues(state = paths()): Partial<Record<ConfigKey, string>> {
+  if (!existsSync(state.envPath)) return {};
+  const parsed = dotenv.parse(readFileSync(state.envPath));
+  return Object.fromEntries(keys.filter(key => parsed[key]?.trim()).map(key => [key, parsed[key].trim()])) as Partial<Record<ConfigKey, string>>;
+}
+export function setConfigValue(key: ConfigKey, value: string, state = paths()): void {
+  if (!keys.includes(key)) fail('CONFIG_INVALID', `Unsupported configuration key ${key}.`);
+  if (!value.trim()) fail('CONFIG_INVALID', `${key} cannot be empty.`);
+  const values = { ...readConfigValues(state), [key]: value.trim() };
+  const body = keys.filter(name => values[name]).map(name => `${name}=${JSON.stringify(values[name])}`).join('\n').concat('\n');
+  const temporary = `${state.envPath}.${process.pid}.tmp`;
+  writeFileSync(temporary, body, { mode: 0o600 }); chmodSync(temporary, 0o600); renameSync(temporary, state.envPath); chmodSync(state.envPath, 0o600);
 }
