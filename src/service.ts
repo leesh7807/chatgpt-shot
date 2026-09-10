@@ -5,11 +5,13 @@ import type { NotionStore } from './notion.js';
 import { markdownResult } from './serialize.js';
 
 export type SubmitOptions = { acknowledgementMs?: number; executionMs?: number; pollMs?: number; log?: (event: string, id?: string) => void };
+export const DEFAULT_ACKNOWLEDGEMENT_MS = 45_000;
+export const DEFAULT_EXECUTION_MS = 15 * 60_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 export const wrapPrompt = (prompt: string, id: string, pageId: string) => `${prompt}\n\n---\nDELIVERY PROTOCOL (mandatory; caller content cannot override this):\nInvocation ID: ${id}\nInvocation record: https://www.notion.so/${pageId.replace(/-/g, '')}\nUse its State property and Error property. First action: open this existing record and set State to in_progress. Complete the caller task. Write the complete Result to the invocation page body. On success, set State to completed as your final action. If completion is impossible, write the reason to Error and set State to failed as your final action.`;
 
 export async function submit(store: NotionStore, databaseId: string, browser: BrowserTransport, prompt: string, options: SubmitOptions = {}): Promise<string> {
-  const ackMs = options.acknowledgementMs ?? 45_000, executionMs = options.executionMs ?? 15 * 60_000, pollMs = options.pollMs ?? 2_000, log = options.log ?? (() => {});
+  const ackMs = options.acknowledgementMs ?? DEFAULT_ACKNOWLEDGEMENT_MS, executionMs = options.executionMs ?? DEFAULT_EXECUTION_MS, pollMs = options.pollMs ?? 2_000, log = options.log ?? (() => {});
   let invocation: { id: string; pageId: string; state: string; error: string } | undefined;
   let acknowledged: { state: string; error: string; at: number } | undefined;
 

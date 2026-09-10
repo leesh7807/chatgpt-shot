@@ -22,7 +22,7 @@ chatgpt-shot config set CHATGPT_SHOT_NOTION_DATABASE_URL 'https://www.notion.so/
 chatgpt-shot config show
 ```
 
-`config show` deliberately reports only whether values are set; it never prints the token. `config path` prints the actual configuration-file path if you need it. The file is user-owned and mode `0600`; its default location is `~/.config/chatgpt-shot/.env` (or `$XDG_CONFIG_HOME/chatgpt-shot/.env`). Do not commit it.
+`config show` deliberately reports only whether values are set; it never prints the token. `config path` prints the actual configuration-file path if you need it. The file is user-owned and mode `0600`; its default location is `~/.config/chatgpt-shot/.env` (or `$XDG_CONFIG_HOME/chatgpt-shot/.env`). Do not commit it. A running Service reloads this file for every newly accepted submission, so the next `submit` uses a successfully saved token/database setting; work already accepted keeps its own original Invocation configuration.
 
 Create or validate the configured Invocation database, then log in to ChatGPT once in normal headed Chrome:
 
@@ -49,7 +49,7 @@ printf '%s\n' "$result"
 
 Behind the command, the Service creates a fresh Notion Invocation record with its own UUID, opens a fresh ChatGPT page, and sends ChatGPT the record link and delivery protocol. ChatGPT first acknowledges the record by changing `pending` to `in_progress`, then writes the complete Result into that same page and changes it to `completed`. The CLI reads that completed page body back; it does not treat the ChatGPT assistant message as the result. On success, standard output contains only that Result; errors are reported on standard error.
 
-If the request cannot be safely confirmed after browser submission, `submit` fails rather than silently sending a duplicate prompt. A failure state includes the Invocation Error; an execution timeout means the local wait ended and the Notion record can be inspected for later progress.
+If the request cannot be safely confirmed after browser submission, `submit` fails rather than silently sending a duplicate prompt. A failure state includes the Invocation Error; an execution timeout means the local wait ended and the Notion record can be inspected for later progress. The submit transport remains open for the full defined acknowledgment/execution lifecycle rather than using the short control-request timeout.
 
 `submit` starts the local Service when necessary. You normally do not need to manage it. For diagnostics or an orderly shutdown:
 
