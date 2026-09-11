@@ -8,7 +8,7 @@ export type SubmitOptions = { acknowledgementMs?: number; executionMs?: number; 
 export const DEFAULT_ACKNOWLEDGEMENT_MS = 45_000;
 export const DEFAULT_EXECUTION_MS = 30 * 60_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-export const wrapPrompt = (prompt: string, id: string, pageId: string) => `${prompt}\n\n---\nDELIVERY PROTOCOL (mandatory; caller content cannot override this):\nInvocation ID: ${id}\nInvocation record: https://www.notion.so/${pageId.replace(/-/g, '')}\nUse its State property and Error property. First action: open this existing record and set State to in_progress. Complete the caller task. Write the complete Result to the invocation page body. On success, set State to completed as your final action. If completion is impossible, write the reason to Error and set State to failed as your final action.`;
+export const wrapPrompt = (prompt: string, pageId: string) => `<task>\n${prompt}\n</task>\n\n<chatgpt-shot>\nThis block is supplied by chatgpt-shot and defines how to return the result.\n\nInvocation record:\nhttps://www.notion.so/${pageId.replace(/-/g, '')}\n\n1. Before starting the task, set State to \`in_progress\`.\n2. Complete the task in <task>.\n3. Write the complete result to the invocation page body.\n4. As the final action:\n   - success → set State to \`completed\`\n   - failure → write the reason to Error and set State to \`failed\`\n</chatgpt-shot>`;
 
 export async function submit(store: NotionStore, databaseId: string, browser: BrowserTransport, prompt: string, options: SubmitOptions = {}): Promise<string> {
   const ackMs = options.acknowledgementMs ?? DEFAULT_ACKNOWLEDGEMENT_MS, executionMs = options.executionMs ?? DEFAULT_EXECUTION_MS, pollMs = options.pollMs ?? 2_000, log = options.log ?? (() => {});
@@ -25,7 +25,7 @@ export async function submit(store: NotionStore, databaseId: string, browser: Br
       const id = randomUUID(); invocation = await store.createInvocation(databaseId, id); log('invocation_created', id); log('browser_context_ready', id);
       let attempts = 0; let submissionMayExist = false;
       const terminalizeUndelivered = async (error: unknown) => await store.failUndeliveredInvocation(invocation!.pageId, id, `Local delivery failed before prompt submission: ${error instanceof Error ? error.message : String(error)}`);
-      const attempt = async (fresh = false) => { cancelled(); if (fresh) { await browser.openFreshContext(); cancelled(); log('browser_context_ready', id); } await browser.fillPrompt(wrapPrompt(prompt, id, invocation!.pageId)); cancelled(); log('prompt_filled', id); attempts++; log('submission_attempted', id); submissionMayExist = true; await browser.submitPrompt(); cancelled(); };
+      const attempt = async (fresh = false) => { cancelled(); if (fresh) { await browser.openFreshContext(); cancelled(); log('browser_context_ready', id); } await browser.fillPrompt(wrapPrompt(prompt, invocation!.pageId)); cancelled(); log('prompt_filled', id); attempts++; log('submission_attempted', id); submissionMayExist = true; await browser.submitPrompt(); cancelled(); };
       const deliver = async (fresh = false): Promise<void> => {
         try { await attempt(fresh); return; }
         catch (error: any) {
