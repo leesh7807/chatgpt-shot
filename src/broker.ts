@@ -1,15 +1,15 @@
 import { ChildProcess, spawn } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { fail } from './errors.js';
 
 type Request = { operation: string; sessionId?: string; prompt?: string; invocationId?: string };
 type Response = { ok: true; value?: unknown } | { ok: false; code: string; message: string };
 type Message = { id?: number; sessionId?: string; result?: any; error?: { message: string } };
-type VirtualDisplay = { process: ChildProcess; display: string };
+type VirtualDisplay = { process: ChildProcess; display: string; authorizationPath: string };
 const uid = process.getuid?.();
 const ownedDirectory = (path: string) => { try { const stat = lstatSync(path); return stat.isDirectory() && (uid === undefined || stat.uid === uid) && (stat.mode & 0o022) === 0; } catch { return false; } };
 const runtimeBase = () => {
@@ -26,9 +26,11 @@ export const brokerSocket = (_profile: string) => join(runtimeDirectory(), 'brok
 const profile = (path: string) => path;
 const chrome = () => [process.env.CHATGPT_SHOT_BROWSER, '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome'].find((path): path is string => Boolean(path && existsSync(path)));
 const xvfb = () => 'Xvfb';
-export const privateDisplayArguments = ['-displayfd', '3', '-screen', '0', '1280x800x24', '-nolisten', 'tcp'];
+const xAuthorityField = (value: Buffer) => { const length = Buffer.alloc(2); length.writeUInt16BE(value.length); return Buffer.concat([length, value]); };
+export const privateXAuthority = (cookie: Buffer) => Buffer.concat([Buffer.from([0xff, 0xff]), xAuthorityField(Buffer.alloc(0)), xAuthorityField(Buffer.alloc(0)), xAuthorityField(Buffer.from('MIT-MAGIC-COOKIE-1')), xAuthorityField(cookie)]);
+export const privateDisplayArguments = (authorizationPath: string) => ['-auth', authorizationPath, '-displayfd', '3', '-screen', '0', '1280x800x24', '-nolisten', 'tcp'];
 export const chromeArguments = (directory: string) => [`--user-data-dir=${directory}`, '--profile-directory=Default', '--remote-debugging-pipe', '--no-first-run', '--no-default-browser-check', '--disable-background-mode', '--no-startup-window'];
-export const chromeEnvironment = (display?: string) => display ? { ...process.env, DISPLAY: display } : undefined;
+export const chromeEnvironment = (display?: string, authorizationPath?: string) => display ? { ...process.env, DISPLAY: display, ...(authorizationPath ? { XAUTHORITY: authorizationPath } : {}) } : undefined;
 export const privateDisplayFromOutput = (output: string): string | undefined => {
   const display = output.trim();
   return /^\d+$/.test(display) && Number(display) <= 65_535 ? `:${display}` : undefined;
@@ -36,10 +38,14 @@ export const privateDisplayFromOutput = (output: string): string | undefined => 
 
 async function startVirtualDisplay(): Promise<VirtualDisplay | undefined> {
   if (process.platform !== 'linux') return;
-  const child = spawn(xvfb(), privateDisplayArguments, { stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
+  const authorizationPath = join(runtimeDirectory(), `xvfb-${randomUUID()}.Xauthority`);
+  try { writeFileSync(authorizationPath, privateXAuthority(randomBytes(16)), { mode: 0o600, flag: 'wx' }); }
+  catch (error) { return fail('BROWSER_UNAVAILABLE', `Could not create private Xvfb authorization: ${error instanceof Error ? error.message : String(error)}`, error); }
+  const removeAuthorization = () => { try { unlinkSync(authorizationPath); } catch {} };
+  const child = spawn(xvfb(), privateDisplayArguments(authorizationPath), { stdio: ['ignore', 'ignore', 'pipe', 'pipe'] });
   const output = child.stdio[3] as NodeJS.ReadableStream | null;
   const error = child.stdio[2] as NodeJS.ReadableStream | null;
-  if (!output) { child.kill(); fail('BROWSER_UNAVAILABLE', 'Xvfb did not create its display-allocation pipe.'); }
+  if (!output) { child.kill(); removeAuthorization(); fail('BROWSER_UNAVAILABLE', 'Xvfb did not create its display-allocation pipe.'); }
   let stderr = '';
   error?.setEncoding('utf8'); error?.on('data', (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-2_000); });
   output!.setEncoding('utf8');
@@ -50,7 +56,7 @@ async function startVirtualDisplay(): Promise<VirtualDisplay | undefined> {
     const finish = (result?: VirtualDisplay, failure?: Error) => {
       if (settled) return;
       settled = true; clearTimeout(timeout); child.removeListener('error', failed); child.removeListener('exit', exited);
-      result ? resolve(result) : reject(failure!);
+      if (result) resolve(result); else { removeAuthorization(); reject(failure!); }
     };
     const detail = () => stderr.trim() ? `: ${stderr.trim()}` : '';
     const failed = (cause: Error) => {
@@ -69,7 +75,7 @@ async function startVirtualDisplay(): Promise<VirtualDisplay | undefined> {
       if (failing) return;
       allocation += chunk;
       const display = privateDisplayFromOutput(allocation);
-      if (display) finish({ process: child, display });
+      if (display) finish({ process: child, display, authorizationPath });
       else if (allocation.length > 32) failed(new Error(`Xvfb returned an invalid private display allocation: ${JSON.stringify(allocation)}`));
     });
   });
@@ -120,7 +126,7 @@ const authProbe = `()=>{${visibility}const c=[...document.querySelectorAll('a,bu
 const composerProbe = `()=>{${visibility}return [...document.querySelectorAll('textarea,[contenteditable="true"]')].some(visible)}`;
 
 class Broker {
-  private process?: ChildProcess; private display?: ChildProcess; private cdp?: PipeCdp; private control?: Page; private starting?: Promise<void>; private startingChild?: ChildProcess; private startingDisplay?: ChildProcess; private startingCdp?: PipeCdp; private stopping = false;
+  private process?: ChildProcess; private display?: VirtualDisplay; private cdp?: PipeCdp; private control?: Page; private starting?: Promise<void>; private startingChild?: ChildProcess; private startingDisplay?: VirtualDisplay; private startingCdp?: PipeCdp; private stopping = false;
   private readonly pages = new Map<string, Page>();
   constructor(private readonly root: string) {}
   private async runtime() {
@@ -134,26 +140,25 @@ class Broker {
     const directory = profile(this.root); mkdirSync(directory, { recursive: true, mode: 0o700 }); chmodSync(directory, 0o700);
     let virtual: VirtualDisplay | undefined; let child: ChildProcess | undefined; let cdp: PipeCdp | undefined;
     try {
-      virtual = await startVirtualDisplay(); this.startingDisplay = virtual?.process;
+      virtual = await startVirtualDisplay(); this.startingDisplay = virtual;
       // Chrome normally creates a visible New Tab on process launch. The broker creates and
       // navigates its own control target below, so suppress the otherwise unused startup tab.
       // Only this Chrome child receives the broker-owned display; the broker keeps its inherited DISPLAY.
-      child = spawn(executable!, chromeArguments(directory), { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'], env: chromeEnvironment(virtual?.display) }) as ChildProcess;
+      child = spawn(executable!, chromeArguments(directory), { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'], env: chromeEnvironment(virtual?.display, virtual?.authorizationPath) }) as ChildProcess;
       await new Promise<void>((resolve, reject) => { child!.once('spawn', resolve); child!.once('error', reject); });
       const input = child.stdio[3], output = child.stdio[4]; if (!input || !output) fail('BROWSER_UNAVAILABLE', 'Chrome did not create its private debugging pipe.');
       cdp = new PipeCdp(input as NodeJS.WritableStream, output as NodeJS.ReadableStream); this.startingChild = child; this.startingCdp = cdp;
-      const virtualProcess = virtual?.process;
       child.once('exit', () => {
         if (this.process === child) { this.process = undefined; this.cdp = undefined; this.control = undefined; this.pages.clear(); }
-        if (virtualProcess && virtualProcess === this.display) { this.display = undefined; void this.terminate(virtualProcess); }
+        if (virtual && virtual === this.display) { this.display = undefined; void this.terminateDisplay(virtual); }
       });
       const deadline = Date.now() + 150_000; const control = await this.createPage(cdp, deadline); await control.within(deadline, async () => { await control.navigate(); await this.ready(control); }); if (this.stopping) throw new Error('Broker shutdown began during startup.');
-      this.process = child; this.display = virtual?.process; this.cdp = cdp; this.control = control;
+      this.process = child; this.display = virtual; this.cdp = cdp; this.control = control;
     } catch (error) {
-      cdp?.close(); await this.terminate(child); await this.terminate(virtual?.process);
+      cdp?.close(); await this.terminate(child); await this.terminateDisplay(virtual);
       if ((error as any)?.code) throw error;
       fail('BROWSER_UNAVAILABLE', `Could not launch the private ChatGPT browser runtime: ${error instanceof Error ? error.message : String(error)}`, error);
-    } finally { if (this.startingChild === child) this.startingChild = undefined; if (this.startingDisplay === virtual?.process) this.startingDisplay = undefined; if (this.startingCdp === cdp) this.startingCdp = undefined; }
+    } finally { if (this.startingChild === child) this.startingChild = undefined; if (this.startingDisplay === virtual) this.startingDisplay = undefined; if (this.startingCdp === cdp) this.startingCdp = undefined; }
   }
   private async createPage(cdp = this.cdp!, deadline = Date.now() + 30_000) { const remaining = () => { const ms = deadline - Date.now(); if (ms <= 0) fail('BROWSER_UNAVAILABLE', 'ChatGPT target creation exceeded its broker deadline.'); return Math.min(30_000, ms); }; const created = await cdp.send('Target.createTarget', { url: 'about:blank' }, undefined, remaining()); const attached = await cdp.send('Target.attachToTarget', { targetId: created.targetId, flatten: true }, undefined, remaining()); return new Page(created.targetId, attached.sessionId, cdp); }
   private async ready(page: Page) {
@@ -194,16 +199,17 @@ class Broker {
     const startingDisplay = this.startingDisplay;
     this.startingCdp?.close();
     if (startingChild?.exitCode === null) startingChild.kill('SIGTERM');
-    if (startingDisplay?.exitCode === null) startingDisplay.kill('SIGTERM');
+    if (startingDisplay?.process.exitCode === null) startingDisplay.process.kill('SIGTERM');
     await this.starting?.catch(() => {});
     await this.terminate(startingChild);
-    await this.terminate(startingDisplay);
+    await this.terminateDisplay(startingDisplay);
     await Promise.all([...this.pages.values()].map((page) => page.close().catch(() => {})));
     this.pages.clear(); this.cdp?.close(); const child = this.process; const display = this.display;
     this.process = undefined; this.display = undefined; this.cdp = undefined; this.control = undefined;
     await this.terminate(child);
-    await this.terminate(display);
+    await this.terminateDisplay(display);
   }
+  private async terminateDisplay(display?: VirtualDisplay) { if (!display) return; await this.terminate(display.process); try { unlinkSync(display.authorizationPath); } catch {} }
   private async terminate(child?: ChildProcess) {
     if (!child || child.exitCode !== null) return;
     await new Promise<void>((resolve) => {
