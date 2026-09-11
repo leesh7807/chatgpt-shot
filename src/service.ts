@@ -4,14 +4,23 @@ import type { BrowserTransport } from './browser.js';
 import type { NotionStore } from './notion.js';
 import { markdownResult } from './serialize.js';
 
-export type SubmitOptions = { acknowledgementMs?: number; executionMs?: number; pollMs?: number; log?: (event: string, id?: string) => void; signal?: AbortSignal };
+export type SubmitOptions = { acknowledgementMs?: number; executionMs?: number; pollMs?: number; inProgressTabHoldMs?: number; log?: (event: string, id?: string) => void; signal?: AbortSignal };
 export const DEFAULT_ACKNOWLEDGEMENT_MS = 45_000;
 export const DEFAULT_EXECUTION_MS = 30 * 60_000;
+export const DEFAULT_IN_PROGRESS_TAB_HOLD_MS = 60_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const sleepCancellable = async (ms: number, signal?: AbortSignal) => {
+  if (!signal) return sleep(ms);
+  await new Promise<void>(resolve => {
+    const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
+};
 export const wrapPrompt = (prompt: string, pageId: string) => `<task>\n${prompt}\n</task>\n\n<chatgpt-shot>\nThis block is supplied by chatgpt-shot and defines how to return the result.\n\nInvocation record:\nhttps://www.notion.so/${pageId.replace(/-/g, '')}\n\n1. Before starting the task, set State to \`in_progress\`.\n2. Complete the task in <task>.\n3. Write the complete result to the invocation page body.\n4. As the final action:\n   - success → set State to \`completed\`\n   - failure → write the reason to Error and set State to \`failed\`\n</chatgpt-shot>`;
 
 export async function submit(store: NotionStore, databaseId: string, browser: BrowserTransport, prompt: string, options: SubmitOptions = {}): Promise<string> {
-  const ackMs = options.acknowledgementMs ?? DEFAULT_ACKNOWLEDGEMENT_MS, executionMs = options.executionMs ?? DEFAULT_EXECUTION_MS, pollMs = options.pollMs ?? 2_000, log = options.log ?? (() => {});
+  const ackMs = options.acknowledgementMs ?? DEFAULT_ACKNOWLEDGEMENT_MS, executionMs = options.executionMs ?? DEFAULT_EXECUTION_MS, pollMs = options.pollMs ?? 2_000, inProgressTabHoldMs = options.inProgressTabHoldMs ?? DEFAULT_IN_PROGRESS_TAB_HOLD_MS, log = options.log ?? (() => {});
   let invocation: { id: string; pageId: string; state: string; error: string } | undefined;
   let acknowledged: { state: string; error: string; at: number } | undefined;
   const cancelled = () => { if (options.signal?.aborted) fail('INVOCATION_CANCELLED', 'The caller cancelled this invocation.'); };
@@ -44,7 +53,11 @@ export async function submit(store: NotionStore, databaseId: string, browser: Br
         let acknowledgementStarted = Date.now(); let inspected = false;
         while (true) {
           cancelled(); const current = await store.readInvocation(invocation.pageId, id); cancelled();
-          if (current.state !== 'pending') { log('acknowledged', id); acknowledged = { ...current, at: Date.now() }; return; }
+          if (current.state !== 'pending') {
+            log('acknowledged', id); acknowledged = { ...current, at: Date.now() };
+            if (current.state === 'in_progress') { await sleepCancellable(inProgressTabHoldMs, options.signal); cancelled(); }
+            return;
+          }
           if (!inspected && Date.now() - acknowledgementStarted >= ackMs) {
             inspected = true; log('submission_inspection_started', id);
             // Losing the invocation page after a successful browser submit makes delivery
