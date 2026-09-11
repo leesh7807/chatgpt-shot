@@ -14,6 +14,10 @@ npm run build
 npm link
 ```
 
+### Linux runtime prerequisite
+
+Normal Linux operation requires the `Xvfb` executable. Install the package supplied by your distribution before starting the broker (for example, `sudo apt install xvfb` on Debian/Ubuntu or `sudo pacman -S xorg-server-xvfb` on Arch Linux). chatgpt-shot does not install it automatically; if it is unavailable, normal browser startup fails with `BROWSER_UNAVAILABLE` and an explanation.
+
 Open a commented template in your system's default text editor and enter the two required values:
 
 ```sh
@@ -43,7 +47,7 @@ chatgpt-shot config set CHATGPT_SHOT_EXECUTION_TIMEOUT_MS -1
 
 `config show` deliberately reports only whether values are set; it never prints the token. `config path` prints the actual configuration-file path if you need it. The file is user-owned and mode `0600`; its default location is `~/.config/chatgpt-shot/.env` (or `$XDG_CONFIG_HOME/chatgpt-shot/.env`). Do not commit it. A running Service reloads this file for every newly accepted submission, so the next `submit` uses a successfully saved token/database setting; work already accepted keeps its own original Invocation configuration.
 
-Create or validate the configured Invocation database, then log in to ChatGPT once in normal headed Chrome:
+Create or validate the configured Invocation database, then log in to ChatGPT once in your normal, user-visible system Chrome:
 
 ```sh
 chatgpt-shot init
@@ -51,7 +55,7 @@ chatgpt-shot login
 chatgpt-shot doctor
 ```
 
-`login` waits for you to finish manual authentication and close Chrome. It never enters credentials for you.
+`login` waits for you to finish manual authentication and close Chrome. It never enters credentials for you. It uses the dedicated chatgpt-shot profile on your current desktop so you can complete authentication normally.
 
 Each submission is expected to use the model and reasoning-effort settings of the ChatGPT profile authenticated during `login`. chatgpt-shot does not verify either setting, so confirm them in ChatGPT when they matter to a task.
 
@@ -84,6 +88,8 @@ chatgpt-shot stop
 ```
 
 The Service binds only `127.0.0.1` on an OS-selected port. Its owner-only discovery record supplies an ephemeral bearer credential; independent local consumers use that authenticated HTTP contract for health, submission, and stop operations. Persistent Chrome session data lives at `~/.local/share/chatgpt-shot/chrome-profile` by default and runtime discovery at `~/.cache/chatgpt-shot/runtime.json`; XDG overrides apply.
+
+On Linux, normal broker operation starts ordinary headful Chrome on a broker-owned private Xvfb display rather than on your physical desktop. Chrome keeps its authenticated dedicated profile, private CDP pipe, and persistent control page, while each submission still opens and closes only its own ChatGPT invocation page. No chatgpt-shot Chrome window appears on your desktop, so you do not need to keep or minimize one. This is not headless or stealth automation. `chatgpt-shot login` is intentionally different: it opens the same dedicated profile in a visible system Chrome window; after you authenticate and close it, the private-display runtime reuses that session.
 
 ## Local HTTP contract
 
