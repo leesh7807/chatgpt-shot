@@ -16,7 +16,7 @@ npm link
 
 ### Linux runtime prerequisite
 
-Normal Linux operation requires the `Xvfb` executable. Install the package supplied by your distribution before starting the broker (for example, `sudo apt install xvfb` on Debian/Ubuntu). chatgpt-shot does not install it automatically; if it is unavailable, normal browser startup fails with `BROWSER_UNAVAILABLE` and an explanation.
+Normal Linux operation requires the `Xvfb` executable. Install the package supplied by your distribution before starting the broker (for example, `sudo apt install xvfb` on Debian/Ubuntu or `sudo pacman -S xorg-server-xvfb` on Arch Linux). chatgpt-shot does not install it automatically; if it is unavailable, normal browser startup fails with `BROWSER_UNAVAILABLE` and an explanation.
 
 Open a commented template in your system's default text editor and enter the two required values:
 
