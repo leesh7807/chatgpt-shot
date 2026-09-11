@@ -28,11 +28,17 @@ chatgpt-shot config set CHATGPT_SHOT_NOTION_DATABASE_URL 'https://www.notion.so/
 chatgpt-shot config show
 ```
 
-Optional user-level lifecycle limits are milliseconds; defaults are 45 seconds for acknowledgement and 15 minutes for execution:
+Optional user-level lifecycle limits are milliseconds; defaults are 45 seconds for acknowledgement and 30 minutes for execution:
 
 ```sh
 chatgpt-shot config set CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS 45000
 chatgpt-shot config set CHATGPT_SHOT_EXECUTION_TIMEOUT_MS 1800000
+```
+
+Set `CHATGPT_SHOT_EXECUTION_TIMEOUT_MS` to `-1` to disable the **local execution** timeout and wait until the Invocation reaches a terminal state. This does not disable the 45-second acknowledgement timeout. An unlimited wait must be cancelled manually (for example, with `Ctrl-C` in the CLI or by cancelling the HTTP request); cancellation closes the local browser page and wait, but it does not undo a prompt that ChatGPT may already have accepted.
+
+```sh
+chatgpt-shot config set CHATGPT_SHOT_EXECUTION_TIMEOUT_MS -1
 ```
 
 `config show` deliberately reports only whether values are set; it never prints the token. `config path` prints the actual configuration-file path if you need it. The file is user-owned and mode `0600`; its default location is `~/.config/chatgpt-shot/.env` (or `$XDG_CONFIG_HOME/chatgpt-shot/.env`). Do not commit it. A running Service reloads this file for every newly accepted submission, so the next `submit` uses a successfully saved token/database setting; work already accepted keeps its own original Invocation configuration.

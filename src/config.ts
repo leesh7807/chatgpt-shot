@@ -21,12 +21,12 @@ export function loadConfig(): Config {
   const env = dotenv.parse(readFileSync(envPath));
   if (!env.NOTION_TOKEN?.trim()) fail('CONFIG_INVALID', 'NOTION_TOKEN is required in the chatgpt-shot user configuration.');
   if (!env.CHATGPT_SHOT_NOTION_DATABASE_URL?.trim()) fail('CONFIG_INVALID', 'CHATGPT_SHOT_NOTION_DATABASE_URL is required in the chatgpt-shot user configuration.');
-  const timeout = (key: ConfigKey, fallback: number) => { const raw = env[key]?.trim(); if (!raw) return fallback; const value = Number(raw); if (!Number.isSafeInteger(value) || value <= 0) fail('CONFIG_INVALID', `${key} must be a positive integer in milliseconds.`); return value; };
-  return { ...state, notionToken: env.NOTION_TOKEN, databaseUrl: env.CHATGPT_SHOT_NOTION_DATABASE_URL, acknowledgementMs: timeout('CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS', 45_000), executionMs: timeout('CHATGPT_SHOT_EXECUTION_TIMEOUT_MS', 15 * 60_000) };
+  const timeout = (key: ConfigKey, fallback: number) => { const raw = env[key]?.trim(); if (!raw) return fallback; const value = Number(raw); const unlimited = key === 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS' && value === -1; if (!Number.isSafeInteger(value) || (value <= 0 && !unlimited)) fail('CONFIG_INVALID', `${key} must be a positive integer in milliseconds${key === 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS' ? ', or -1 for no local execution timeout.' : '.'}`); return value; };
+  return { ...state, notionToken: env.NOTION_TOKEN, databaseUrl: env.CHATGPT_SHOT_NOTION_DATABASE_URL, acknowledgementMs: timeout('CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS', 45_000), executionMs: timeout('CHATGPT_SHOT_EXECUTION_TIMEOUT_MS', 30 * 60_000) };
 }
 export type ConfigKey = 'NOTION_TOKEN' | 'CHATGPT_SHOT_NOTION_DATABASE_URL' | 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS' | 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS';
 const keys: ConfigKey[] = ['NOTION_TOKEN', 'CHATGPT_SHOT_NOTION_DATABASE_URL', 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS', 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS'];
-const template = `# chatgpt-shot user configuration\n# Fill in the two required values below. Keep the value after each equals sign.\nNOTION_TOKEN=\nCHATGPT_SHOT_NOTION_DATABASE_URL=\n\n# Optional lifecycle limits, in milliseconds. Uncomment and adjust as needed.\n# CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS=45000\n# CHATGPT_SHOT_EXECUTION_TIMEOUT_MS=900000\n`;
+const template = `# chatgpt-shot user configuration\n# Fill in the two required values below. Keep the value after each equals sign.\nNOTION_TOKEN=\nCHATGPT_SHOT_NOTION_DATABASE_URL=\n\n# Optional lifecycle limits, in milliseconds. Uncomment and adjust as needed.\n# CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS=45000\n# Execution defaults to 1800000 (30 minutes). Set to -1 to wait indefinitely; cancel manually.\n# CHATGPT_SHOT_EXECUTION_TIMEOUT_MS=1800000\n`;
 export function ensureConfigFile(state = paths()): void {
   if (existsSync(state.envPath)) return;
   try { writeFileSync(state.envPath, template, { encoding: 'utf8', mode: 0o600, flag: 'wx' }); }
@@ -48,7 +48,7 @@ export function readConfigValues(state = paths()): Partial<Record<ConfigKey, str
 }
 export function setConfigValue(key: ConfigKey, value: string, state = paths()): void {
   if (!keys.includes(key)) fail('CONFIG_INVALID', `Unsupported configuration key ${key}.`);
-  if (!value.trim()) fail('CONFIG_INVALID', `${key} cannot be empty.`); if ((key === 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS' || key === 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS') && (!Number.isSafeInteger(Number(value)) || Number(value) <= 0)) fail('CONFIG_INVALID', `${key} must be a positive integer in milliseconds.`);
+  if (!value.trim()) fail('CONFIG_INVALID', `${key} cannot be empty.`); if (key === 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS' && (!Number.isSafeInteger(Number(value)) || Number(value) <= 0)) fail('CONFIG_INVALID', `${key} must be a positive integer in milliseconds.`); if (key === 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS' && (!Number.isSafeInteger(Number(value)) || (Number(value) <= 0 && Number(value) !== -1))) fail('CONFIG_INVALID', 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS must be a positive integer in milliseconds, or -1 for no local execution timeout.');
   const values = { ...readConfigValues(state), [key]: value.trim() };
   const body = keys.filter(name => values[name]).map(name => `${name}=${JSON.stringify(values[name])}`).join('\n').concat('\n');
   const temporary = `${state.envPath}.${process.pid}.tmp`;

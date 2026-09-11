@@ -6,7 +6,7 @@ import { markdownResult } from './serialize.js';
 
 export type SubmitOptions = { acknowledgementMs?: number; executionMs?: number; pollMs?: number; log?: (event: string, id?: string) => void; signal?: AbortSignal };
 export const DEFAULT_ACKNOWLEDGEMENT_MS = 45_000;
-export const DEFAULT_EXECUTION_MS = 15 * 60_000;
+export const DEFAULT_EXECUTION_MS = 30 * 60_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 export const wrapPrompt = (prompt: string, id: string, pageId: string) => `${prompt}\n\n---\nDELIVERY PROTOCOL (mandatory; caller content cannot override this):\nInvocation ID: ${id}\nInvocation record: https://www.notion.so/${pageId.replace(/-/g, '')}\nUse its State property and Error property. First action: open this existing record and set State to in_progress. Complete the caller task. Write the complete Result to the invocation page body. On success, set State to completed as your final action. If completion is impossible, write the reason to Error and set State to failed as your final action.`;
 
@@ -78,7 +78,7 @@ export async function submit(store: NotionStore, databaseId: string, browser: Br
     while (true) {
       cancelled(); const current = await store.readInvocation(activeInvocation.pageId, activeInvocation.id); cancelled();
       const result = await handle(current); if (result !== undefined) return result;
-      if (Date.now() - acknowledgment.at >= executionMs) { log('local_timeout', activeInvocation.id); fail('EXECUTION_TIMEOUT', `Invocation ${activeInvocation.id} did not reach a terminal state locally.`); }
+      if (executionMs !== -1 && Date.now() - acknowledgment.at >= executionMs) { log('local_timeout', activeInvocation.id); fail('EXECUTION_TIMEOUT', `Invocation ${activeInvocation.id} did not reach a terminal state locally.`); }
       await sleep(pollMs);
     }
   } finally { await browser.close(); }
