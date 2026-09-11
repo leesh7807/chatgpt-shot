@@ -41,6 +41,8 @@ chatgpt-shot doctor
 
 `login` waits for you to finish manual authentication and close Chrome. It never enters credentials for you.
 
+Each submission is expected to use the model and reasoning-effort settings of the ChatGPT profile authenticated during `login`. chatgpt-shot does not verify either setting, so confirm them in ChatGPT when they matter to a task.
+
 ## Everyday use
 
 ```sh
