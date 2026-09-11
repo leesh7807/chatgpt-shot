@@ -38,3 +38,11 @@ The browser must remain a normal GUI Chrome session for ChatGPT Web while its re
 - Node tests and TypeScript compilation verify deterministic broker behavior.
 - `ps` and `/proc/<pid>/environ` can inspect the broker-owned Xvfb and Chrome display environments during the Linux smoke test.
 - The CLI `login`, `doctor`, `submit`, and `stop` commands exercise profile reuse, persistent runtime, and cleanup.
+
+## chatgpt-shot review log
+
+- Reviewed HEAD: `46601e0563149f1d52c433dec3d17e5333f6ef4a`
+- Verdict: FINDINGS
+- Finding: accepted. Xvfb had no X authorization, so a different local OS user could connect through its Unix socket despite `-nolisten tcp`.
+- Applied commit: `e1b5c59d24b57e3b2a0976be8e16226caf964b16`
+- Verification: `npm test` (60 passed), `npm run build`, and `git diff --check` passed. Xvfb is not installed in this environment, so the live Linux display smoke test remains unavailable.
