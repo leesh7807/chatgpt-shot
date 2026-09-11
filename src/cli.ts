@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { loadConfig, paths, readConfigValues, setConfigValue, type ConfigKey } from './config.js';
+import { loadConfig, openConfigInDefaultEditor, paths, readConfigValues, setConfigValue, type ConfigKey } from './config.js';
 import { ShotError, fail } from './errors.js';
 import { NotionStore, databaseIdFromUrl } from './notion.js';
 import { ChatGPTBrowser } from './browser.js';
@@ -10,10 +10,11 @@ async function main(args: string[]) {
   const [command, ...rest] = args;
   if (command === 'config') {
     const [action, key, ...valueParts] = rest; const state = paths();
+    if (!action) { await openConfigInDefaultEditor(state); return out(`opened configuration: ${state.envPath}`); }
     if (action === 'path' && !key) return out(state.envPath);
     if (action === 'show' && !key) { const values = readConfigValues(state); return out(`configuration: ${state.envPath}\nNOTION_TOKEN: ${values.NOTION_TOKEN ? 'set' : 'missing'}\nCHATGPT_SHOT_NOTION_DATABASE_URL: ${values.CHATGPT_SHOT_NOTION_DATABASE_URL ? 'set' : 'missing'}\nCHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS: ${values.CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS ?? '45000 (default)'}\nCHATGPT_SHOT_EXECUTION_TIMEOUT_MS: ${values.CHATGPT_SHOT_EXECUTION_TIMEOUT_MS ?? '900000 (default)'}`); }
     if (action === 'set' && (key === 'NOTION_TOKEN' || key === 'CHATGPT_SHOT_NOTION_DATABASE_URL' || key === 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS' || key === 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS') && valueParts.length) { setConfigValue(key as ConfigKey, valueParts.join(' '), state); return out(`saved ${key}`); }
-    return fail('CONFIG_INVALID', 'Usage: chatgpt-shot config <path|show|set KEY VALUE>');
+    return fail('CONFIG_INVALID', 'Usage: chatgpt-shot config [path|show|set KEY VALUE]');
   }
   const config = loadConfig(); const databaseId = databaseIdFromUrl(config.databaseUrl);
   if (command === '__service') return runService();

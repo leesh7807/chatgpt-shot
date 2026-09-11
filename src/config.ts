@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, chmodSync, renameSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import dotenv from 'dotenv';
@@ -25,6 +26,21 @@ export function loadConfig(): Config {
 }
 export type ConfigKey = 'NOTION_TOKEN' | 'CHATGPT_SHOT_NOTION_DATABASE_URL' | 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS' | 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS';
 const keys: ConfigKey[] = ['NOTION_TOKEN', 'CHATGPT_SHOT_NOTION_DATABASE_URL', 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS', 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS'];
+const template = `# chatgpt-shot user configuration\n# Fill in the two required values below. Keep the value after each equals sign.\nNOTION_TOKEN=\nCHATGPT_SHOT_NOTION_DATABASE_URL=\n\n# Optional lifecycle limits, in milliseconds. Uncomment and adjust as needed.\n# CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS=45000\n# CHATGPT_SHOT_EXECUTION_TIMEOUT_MS=900000\n`;
+export function ensureConfigFile(state = paths()): void {
+  if (existsSync(state.envPath)) return;
+  try { writeFileSync(state.envPath, template, { encoding: 'utf8', mode: 0o600, flag: 'wx' }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  chmodSync(state.envPath, 0o600);
+}
+export async function openConfigInDefaultEditor(state = paths()): Promise<void> {
+  ensureConfigFile(state);
+  const [command, args]: [string, string[]] = process.platform === 'darwin' ? ['open', [state.envPath]] : process.platform === 'win32' ? ['cmd', ['/c', 'start', '', state.envPath]] : ['xdg-open', [state.envPath]];
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args, { detached: true, stdio: 'ignore' });
+    child.once('error', reject); child.once('spawn', () => { child.unref(); resolve(); });
+  });
+}
 export function readConfigValues(state = paths()): Partial<Record<ConfigKey, string>> {
   if (!existsSync(state.envPath)) return {};
   const parsed = dotenv.parse(readFileSync(state.envPath));

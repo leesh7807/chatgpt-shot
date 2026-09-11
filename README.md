@@ -14,7 +14,13 @@ npm run build
 npm link
 ```
 
-Set the two required values without opening an editor or locating a dotfile:
+Open a commented template in your system's default text editor and enter the two required values:
+
+```sh
+chatgpt-shot config
+```
+
+Alternatively, set them without opening an editor or locating a dotfile:
 
 ```sh
 chatgpt-shot config set NOTION_TOKEN 'secret_notion_token'
