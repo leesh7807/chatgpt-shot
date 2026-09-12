@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -19,16 +19,41 @@ test('global help works before configuration is loaded', () => {
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
-test('command help is local-only, including submit help', () => {
+test('every public command has local help on both supported flags', () => {
   const directory = mkdtempSync(join(tmpdir(), 'chatgpt-shot-cli-'));
+  const expected = new Map([
+    ['config', /Usage:\n  chatgpt-shot config\n  chatgpt-shot config path\n  chatgpt-shot config show\n  chatgpt-shot config set KEY VALUE/],
+    ['init', /Usage: chatgpt-shot init\n\nCreate or validate/],
+    ['login', /Usage: chatgpt-shot login\n\nOpen the dedicated Chrome profile/],
+    ['doctor', /Usage: chatgpt-shot doctor\n\nCheck configuration/],
+    ['start', /Usage: chatgpt-shot start\n\nStart the local Service/],
+    ['status', /Usage: chatgpt-shot status\n\nReport whether/],
+    ['port', /Usage: chatgpt-shot port\n\nPrint the port/],
+    ['submit', /Usage: chatgpt-shot submit "<prompt>"\n\nSubmit exactly one non-empty prompt/],
+    ['stop', /Usage: chatgpt-shot stop\n\nStop the local Service/]
+  ]);
   try {
-    for (const flag of ['--help', '-h']) {
-      const result = cli(['submit', flag], directory);
-      assert.equal(result.status, 0); assert.equal(result.stdout, 'Usage: chatgpt-shot submit "<prompt>"\n'); assert.equal(result.stderr, '');
+    for (const [command, usage] of expected) {
+      for (const flag of ['--help', '-h']) {
+        const result = cli([command, flag], directory);
+        assert.equal(result.status, 0, `${command} ${flag}`);
+        assert.match(result.stdout, usage, `${command} ${flag}`);
+        assert.equal(result.stderr, '', `${command} ${flag}`);
+      }
     }
-    const configHelp = cli(['config', '--help'], directory);
-    assert.equal(configHelp.status, 0); assert.match(configHelp.stdout, /Usage: chatgpt-shot config/);
+    assert.match(cli(['config', '--help'], directory).stdout, /config path[\s\S]*config show[\s\S]*config set KEY VALUE/);
+    assert.match(cli(['submit', '--help'], directory).stdout, /chatgpt-shot submit "<prompt>"[\s\S]*exactly one non-empty prompt/);
+    assert.equal(existsSync(join(directory, 'chatgpt-shot')), false);
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('help tokens resolve to their scope and are not submit prompts', () => {
+  assert.deepEqual(parseCli(['--help']), { kind: 'help', scope: 'global' });
+  for (const command of ['config', 'init', 'login', 'doctor', 'start', 'status', 'port', 'submit', 'stop'] as const) {
+    for (const flag of ['--help', '-h']) assert.deepEqual(parseCli([command, flag]), { kind: 'help', scope: command });
+  }
+  assert.deepEqual(parseCli(['submit', '--help']), { kind: 'help', scope: 'submit' });
+  assert.deepEqual(parseCli(['submit', '-h']), { kind: 'help', scope: 'submit' });
 });
 
 test('submit accepts one positional prompt exactly and preserves it', () => {

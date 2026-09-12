@@ -12,6 +12,7 @@ const commands = ['config', 'init', 'login', 'doctor', 'start', 'status', 'port'
 type Command = typeof commands[number];
 type HelpScope = 'global' | Command;
 export type ParsedCli = { kind: 'help'; scope: HelpScope } | { kind: 'command'; command: Command; rest: string[]; prompt?: string };
+const submitUsage = 'Usage: chatgpt-shot submit "<prompt>"';
 
 const globalHelp = `Usage: chatgpt-shot <command> [arguments]
 
@@ -28,15 +29,63 @@ Commands:
 
 Run "chatgpt-shot <command> --help" for command usage.`;
 const commandHelp: Record<Command, string> = {
-  config: 'Usage: chatgpt-shot config [path|show|set KEY VALUE]',
-  init: 'Usage: chatgpt-shot init',
-  login: 'Usage: chatgpt-shot login',
-  doctor: 'Usage: chatgpt-shot doctor',
-  start: 'Usage: chatgpt-shot start',
-  status: 'Usage: chatgpt-shot status',
-  port: 'Usage: chatgpt-shot port',
-  submit: 'Usage: chatgpt-shot submit "<prompt>"',
-  stop: 'Usage: chatgpt-shot stop'
+  config: `Usage:
+  chatgpt-shot config
+  chatgpt-shot config path
+  chatgpt-shot config show
+  chatgpt-shot config set KEY VALUE
+
+Open or update the user configuration.
+
+Forms:
+  config                 Open the configuration file in the default editor.
+  config path            Print the configuration-file path.
+  config show            Show configured values without printing the token.
+  config set KEY VALUE   Save one supported configuration value.
+
+Supported keys: NOTION_TOKEN, CHATGPT_SHOT_NOTION_DATABASE_URL,
+CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS, CHATGPT_SHOT_EXECUTION_TIMEOUT_MS.`,
+  init: `Usage: chatgpt-shot init
+
+Create or validate the configured Notion Invocation database.
+
+Arguments: none.`,
+  login: `Usage: chatgpt-shot login
+
+Open the dedicated Chrome profile for manual ChatGPT authentication.
+
+Arguments: none.`,
+  doctor: `Usage: chatgpt-shot doctor
+
+Check configuration, the Notion Invocation database, and browser readiness.
+
+Arguments: none.`,
+  start: `Usage: chatgpt-shot start
+
+Start the local Service and print its port.
+
+Arguments: none.`,
+  status: `Usage: chatgpt-shot status
+
+Report whether the local Service is healthy.
+
+Arguments: none.`,
+  port: `Usage: chatgpt-shot port
+
+Print the port of the healthy local Service.
+
+Arguments: none.`,
+  submit: `${submitUsage}
+
+Submit exactly one non-empty prompt and wait for its completed Result.
+
+Arguments:
+  <prompt>   One positional prompt argument; quote it when it contains spaces.`,
+  stop: `Usage: chatgpt-shot stop
+
+Stop the local Service after accepted work drains.
+
+Arguments: none.`
 };
 const isHelp = (value: string) => value === '--help' || value === '-h';
 const isCommand = (value: string): value is Command => (commands as readonly string[]).includes(value);
@@ -49,7 +98,7 @@ export function parseCli(args: string[]): ParsedCli {
   if (rest.length === 1 && isHelp(rest[0])) return { kind: 'help', scope: command };
   if (command === 'submit') {
     const prompt = rest.length === 1 ? rest[0] : undefined;
-    if (!prompt?.trim()) fail('CONFIG_INVALID', commandHelp.submit);
+    if (!prompt?.trim()) fail('CONFIG_INVALID', submitUsage);
     return { kind: 'command', command, rest, prompt };
   }
   return { kind: 'command', command, rest };

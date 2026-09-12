@@ -65,7 +65,7 @@ Each submission is expected to use the model and reasoning-effort settings of th
 chatgpt-shot submit "Summarize the attached material and write the result to the Invocation record."
 ```
 
-The canonical user and agent interface is `chatgpt-shot submit "<prompt>"`: it accepts exactly one non-empty positional prompt. Use `chatgpt-shot --help` (or `-h`) for the command list and `chatgpt-shot <command> --help` (or `-h`) for command-specific usage. Help is local-only and does not load configuration or contact the Service, Notion, or ChatGPT.
+The canonical user and agent interface is `chatgpt-shot submit "<prompt>"`: it accepts exactly one non-empty positional prompt.
 
 `submit` is synchronous: it returns only when this one invocation reaches `completed` (or a bounded failure/timeout). The command prints the exact completed Notion **Result** body to standard output, so a shell script can receive it directly:
 
