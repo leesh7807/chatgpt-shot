@@ -9,6 +9,7 @@ const stale = () => Object.assign(new Error(STALE_BROWSER_SESSION_MESSAGE), { co
 
 test('recognizes only the browser stale-session message', () => {
   assert.equal(isStaleBrowserSessionError(new Error(STALE_BROWSER_SESSION_MESSAGE)), true);
+  assert.equal(isStaleBrowserSessionError(new Error(`${STALE_BROWSER_SESSION_MESSAGE}.`)), true);
   assert.equal(isStaleBrowserSessionError(new Error('Session with given id not found: extra')), false);
   assert.equal(isStaleBrowserSessionError(new Error('Browser transport failed')), false);
 });

@@ -72,3 +72,10 @@ The desired behavior is for this mismatch to be treated as a normal browser life
 - **Controlled browser-session invalidation** closes or invalidates an active browser tab/session while leaving the chatgpt-shot service running.
 - **Invocation readback** verifies that pre-Invocation browser failures do not create new Invocation records and that existing Invocation lifecycle behavior remains unchanged.
 
+## chatgpt-shot review log
+
+- Reviewed HEAD: `dcb2c7212098ea9a9f9281f176540b3b6e7c66ad`
+- Verdict: `FINDINGS`
+- Finding accepted: Chromium returns `Session with given id not found.` with a terminal period, while the matcher only accepted the period-less form; this left the real stale-session recovery path inactive.
+- Applied commit: `058feb2f621b4bc0f309b1127984281a04acd962`.
+- Verification: independently reproduced Chromium CDP response `{code: -32001, message: "Session with given id not found."}`; initial `npm run build`, `npm test`, and `npm start -- doctor` passed before the finding fix.
