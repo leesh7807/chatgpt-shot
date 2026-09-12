@@ -4,7 +4,7 @@ import net from 'node:net';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { fail } from './errors.js';
+import { fail, isStaleBrowserSessionError } from './errors.js';
 
 type Request = { operation: string; sessionId?: string; prompt?: string; invocationId?: string };
 type Response = { ok: true; value?: unknown } | { ok: false; code: string; message: string };
@@ -178,17 +178,39 @@ class Broker {
     });
   }
   private async composer(page: Page) { await this.ready(page); for (let i = 0; i < 60; i++) { if (await page.evaluate<boolean>(composerProbe)) return; await delay(500); } fail('BROWSER_UNAVAILABLE', 'The authenticated ChatGPT composer is unavailable.'); }
+  private async recreateControl() {
+    const deadline = Date.now() + 75_000;
+    const replacement = await this.createPage(this.cdp!, deadline);
+    try {
+      await replacement.within(deadline, async () => { await replacement.navigate(); await this.ready(replacement); });
+      const previous = this.control;
+      this.control = replacement;
+      await previous?.close().catch(() => {});
+    } catch (error) { await replacement.close().catch(() => {}); throw error; }
+  }
   async handle(request: Request): Promise<unknown> {
     await this.runtime();
-    if (request.operation === 'ensure') return;
-    if (request.operation === 'auth') return this.auth(this.control!);
-    if (request.operation === 'open') { const deadline = Date.now() + 75_000; const page = await this.createPage(this.cdp!, deadline); try { await page.within(deadline, async () => { await page.navigate(); const auth = await this.auth(page); if (!auth.authenticated) fail('CHATGPT_AUTH_REQUIRED', 'ChatGPT authentication is required. Run `chatgpt-shot login`.'); await this.composer(page); }); const id = randomUUID(); this.pages.set(id, page); return id; } catch (error) { await page.close().catch(() => {}); throw error; } }
-    const page = request.sessionId ? this.pages.get(request.sessionId) : undefined; if (!page) return fail('BROWSER_UNAVAILABLE', 'Browser invocation page is unavailable.');
-    if (request.operation === 'fill') { const deadline = Date.now() + 45_000; await page.within(deadline, async () => { await this.composer(page); await page.evaluate(`value=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);if(!e)throw new Error('composer unavailable');e.focus();if(e instanceof HTMLTextAreaElement){const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;s.call(e,value)}else e.textContent=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}`, [request.prompt ?? '']); }); return; }
-    if (request.operation === 'submit') { const clicked = await page.evaluate<boolean>(`()=>{${visibility}const b=[...document.querySelectorAll('button')].find(e=>/send prompt|send message/i.test([e.getAttribute('aria-label'),e.textContent].filter(Boolean).join(' '))&&!e.disabled&&visible(e));if(!b)return false;b.click();return true}`); if (!clicked) await this.cdp!.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }, page.sessionId).then(() => this.cdp!.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }, page.sessionId)); return; }
-    if (request.operation === 'inspect') { const id = request.invocationId ?? ''; const value = await page.evaluate<{ seen: boolean; value: string }>(`id=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let seen=false,node;while(node=walker.nextNode()){const parent=node.parentElement;if(!parent?.closest('textarea,[contenteditable="true"]')&&node.textContent?.includes(id)){seen=true;break}}return {seen,value:e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'')}}`, [id]); return value.seen && !value.value.includes(id) ? 'submitted' : !value.seen && value.value.includes(id) ? 'not_submitted' : 'uncertain'; }
-    if (request.operation === 'close') { await page.close().catch(() => {}); this.pages.delete(request.sessionId!); return; }
-    fail('INTERNAL_ERROR', `Unsupported broker operation ${request.operation}.`);
+    try {
+      if (request.operation === 'ensure') return;
+      if (request.operation === 'auth') {
+        try { return await this.auth(this.control!); }
+        catch (error) {
+          if (!isStaleBrowserSessionError(error)) throw error;
+          await this.recreateControl();
+          return this.auth(this.control!);
+        }
+      }
+      if (request.operation === 'open') { const deadline = Date.now() + 75_000; const page = await this.createPage(this.cdp!, deadline); try { await page.within(deadline, async () => { await page.navigate(); const auth = await this.auth(page); if (!auth.authenticated) fail('CHATGPT_AUTH_REQUIRED', 'ChatGPT authentication is required. Run `chatgpt-shot login`.'); await this.composer(page); }); const id = randomUUID(); this.pages.set(id, page); return id; } catch (error) { await page.close().catch(() => {}); throw error; } }
+      const page = request.sessionId ? this.pages.get(request.sessionId) : undefined; if (!page) return fail('BROWSER_UNAVAILABLE', 'Browser invocation page is unavailable.');
+      if (request.operation === 'fill') { const deadline = Date.now() + 45_000; await page.within(deadline, async () => { await this.composer(page); await page.evaluate(`value=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);if(!e)throw new Error('composer unavailable');e.focus();if(e instanceof HTMLTextAreaElement){const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;s.call(e,value)}else e.textContent=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}`, [request.prompt ?? '']); }); return; }
+      if (request.operation === 'submit') { const clicked = await page.evaluate<boolean>(`()=>{${visibility}const b=[...document.querySelectorAll('button')].find(e=>/send prompt|send message/i.test([e.getAttribute('aria-label'),e.textContent].filter(Boolean).join(' '))&&!e.disabled&&visible(e));if(!b)return false;b.click();return true}`); if (!clicked) await this.cdp!.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }, page.sessionId).then(() => this.cdp!.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }, page.sessionId)); return; }
+      if (request.operation === 'inspect') { const id = request.invocationId ?? ''; const value = await page.evaluate<{ seen: boolean; value: string }>(`id=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let seen=false,node;while(node=walker.nextNode()){const parent=node.parentElement;if(!parent?.closest('textarea,[contenteditable="true"]')&&node.textContent?.includes(id)){seen=true;break}}return {seen,value:e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'')}}`, [id]); return value.seen && !value.value.includes(id) ? 'submitted' : !value.seen && value.value.includes(id) ? 'not_submitted' : 'uncertain'; }
+      if (request.operation === 'close') { await page.close().catch(() => {}); this.pages.delete(request.sessionId!); return; }
+      fail('INTERNAL_ERROR', `Unsupported broker operation ${request.operation}.`);
+    } catch (error) {
+      if (request.sessionId && isStaleBrowserSessionError(error)) this.pages.delete(request.sessionId);
+      throw error;
+    }
   }
   async discard(sessionId: string) { const page = this.pages.get(sessionId); if (!page) return; this.pages.delete(sessionId); await page.close().catch(() => {}); }
   async close() {
