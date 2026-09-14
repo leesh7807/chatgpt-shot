@@ -38,14 +38,20 @@ test('creates a wildcard MIT-MAGIC-COOKIE authority record for the dynamically a
   assert.ok(authority.subarray(-cookie.length).equals(cookie));
 });
 
-test('keeps Chrome headful and passes a private display only to its child environment', () => {
-  const arguments_ = chromeArguments('/tmp/chatgpt-shot-profile');
+test('keeps Linux Chrome headful and selects the private X11 display', () => {
+  const arguments_ = chromeArguments('/tmp/chatgpt-shot-profile', 'linux');
   assert.ok(arguments_.includes('--remote-debugging-pipe'));
   assert.ok(arguments_.includes('--no-startup-window'));
+  assert.ok(arguments_.includes('--ozone-platform=x11'));
   assert.ok(!arguments_.includes('--start-minimized'));
   assert.ok(!arguments_.some(argument => argument.startsWith('--headless')));
-  const environment = chromeEnvironment(':77', '/tmp/chatgpt-shot.Xauthority');
+  const environment = chromeEnvironment(':77', '/tmp/chatgpt-shot.Xauthority', { DISPLAY: ':0', WAYLAND_DISPLAY: 'wayland-0' });
   assert.equal(environment?.DISPLAY, ':77');
   assert.equal(environment?.XAUTHORITY, '/tmp/chatgpt-shot.Xauthority');
+  assert.equal(environment?.WAYLAND_DISPLAY, undefined);
   assert.equal(chromeEnvironment(), undefined);
+});
+
+test('does not select the X11 backend for non-Linux Chrome', () => {
+  assert.ok(!chromeArguments('/tmp/chatgpt-shot-profile', 'darwin').includes('--ozone-platform=x11'));
 });
