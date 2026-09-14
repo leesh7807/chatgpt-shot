@@ -29,8 +29,13 @@ const xvfb = () => 'Xvfb';
 const xAuthorityField = (value: Buffer) => { const length = Buffer.alloc(2); length.writeUInt16BE(value.length); return Buffer.concat([length, value]); };
 export const privateXAuthority = (cookie: Buffer) => Buffer.concat([Buffer.from([0xff, 0xff]), xAuthorityField(Buffer.alloc(0)), xAuthorityField(Buffer.alloc(0)), xAuthorityField(Buffer.from('MIT-MAGIC-COOKIE-1')), xAuthorityField(cookie)]);
 export const privateDisplayArguments = (authorizationPath: string) => ['-auth', authorizationPath, '-displayfd', '3', '-screen', '0', '1280x800x24', '-nolisten', 'tcp'];
-export const chromeArguments = (directory: string) => [`--user-data-dir=${directory}`, '--profile-directory=Default', '--remote-debugging-pipe', '--no-first-run', '--no-default-browser-check', '--disable-background-mode', '--no-startup-window'];
-export const chromeEnvironment = (display?: string, authorizationPath?: string) => display ? { ...process.env, DISPLAY: display, ...(authorizationPath ? { XAUTHORITY: authorizationPath } : {}) } : undefined;
+export const chromeArguments = (directory: string, platform = process.platform) => [`--user-data-dir=${directory}`, '--profile-directory=Default', '--remote-debugging-pipe', '--no-first-run', '--no-default-browser-check', '--disable-background-mode', '--no-startup-window', ...(platform === 'linux' ? ['--ozone-platform=x11'] : [])];
+export const chromeEnvironment = (display?: string, authorizationPath?: string, inherited: NodeJS.ProcessEnv = process.env) => {
+  if (!display) return undefined;
+  const environment = { ...inherited };
+  delete environment.WAYLAND_DISPLAY;
+  return { ...environment, DISPLAY: display, ...(authorizationPath ? { XAUTHORITY: authorizationPath } : {}) };
+};
 export const privateDisplayFromOutput = (output: string): string | undefined => {
   const display = output.trim();
   return /^\d+$/.test(display) && Number(display) <= 65_535 ? `:${display}` : undefined;
