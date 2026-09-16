@@ -49,13 +49,14 @@ export async function runService(): Promise<void> {
   if (!startupToken || !claimStartup(config, startupToken)) return fail('BROWSER_UNAVAILABLE', 'Service startup ownership was superseded.') as never;
   const credential = randomBytes(32).toString('base64url'); let stopping = false; let active = 0; let server: ReturnType<typeof createServer>;
   const creating = new Map<string, Promise<JobExecution>>();
+  const admissions = new Set<AbortController>();
   const json = (res: any, status: number, body: unknown) => { if (!res.destroyed) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); } };
   const durable = async (store: NotionStore, databaseId: string, id: string) => {
     const invocation = await store.findInvocation(databaseId, id);
     if (!invocation) return undefined;
     return { id: invocation.id, state: invocation.state, error: invocation.error || null, result: invocation.state === 'completed' ? await (await import('./serialize.js')).markdownResult(store, invocation.pageId) : null };
   };
-  const stop = async () => { if (stopping) return; stopping = true; if (active) await new Promise<void>(resolve => { const timer = setInterval(() => { if (!active) { clearInterval(timer); resolve(); } }, 25); }); await shutdownBroker(config.browserProfilePath); await new Promise<void>(resolve => server.close(() => resolve())); removeDiscovery(config, credential); releaseStartup(config, startupToken); };
+  const stop = async () => { if (stopping) return; stopping = true; for (const admission of admissions) admission.abort(); if (active || admissions.size) await new Promise<void>(resolve => { const timer = setInterval(() => { if (!active && !admissions.size) { clearInterval(timer); resolve(); } }, 25); }); await shutdownBroker(config.browserProfilePath); await new Promise<void>(resolve => server.close(() => resolve())); removeDiscovery(config, credential); releaseStartup(config, startupToken); };
   server = createServer(async (req, res) => {
     const unauthorized = () => json(res, 401, { code: 'UNAUTHORIZED', message: 'A current service credential is required.' });
     if (req.headers.authorization !== `Bearer ${credential}`) return unauthorized();
@@ -79,15 +80,19 @@ export async function runService(): Promise<void> {
         const id = req.url === '/jobs' ? input.id : randomUUID();
         if (!jobId(id)) fail('CONFIG_INVALID', 'jobs requires a UUID Job ID.');
         const current = loadConfig(); const store = new NotionStore(current.notionToken); const databaseId = databaseIdFromUrl(current.databaseUrl); store.validateSchema(await store.database(databaseId));
+        if (stopping) return json(res, 503, { code: 'SERVICE_STOPPING', message: 'Service is not accepting this request.' });
+        const admission = new AbortController(); admissions.add(admission);
         let execution = creating.get(id);
         if (!execution) {
-          execution = startJob(store, databaseId, new ChatGPTBrowser(current.browserProfilePath), prompt, id, { acknowledgementMs: current.acknowledgementMs, executionMs: current.executionMs }); creating.set(id, execution);
+          execution = startJob(store, databaseId, new ChatGPTBrowser(current.browserProfilePath), prompt, id, { acknowledgementMs: current.acknowledgementMs, executionMs: current.executionMs, signal: admission.signal }); creating.set(id, execution);
           void execution.then(run => { if (!run.created) return; active++; void run.completion.catch(() => {}).finally(() => { active--; }); }).catch(() => {}).finally(() => creating.delete(id));
         }
-        const run = await execution;
+        let run: JobExecution;
+        try { run = await execution; }
+        finally { admissions.delete(admission); }
         if (req.url === '/jobs') { const value = await durable(store, databaseId, id); return json(res, 200, value ?? { id: run.job.id, state: run.job.state, error: run.job.error || null, result: null }); }
         try { const result = await run.completion; return json(res, 200, { result }); } catch (error) { return json(res, 500, responseError(error)); }
-      } catch (error) { return json(res, 500, responseError(error)); }
+      } catch (error) { return json(res, stopping ? 503 : 500, stopping ? { code: 'SERVICE_STOPPING', message: 'Service is not accepting this request.' } : responseError(error)); }
     });
   });
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => resolve()); }); const address = server.address(); if (!address || typeof address === 'string') return fail('INTERNAL_ERROR', 'Service did not obtain a TCP port.') as never; publish(config, { pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential }); process.once('SIGTERM', () => void stop()); process.once('SIGINT', () => void stop());

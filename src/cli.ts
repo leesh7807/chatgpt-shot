@@ -138,15 +138,14 @@ export async function main(args: string[]) {
   if (command === 'jobs') { const record = await ensureService(config); out(JSON.stringify(await call(record, rest[0] ? `/jobs/${rest[0]}` : '/jobs'))); return; }
   if (command === 'submit') {
     const record = await ensureService(config); const id = randomUUID(); const controller = new AbortController();
-    let accepted = false;
     const remove = installCancellationHandler(async () => {
       controller.abort();
-      // The signal handler exits before main's catch block can report the observer failure.
-      if (accepted) process.stderr.write(`INVOCATION_CANCELLED: The synchronous observer ended. Job ID: ${id}.\n`);
+      // A caller-generated ID is the recovery identity even when the create response is lost.
+      // The signal handler exits before main's catch block can report it.
+      process.stderr.write(`INVOCATION_CANCELLED: The synchronous observer ended. Job ID: ${id}.\n`);
     });
     try {
       await call(record, '/jobs', { id, prompt: parsed.prompt! }, controller.signal);
-      accepted = true;
       const acceptanceStarted = Date.now(); let acknowledgedAt: number | undefined;
       while (true) {
         if (controller.signal.aborted) fail('INVOCATION_CANCELLED', `The synchronous observer ended. Job ID: ${id}.`);
