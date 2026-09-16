@@ -156,7 +156,13 @@ export async function main(args: string[]) {
         if (config.executionMs !== -1 && Date.now() - started >= config.executionMs) fail('EXECUTION_TIMEOUT', `The synchronous observer timed out. Job ID: ${id}.`);
         await new Promise(resolve => setTimeout(resolve, 1_000));
       }
-    } catch (error) { if (accepted && error instanceof ShotError && !error.message.includes(`Job ID: ${id}`)) throw new ShotError(error.code, `${error.message} Job ID: ${id}.`); throw error; } finally { remove(); }
+    } catch (error) {
+      // A create response can be lost after the server has accepted the caller-generated ID.
+      // Always preserve it so the caller can safely retry POST /jobs or query it later.
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes(`Job ID: ${id}`)) throw new ShotError(error instanceof ShotError ? error.code : 'INTERNAL_ERROR', `${message} Job ID: ${id}.`);
+      throw error;
+    } finally { remove(); }
   }
   fail('CONFIG_INVALID', 'Usage: chatgpt-shot <config|init|login|doctor|start|status|port|submit|jobs|stop>');
 }

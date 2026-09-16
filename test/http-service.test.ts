@@ -2,11 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { call, SUBMIT_TRANSPORT_TIMEOUT_MS } from '../src/http-service.js';
+import { call, JOB_TRANSPORT_TIMEOUT_MS, SUBMIT_TRANSPORT_TIMEOUT_MS } from '../src/http-service.js';
 import { ShotError } from '../src/errors.js';
 
 test('does not give submit a shorter client-side transport timeout', () => {
   assert.equal(SUBMIT_TRANSPORT_TIMEOUT_MS, 0);
+});
+test('does not give Job acceptance a shorter client-side transport timeout', () => {
+  assert.equal(JOB_TRANSPORT_TIMEOUT_MS, 0);
 });
 
 test('restores a defined Service failure code at the HTTP client boundary', async () => {
