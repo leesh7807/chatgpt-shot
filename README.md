@@ -39,7 +39,7 @@ chatgpt-shot config set CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS 45000
 chatgpt-shot config set CHATGPT_SHOT_EXECUTION_TIMEOUT_MS 1800000
 ```
 
-Set `CHATGPT_SHOT_EXECUTION_TIMEOUT_MS` to `-1` to disable the **local execution** timeout and wait until the Invocation reaches a terminal state. This does not disable the 45-second acknowledgement timeout. An unlimited wait must be cancelled manually (for example, with `Ctrl-C` in the CLI or by cancelling the HTTP request); cancellation closes the local browser page and wait, but it does not undo a prompt that ChatGPT may already have accepted.
+Set `CHATGPT_SHOT_EXECUTION_TIMEOUT_MS` to `-1` to disable the **local execution** timeout and wait until the Invocation reaches a terminal state. This does not disable the 45-second acknowledgement timeout. An unlimited synchronous observer may be ended with `Ctrl-C`; an already accepted durable Job continues independently and can be read later.
 
 ```sh
 chatgpt-shot config set CHATGPT_SHOT_EXECUTION_TIMEOUT_MS -1
@@ -76,6 +76,8 @@ printf '%s\n' "$result"
 
 Behind the command, the Service creates a fresh Notion Invocation record with its own UUID, opens a fresh ChatGPT page, and sends ChatGPT the record link and delivery protocol. ChatGPT first acknowledges the record by changing `pending` to `in_progress`, then writes the complete Result into that same page and changes it to `completed`. The CLI reads that completed page body back; it does not treat the ChatGPT assistant message as the result. On success, standard output contains only that Result; errors are reported on standard error.
 
+Every accepted submission is also a durable **Job**, identified by the UUID stored in the Notion `ID` property. If the synchronous observer ends after acceptance, its diagnostic includes the Job ID; use `chatgpt-shot jobs` to rediscover recent Jobs or `chatgpt-shot jobs <id>` to read a Job's current state, Error, or completed Result. Ending an observer does not cancel the accepted Job.
+
 If the request cannot be safely confirmed after browser submission, `submit` fails rather than silently sending a duplicate prompt. A failure state includes the Invocation Error; an execution timeout means the local wait ended and the Notion record can be inspected for later progress. Unlike short health/control requests, submit has no separate client-side HTTP timeout: its Invocation lifecycle defines the normal terminal outcome.
 
 `submit` starts the local Service when necessary. You normally do not need to manage it. For diagnostics or an orderly shutdown:
@@ -96,9 +98,11 @@ On Linux, normal broker operation starts ordinary headful Chrome on a broker-own
 The discovery record is JSON at `$XDG_CACHE_HOME/chatgpt-shot/runtime.json` (default `~/.cache/chatgpt-shot/runtime.json`), mode `0600`. It contains `{ pid, host, port, protocolVersion, credential }`. Treat it as discovery only: call health before trusting it. All requests use `Authorization: Bearer <credential>` and bind to the record's `127.0.0.1:port`.
 
 - `GET /health` returns `200 { "pid", "protocolVersion", "accepting" }` for the current Service.
-- `POST /submit` accepts `{ "prompt": "..." }` and keeps the response open for that invocation's configured lifecycle. It returns `200 { "result": "completed Notion Result" }`. Concurrent requests receive distinct Invocations and never share results.
+- `POST /jobs` accepts `{ "id": "UUID", "prompt": "..." }` and returns after the durable Job is accepted. Repeating an ID returns the existing Job without another submission.
+- `GET /jobs` returns recent durable Job IDs and states. `GET /jobs/:id` returns `{ "id", "state", "error", "result" }`; `result` is populated only for `completed` Jobs.
+- `POST /submit` remains the synchronous compatibility surface and returns `200 { "result": "completed Notion Result" }`, implemented over a new Job.
 - `POST /stop` accepts `{}` and returns `200 { "stopping": true }`; new submissions are rejected while accepted work drains.
 
-Service failures return JSON `{ "code", "message" }` with a non-200 status. Defined application codes—including `CHATGPT_AUTH_REQUIRED`, `SUBMISSION_UNCERTAIN`, `ACKNOWLEDGMENT_TIMEOUT`, `EXECUTION_TIMEOUT`, `INVOCATION_FAILED`, and `INVOCATION_CANCELLED`—must be handled by consumers rather than collapsed into a generic transport error. A client disconnect cancels that client’s local Invocation wait and closes only its browser page; it does not stop other submissions or the Service. A prompt already accepted by ChatGPT may still have remote effects, so do not automatically resubmit an `INVOCATION_CANCELLED` or `SUBMISSION_UNCERTAIN` request.
+Service failures return JSON `{ "code", "message" }` with a non-200 status. Defined application codes—including `CHATGPT_AUTH_REQUIRED`, `SUBMISSION_UNCERTAIN`, `ACKNOWLEDGMENT_TIMEOUT`, `EXECUTION_TIMEOUT`, `INVOCATION_FAILED`, and `INVOCATION_CANCELLED`—must be handled by consumers rather than collapsed into a generic transport error. A client disconnect ends only its observation; it does not stop an accepted Job, other submissions, or the Service. Do not automatically resubmit a `SUBMISSION_UNCERTAIN` Job: inspect it by ID instead.
 
 The local `NOTION_TOKEN` and ChatGPT account's Notion connection are separate. `doctor` checks local Notion access and browser readiness, but one manually authenticated `submit` is the authoritative check that ChatGPT can update the Notion record and publish its Result.

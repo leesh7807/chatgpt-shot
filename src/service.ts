@@ -5,24 +5,31 @@ import type { NotionStore } from './notion.js';
 import { markdownResult } from './serialize.js';
 
 export type SubmitOptions = { acknowledgementMs?: number; executionMs?: number; pollMs?: number; log?: (event: string, id?: string) => void; signal?: AbortSignal };
+export type JobExecution = { job: { id: string; pageId: string; state: string; error: string }; completion: Promise<string>; created: boolean };
 export const DEFAULT_ACKNOWLEDGEMENT_MS = 45_000;
 export const DEFAULT_EXECUTION_MS = 30 * 60_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 export const wrapPrompt = (prompt: string, pageId: string) => `<task>\n${prompt}\n</task>\n\n<chatgpt-shot>\nThis block is supplied by chatgpt-shot and defines how to return the result.\n\nInvocation record:\nhttps://www.notion.so/${pageId.replace(/-/g, '')}\n\n1. Before starting the task, set State to \`in_progress\`.\n2. Complete the task in <task>.\n3. Write the complete result to the invocation page body.\n4. As the final action:\n   - success → set State to \`completed\`\n   - failure → write the reason to Error and set State to \`failed\`\n</chatgpt-shot>`;
 
-export async function submit(store: NotionStore, databaseId: string, browser: BrowserTransport, prompt: string, options: SubmitOptions = {}): Promise<string> {
+export async function startJob(store: NotionStore, databaseId: string, browser: BrowserTransport, prompt: string, id: string, options: SubmitOptions = {}): Promise<JobExecution> {
   const ackMs = options.acknowledgementMs ?? DEFAULT_ACKNOWLEDGEMENT_MS, executionMs = options.executionMs ?? DEFAULT_EXECUTION_MS, pollMs = options.pollMs ?? 2_000, log = options.log ?? (() => {});
   let invocation: { id: string; pageId: string; state: string; error: string } | undefined;
   let acknowledged: { state: string; error: string; at: number } | undefined;
   const cancelled = () => { if (options.signal?.aborted) fail('INVOCATION_CANCELLED', 'The caller cancelled this invocation.'); };
-
-  try {
-    return await browser.withBrowser(async () => {
+  // Keep the synchronous primitive usable with minimal test/delivery stores; real Job creation
+  // always supplies the durable resolver.
+  const existing = typeof (store as any).findInvocation === 'function' ? await store.findInvocation(databaseId, id) : undefined;
+  if (existing) return { job: existing, completion: Promise.resolve(''), created: false };
+  let accepted!: (value: { id: string; pageId: string; state: string; error: string }) => void;
+  let rejected!: (reason: unknown) => void;
+  const acceptance = new Promise<{ id: string; pageId: string; state: string; error: string }>((resolve, reject) => { accepted = resolve; rejected = reject; });
+  const completion = browser.withBrowser(async () => {
+    try {
       cancelled(); await browser.ensureAvailable(); cancelled(); await browser.ensureAuthenticated(); cancelled();
       // The invocation must not exist until the actual fresh submission page has passed its own
       // navigation/auth/composer preflight.
       await browser.openFreshContext(); cancelled();
-      const id = randomUUID(); invocation = await store.createInvocation(databaseId, id); log('invocation_created', id); log('browser_context_ready', id);
+      invocation = await store.createInvocation(databaseId, id); accepted(invocation); log('invocation_created', id); log('browser_context_ready', id);
       let attempts = 0; let submissionMayExist = false;
       const terminalizeUndelivered = async (error: unknown) => await store.failUndeliveredInvocation(invocation!.pageId, id, `Local delivery failed before prompt submission: ${error instanceof Error ? error.message : String(error)}`);
       const attempt = async (fresh = false) => { cancelled(); if (fresh) { await browser.openFreshContext(); cancelled(); log('browser_context_ready', id); } await browser.fillPrompt(wrapPrompt(prompt, invocation!.pageId)); cancelled(); log('prompt_filled', id); attempts++; log('submission_attempted', id); submissionMayExist = true; await browser.submitPrompt(); cancelled(); };
@@ -43,7 +50,7 @@ export async function submit(store: NotionStore, databaseId: string, browser: Br
         await deliver();
         let acknowledgementStarted = Date.now(); let inspected = false;
         while (true) {
-          cancelled(); const current = await store.readInvocation(invocation.pageId, id); cancelled();
+        const current = await store.readInvocation(invocation.pageId, id);
           if (current.state !== 'pending') { log('acknowledged', id); acknowledged = { ...current, at: Date.now() }; break; }
           if (!inspected && Date.now() - acknowledgementStarted >= ackMs) {
             inspected = true; log('submission_inspection_started', id);
@@ -74,11 +81,23 @@ export async function submit(store: NotionStore, databaseId: string, browser: Br
       };
       const immediate = await handle(acknowledgment); if (immediate !== undefined) return immediate;
       while (true) {
-        cancelled(); const current = await store.readInvocation(activeInvocation.pageId, activeInvocation.id); cancelled();
+        const current = await store.readInvocation(activeInvocation.pageId, activeInvocation.id);
         const result = await handle(current); if (result !== undefined) return result;
         if (executionMs !== -1 && Date.now() - acknowledgment.at >= executionMs) { log('local_timeout', activeInvocation.id); fail('EXECUTION_TIMEOUT', `Invocation ${activeInvocation.id} did not reach a terminal state locally.`); }
         await sleep(pollMs);
       }
-    });
-  } finally { await browser.close(); }
+    } catch (error) { if (!invocation) rejected(error); throw error; }
+  }).finally(() => browser.close());
+  // Preflight can reject before acceptance is observable. Mark that background promise handled
+  // while still returning the original rejection to a caller that did receive a Job.
+  void completion.catch(() => {});
+  const job = await acceptance;
+  return { job, completion, created: true };
+}
+
+// Compatibility for direct callers: create a caller-owned UUID and synchronously observe it.
+export async function submit(store: NotionStore, databaseId: string, browser: BrowserTransport, prompt: string, options: SubmitOptions = {}): Promise<string> {
+  const execution = await startJob(store, databaseId, browser, prompt, randomUUID(), options);
+  if (!execution.created) fail('INTERNAL_ERROR', 'A generated Job ID already exists.');
+  return execution.completion;
 }

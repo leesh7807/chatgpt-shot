@@ -1,16 +1,17 @@
 import { createServer, request as httpRequest } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, openSync, closeSync, readFileSync, renameSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { loadConfig, type Config } from './config.js';
 import { databaseIdFromUrl, NotionStore } from './notion.js';
 import { ChatGPTBrowser, manualLogin, shutdownBroker } from './browser.js';
-import { submit } from './service.js';
+import { startJob, type JobExecution } from './service.js';
 import { isErrorCode, ShotError, fail } from './errors.js';
 
 export type Discovery = { pid: number; host: '127.0.0.1'; port: number; protocolVersion: 1; credential: string };
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const responseError = (error: unknown) => error instanceof ShotError ? { code: error.code, message: error.message } : { code: 'INTERNAL_ERROR', message: error instanceof Error ? error.message : String(error) };
+const jobId = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 export function readDiscovery(config: Pick<Config, 'discoveryPath'> = loadConfig()): Discovery | undefined { try { const record = JSON.parse(readFileSync(config.discoveryPath, 'utf8')); return record?.host === '127.0.0.1' && Number.isInteger(record.port) && typeof record.credential === 'string' ? record : undefined; } catch { return undefined; } }
 function publish(config: Config, record: Discovery) { const temporary = `${config.discoveryPath}.${process.pid}.${randomBytes(4).toString('hex')}`; writeFileSync(temporary, JSON.stringify(record), { mode: 0o600 }); chmodSync(temporary, 0o600); renameSync(temporary, config.discoveryPath); chmodSync(config.discoveryPath, 0o600); }
 function removeDiscovery(config: Pick<Config, 'discoveryPath'>, credential?: string) { const current = readDiscovery(config); if (!credential || current?.credential === credential) try { unlinkSync(config.discoveryPath); } catch {} }
@@ -42,13 +43,47 @@ export async function ensureService(config = loadConfig()): Promise<Discovery> {
 export async function stopService(config: Pick<Config, 'discoveryPath'> = loadConfig()): Promise<void> { const record = await healthy(config); if (!record) { removeDiscovery(config); return; } await call(record, '/stop', {}); while (await healthy(config)) await delay(100); }
 export async function login(config = loadConfig()) { await stopService(config); await manualLogin(config.browserProfilePath); }
 export async function runService(): Promise<void> {
-  const config = loadConfig(); const startupToken = process.env.CHATGPT_SHOT_STARTUP_TOKEN; if (!startupToken || !claimStartup(config, startupToken)) return fail('BROWSER_UNAVAILABLE', 'Service startup ownership was superseded.') as never; const credential = randomBytes(32).toString('base64url'); let stopping = false; let active = 0; let server: ReturnType<typeof createServer>;
+  const config = loadConfig(); const startupToken = process.env.CHATGPT_SHOT_STARTUP_TOKEN;
+  if (!startupToken || !claimStartup(config, startupToken)) return fail('BROWSER_UNAVAILABLE', 'Service startup ownership was superseded.') as never;
+  const credential = randomBytes(32).toString('base64url'); let stopping = false; let active = 0; let server: ReturnType<typeof createServer>;
+  const creating = new Map<string, Promise<JobExecution>>();
+  const json = (res: any, status: number, body: unknown) => { if (!res.destroyed) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); } };
+  const durable = async (store: NotionStore, databaseId: string, id: string) => {
+    const invocation = await store.findInvocation(databaseId, id);
+    if (!invocation) return undefined;
+    return { id: invocation.id, state: invocation.state, error: invocation.error || null, result: invocation.state === 'completed' ? await (await import('./serialize.js')).markdownResult(store, invocation.pageId) : null };
+  };
   const stop = async () => { if (stopping) return; stopping = true; if (active) await new Promise<void>(resolve => { const timer = setInterval(() => { if (!active) { clearInterval(timer); resolve(); } }, 25); }); await shutdownBroker(config.browserProfilePath); await new Promise<void>(resolve => server.close(() => resolve())); removeDiscovery(config, credential); releaseStartup(config, startupToken); };
-  server = createServer(async (req, res) => { const unauthorized = () => { res.writeHead(401, { 'content-type': 'application/json' }); res.end(JSON.stringify({ code: 'UNAUTHORIZED', message: 'A current service credential is required.' })); };
+  server = createServer(async (req, res) => {
+    const unauthorized = () => json(res, 401, { code: 'UNAUTHORIZED', message: 'A current service credential is required.' });
     if (req.headers.authorization !== `Bearer ${credential}`) return unauthorized();
-    if (req.url === '/health' && req.method === 'GET') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ pid: process.pid, protocolVersion: 1, accepting: !stopping })); }
-    if (req.url === '/stop' && req.method === 'POST') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ stopping: true })); void stop(); return; }
-    if (req.url !== '/submit' || req.method !== 'POST' || stopping) { res.writeHead(stopping ? 503 : 404, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ code: stopping ? 'SERVICE_STOPPING' : 'NOT_FOUND', message: 'Service is not accepting this request.' })); }
-    active++; let released = false; const release = () => { if (!released) { released = true; active--; } }; let body = ''; const controller = new AbortController(); let browser: ChatGPTBrowser | undefined; const bodyDeadline = setTimeout(() => { cancel(); req.destroy(); }, 30_000); bodyDeadline.unref(); const cancel = () => { if (!res.writableEnded) { controller.abort(); void browser?.close(); } }; req.on('aborted', () => { clearTimeout(bodyDeadline); cancel(); release(); }); res.on('close', cancel); req.setEncoding('utf8'); req.on('data', chunk => body += chunk); req.on('end', async () => { clearTimeout(bodyDeadline); try { const prompt = JSON.parse(body).prompt; if (typeof prompt !== 'string' || !prompt) fail('CONFIG_INVALID', 'submit requires a non-empty prompt.'); const invocationConfig = loadConfig(); const store = new NotionStore(invocationConfig.notionToken); store.validateSchema(await store.database(databaseIdFromUrl(invocationConfig.databaseUrl))); browser = new ChatGPTBrowser(invocationConfig.browserProfilePath); const result = await submit(store, databaseIdFromUrl(invocationConfig.databaseUrl), browser, prompt, { acknowledgementMs: invocationConfig.acknowledgementMs, executionMs: invocationConfig.executionMs, signal: controller.signal }); if (!res.destroyed) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ result })); } } catch (error) { if (!res.destroyed) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify(responseError(error))); } } finally { release(); } }); });
+    if (req.url === '/health' && req.method === 'GET') return json(res, 200, { pid: process.pid, protocolVersion: 1, accepting: !stopping });
+    if (req.url === '/stop' && req.method === 'POST') { json(res, 200, { stopping: true }); void stop(); return; }
+    const match = req.url?.match(/^\/jobs\/([0-9a-f-]+)$/i);
+    if ((req.method === 'GET' && (req.url === '/jobs' || match))) {
+      try { const current = loadConfig(); const store = new NotionStore(current.notionToken); const databaseId = databaseIdFromUrl(current.databaseUrl); store.validateSchema(await store.database(databaseId));
+        if (match) { const value = await durable(store, databaseId, match[1]); return value ? json(res, 200, value) : json(res, 404, { code: 'NOT_FOUND', message: 'Job does not exist.' }); }
+        const jobs = await store.listInvocations(databaseId); return json(res, 200, { jobs: jobs.map(job => ({ id: job.id, state: job.state, error: job.error || null })) });
+      } catch (error) { return json(res, 500, responseError(error)); }
+    }
+    if ((req.url !== '/jobs' && req.url !== '/submit') || req.method !== 'POST' || stopping) return json(res, stopping ? 503 : 404, { code: stopping ? 'SERVICE_STOPPING' : 'NOT_FOUND', message: 'Service is not accepting this request.' });
+    let body = ''; req.setEncoding('utf8'); req.on('data', chunk => body += chunk); req.on('end', async () => {
+      try {
+        const input = JSON.parse(body); const prompt = input.prompt;
+        if (typeof prompt !== 'string' || !prompt.trim()) fail('CONFIG_INVALID', 'submit requires a non-empty prompt.');
+        const id = req.url === '/jobs' ? input.id : randomUUID();
+        if (!jobId(id)) fail('CONFIG_INVALID', 'jobs requires a UUID Job ID.');
+        const current = loadConfig(); const store = new NotionStore(current.notionToken); const databaseId = databaseIdFromUrl(current.databaseUrl); store.validateSchema(await store.database(databaseId));
+        let execution = creating.get(id);
+        if (!execution) {
+          execution = startJob(store, databaseId, new ChatGPTBrowser(current.browserProfilePath), prompt, id, { acknowledgementMs: current.acknowledgementMs, executionMs: current.executionMs }); creating.set(id, execution);
+          void execution.then(run => { if (!run.created) return; active++; void run.completion.catch(() => {}).finally(() => { active--; }); }).catch(() => {}).finally(() => creating.delete(id));
+        }
+        const run = await execution;
+        if (req.url === '/jobs') { const value = await durable(store, databaseId, id); return json(res, 200, value ?? { id: run.job.id, state: run.job.state, error: run.job.error || null, result: null }); }
+        try { const result = await run.completion; return json(res, 200, { result }); } catch (error) { return json(res, 500, responseError(error)); }
+      } catch (error) { return json(res, 500, responseError(error)); }
+    });
+  });
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => resolve()); }); const address = server.address(); if (!address || typeof address === 'string') return fail('INTERNAL_ERROR', 'Service did not obtain a TCP port.') as never; publish(config, { pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential }); process.once('SIGTERM', () => void stop()); process.once('SIGINT', () => void stop());
 }
