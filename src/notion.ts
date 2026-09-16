@@ -46,7 +46,26 @@ export class NotionStore {
     } catch (e) { if (e instanceof ShotError) throw e; return fail('NOTION_INIT_FAILED', 'Could not configure the supplied Invocation database.', e); }
   }
   async createInvocation(databaseId: string, id: string): Promise<Invocation> { try { const page: any = await this.client.pages.create({ parent: { database_id: databaseId }, properties: { ID: { title: [{ text: { content: id } }] }, State: { select: { name: 'pending' } }, Error: { rich_text: [] } } }); return { id, pageId: page.id, state: 'pending', error: '' }; } catch (e) { return fail('INVOCATION_CREATE_FAILED', 'Could not create pending invocation.', e); } }
+  private invocation(page: any, id: string): Invocation {
+    const state = page.properties?.State?.select?.name;
+    if (!STATES.includes(state)) fail('INVALID_INVOCATION_STATE', `Invocation ${id} has invalid State.`);
+    return { id, pageId: page.id, state, error: text(page.properties?.Error?.rich_text) };
+  }
+  // The Notion title is the durable, public Job identity.  Never retain a separate page-ID map.
+  async findInvocation(databaseId: string, id: string): Promise<Invocation | undefined> { try {
+    const found: any = await this.client.databases.query({ database_id: databaseId, filter: { property: 'ID', title: { equals: id } }, page_size: 100 });
+    if (found.results.length > 1) fail('INVALID_INVOCATION_STATE', `Job ${id} has duplicate Notion records.`);
+    return found.results[0] ? this.invocation(found.results[0], id) : undefined;
+  } catch (e) { if (e instanceof ShotError) throw e; return fail('NOTION_UNAVAILABLE', `Could not resolve Job ${id}.`, e); } }
+  async listInvocations(databaseId: string): Promise<Invocation[]> { try {
+    const found: any = await this.client.databases.query({ database_id: databaseId, sorts: [{ timestamp: 'created_time', direction: 'descending' }], page_size: 100 });
+    return found.results.map((page: any) => {
+      const id = text(page.properties?.ID?.title);
+      if (!id) fail('INVALID_INVOCATION_STATE', 'Invocation record has no ID.');
+      return this.invocation(page, id);
+    });
+  } catch (e) { if (e instanceof ShotError) throw e; return fail('NOTION_UNAVAILABLE', 'Could not list Jobs.', e); } }
   async failUndeliveredInvocation(pageId: string, id: string, reason: string): Promise<void> { try { await this.client.pages.update({ page_id: pageId, properties: { State: { select: { name: 'failed' } }, Error: { rich_text: [{ text: { content: reason.slice(0, 2_000) } }] } } }); } catch (e) { return fail('NOTION_UNAVAILABLE', `Could not terminalize undelivered invocation ${id}.`, e); } }
-  async readInvocation(pageId: string, id: string): Promise<Invocation> { try { const page: any = await this.client.pages.retrieve({ page_id: pageId }); const state = page.properties?.State?.select?.name; if (!STATES.includes(state)) return fail('INVALID_INVOCATION_STATE', `Invocation ${id} has invalid State.`); return { id, pageId, state, error: text(page.properties?.Error?.rich_text) }; } catch (e) { if (e instanceof ShotError) throw e; return fail('NOTION_UNAVAILABLE', `Could not read invocation ${id}.`, e); } }
+  async readInvocation(pageId: string, id: string): Promise<Invocation> { try { return this.invocation(await this.client.pages.retrieve({ page_id: pageId }), id); } catch (e) { if (e instanceof ShotError) throw e; return fail('NOTION_UNAVAILABLE', `Could not read invocation ${id}.`, e); } }
   async children(pageId: string): Promise<any[]> { try { let cursor: string | undefined; const all: any[] = []; do { const r: any = await this.client.blocks.children.list({ block_id: pageId, start_cursor: cursor, page_size: 100 }); all.push(...r.results); cursor = r.has_more ? r.next_cursor : undefined; } while(cursor); return all; } catch (e) { return fail('RESULT_READ_FAILED', 'Could not read invocation Result.', e); } }
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { loadConfig, openConfigInDefaultEditor, paths, readConfigValues, setConfigValue, type ConfigKey } from './config.js';
 import { ShotError, fail } from './errors.js';
 import { NotionStore, databaseIdFromUrl } from './notion.js';
@@ -8,7 +9,7 @@ import { ChatGPTBrowser } from './browser.js';
 import { call, ensureService, healthy, login, runService, stopService } from './http-service.js';
 import { installCancellationHandler } from './cancellation.js';
 const out = (value: string) => process.stdout.write(`${value}\n`);
-const commands = ['config', 'init', 'login', 'doctor', 'start', 'status', 'port', 'submit', 'stop'] as const;
+const commands = ['config', 'init', 'login', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'stop'] as const;
 type Command = typeof commands[number];
 type HelpScope = 'global' | Command;
 export type ParsedCli = { kind: 'help'; scope: HelpScope } | { kind: 'command'; command: Command; rest: string[]; prompt?: string };
@@ -25,6 +26,7 @@ Commands:
   status  Report local Service health
   port    Print the healthy local Service port
   submit  Submit one prompt and wait for its completed Result
+  jobs    List durable Jobs or read one Job
   stop    Stop the local Service after accepted work drains
 
 Run "chatgpt-shot <command> --help" for command usage.`;
@@ -81,6 +83,11 @@ Submit exactly one non-empty prompt and wait for its completed Result.
 
 Arguments:
   <prompt>   One positional prompt argument; quote it when it contains spaces.`,
+  jobs: `Usage:
+  chatgpt-shot jobs
+  chatgpt-shot jobs <id>
+
+List recent durable Jobs, or read one Job and its terminal Result or Error.`,
   stop: `Usage: chatgpt-shot stop
 
 Stop the local Service after accepted work drains.
@@ -101,6 +108,7 @@ export function parseCli(args: string[]): ParsedCli {
     if (!prompt?.trim()) fail('CONFIG_INVALID', submitUsage);
     return { kind: 'command', command, rest, prompt };
   }
+  if (command === 'jobs' && rest.length > 1) fail('CONFIG_INVALID', 'Usage: chatgpt-shot jobs [id]');
   return { kind: 'command', command, rest };
 }
 
@@ -127,7 +135,38 @@ export async function main(args: string[]) {
   if (command === 'port') { const record = await healthy(config); if (!record) return fail('BROWSER_UNAVAILABLE', 'No healthy chatgpt-shot Service is running.'); out(String(record.port)); return; }
   if (command === 'stop') { await stopService(config); out('chatgpt-shot Service stopped.'); return; }
   if (command === 'doctor') { const store = new NotionStore(config.notionToken); store.validateSchema(await store.database(databaseId)); const browser = new ChatGPTBrowser(config.browserProfilePath); await browser.withBrowser(async () => { await browser.ensureAvailable(); await browser.ensureAuthenticated(); await browser.openFreshContext(); }); out('OK: user configuration, Invocation database, browser profile, authenticated ChatGPT session, and composer are available. ChatGPT-to-Notion write access is not verified; confirm it with a smoke submit.'); return; }
-  if (command === 'submit') { const record = await ensureService(config); const controller = new AbortController(); const remove = installCancellationHandler(async () => controller.abort()); try { out((await call<{ result: string }>(record, '/submit', { prompt: parsed.prompt! }, controller.signal)).result); } finally { remove(); } return; }
-  fail('CONFIG_INVALID', 'Usage: chatgpt-shot <config|init|login|doctor|start|status|port|submit|stop>');
+  if (command === 'jobs') { const record = await ensureService(config); out(JSON.stringify(await call(record, rest[0] ? `/jobs/${rest[0]}` : '/jobs'))); return; }
+  if (command === 'submit') {
+    const record = await ensureService(config); const id = randomUUID(); const controller = new AbortController();
+    const remove = installCancellationHandler(async () => {
+      controller.abort();
+      // A caller-generated ID is the recovery identity even when the create response is lost.
+      // The signal handler exits before main's catch block can report it.
+      process.stderr.write(`INVOCATION_CANCELLED: The synchronous observer ended. Job ID: ${id}.\n`);
+    });
+    try {
+      await call(record, '/jobs', { id, prompt: parsed.prompt! }, controller.signal);
+      const acceptanceStarted = Date.now(); let acknowledgedAt: number | undefined;
+      while (true) {
+        if (controller.signal.aborted) fail('INVOCATION_CANCELLED', `The synchronous observer ended. Job ID: ${id}.`);
+        const job = await call<{ state: string; error: string | null; result: string | null }>(record, `/jobs/${id}`, undefined, controller.signal);
+        if (job.state === 'completed') { out(job.result!); return; }
+        if (job.state === 'failed') fail('INVOCATION_FAILED', `${job.error ?? 'Job failed.'} Job ID: ${id}.`);
+        if (job.state === 'pending' && Date.now() - acceptanceStarted >= config.acknowledgementMs) fail('ACKNOWLEDGMENT_TIMEOUT', `Job ${id} was not acknowledged locally.`);
+        if (job.state === 'in_progress') {
+          acknowledgedAt ??= Date.now();
+          if (config.executionMs !== -1 && Date.now() - acknowledgedAt >= config.executionMs) fail('EXECUTION_TIMEOUT', `The synchronous observer timed out. Job ID: ${id}.`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+      }
+    } catch (error) {
+      // A create response can be lost after the server has accepted the caller-generated ID.
+      // Always preserve it so the caller can safely retry POST /jobs or query it later.
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes(`Job ID: ${id}`)) throw new ShotError(error instanceof ShotError ? error.code : 'INTERNAL_ERROR', `${message} Job ID: ${id}.`);
+      throw error;
+    } finally { remove(); }
+  }
+  fail('CONFIG_INVALID', 'Usage: chatgpt-shot <config|init|login|doctor|start|status|port|submit|jobs|stop>');
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) main(process.argv.slice(2)).catch(e => { if (e instanceof ShotError) { process.stderr.write(`${e.code}: ${e.message}\n`); process.exitCode = 1; } else { process.stderr.write(`INTERNAL_ERROR: ${e instanceof Error ? e.message : String(e)}\n`); process.exitCode = 1; } });
