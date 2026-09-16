@@ -147,13 +147,17 @@ export async function main(args: string[]) {
     try {
       await call(record, '/jobs', { id, prompt: parsed.prompt! }, controller.signal);
       accepted = true;
-      const started = Date.now();
+      const acceptanceStarted = Date.now(); let acknowledgedAt: number | undefined;
       while (true) {
         if (controller.signal.aborted) fail('INVOCATION_CANCELLED', `The synchronous observer ended. Job ID: ${id}.`);
         const job = await call<{ state: string; error: string | null; result: string | null }>(record, `/jobs/${id}`, undefined, controller.signal);
         if (job.state === 'completed') { out(job.result!); return; }
         if (job.state === 'failed') fail('INVOCATION_FAILED', `${job.error ?? 'Job failed.'} Job ID: ${id}.`);
-        if (config.executionMs !== -1 && Date.now() - started >= config.executionMs) fail('EXECUTION_TIMEOUT', `The synchronous observer timed out. Job ID: ${id}.`);
+        if (job.state === 'pending' && Date.now() - acceptanceStarted >= config.acknowledgementMs) fail('ACKNOWLEDGMENT_TIMEOUT', `Job ${id} was not acknowledged locally.`);
+        if (job.state === 'in_progress') {
+          acknowledgedAt ??= Date.now();
+          if (config.executionMs !== -1 && Date.now() - acknowledgedAt >= config.executionMs) fail('EXECUTION_TIMEOUT', `The synchronous observer timed out. Job ID: ${id}.`);
+        }
         await new Promise(resolve => setTimeout(resolve, 1_000));
       }
     } catch (error) {

@@ -17,6 +17,7 @@ function publish(config: Config, record: Discovery) { const temporary = `${confi
 function removeDiscovery(config: Pick<Config, 'discoveryPath'>, credential?: string) { const current = readDiscovery(config); if (!credential || current?.credential === credential) try { unlinkSync(config.discoveryPath); } catch {} }
 export const SUBMIT_TRANSPORT_TIMEOUT_MS = 0;
 export const JOB_TRANSPORT_TIMEOUT_MS = 0;
+export const REQUEST_BODY_TIMEOUT_MS = 30_000;
 export async function call<T>(record: Discovery, path: string, body?: unknown, signal?: AbortSignal): Promise<T> { return await new Promise<T>((resolve, reject) => { const payload = body === undefined ? undefined : JSON.stringify(body); const timeout = path === '/submit' ? SUBMIT_TRANSPORT_TIMEOUT_MS : path === '/jobs' && body !== undefined ? JOB_TRANSPORT_TIMEOUT_MS : 10_000; const req = httpRequest({ host: record.host, port: record.port, path, method: body === undefined ? 'GET' : 'POST', headers: { authorization: `Bearer ${record.credential}`, ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}) }, ...(timeout ? { timeout } : {}) }, res => { let text = ''; res.setEncoding('utf8'); res.on('data', c => text += c); res.on('end', () => { try { const parsed = JSON.parse(text) as { code?: unknown; message?: unknown }; if (res.statusCode !== 200) { if (isErrorCode(parsed.code)) reject(new ShotError(parsed.code, typeof parsed.message === 'string' ? parsed.message : 'Service request failed.')); else reject(new Error(typeof parsed.message === 'string' ? parsed.message : 'Service request failed.')); } else resolve(parsed as T); } catch (error) { reject(error); } }); }); const abort = () => req.destroy(new ShotError('INVOCATION_CANCELLED', 'The caller cancelled this invocation.')); if (signal?.aborted) return abort(); signal?.addEventListener('abort', abort, { once: true }); req.once('error', reject); if (timeout) req.once('timeout', () => req.destroy(new Error('Service request timed out.'))); if (payload) req.write(payload); req.end(); }); }
 export async function healthy(config: Pick<Config, 'discoveryPath'> = loadConfig()): Promise<Discovery | undefined> { const record = readDiscovery(config); if (!record) return undefined; try { const status = await call<{ pid: number; protocolVersion: number }>(record, '/health'); return status.pid === record.pid && status.protocolVersion === 1 ? record : undefined; } catch { return undefined; } }
 function processAlive(pid: number) { try { process.kill(pid, 0); return true; } catch { return false; } }
@@ -68,7 +69,10 @@ export async function runService(): Promise<void> {
       } catch (error) { return json(res, 500, responseError(error)); }
     }
     if ((req.url !== '/jobs' && req.url !== '/submit') || req.method !== 'POST' || stopping) return json(res, stopping ? 503 : 404, { code: stopping ? 'SERVICE_STOPPING' : 'NOT_FOUND', message: 'Service is not accepting this request.' });
-    let body = ''; req.setEncoding('utf8'); req.on('data', chunk => body += chunk); req.on('end', async () => {
+    let body = ''; const bodyDeadline = setTimeout(() => req.destroy(), REQUEST_BODY_TIMEOUT_MS); bodyDeadline.unref();
+    const clearBodyDeadline = () => clearTimeout(bodyDeadline);
+    req.once('aborted', clearBodyDeadline); req.once('close', clearBodyDeadline); req.setEncoding('utf8'); req.on('data', chunk => body += chunk); req.on('end', async () => {
+      clearBodyDeadline();
       try {
         const input = JSON.parse(body); const prompt = input.prompt;
         if (typeof prompt !== 'string' || !prompt.trim()) fail('CONFIG_INVALID', 'submit requires a non-empty prompt.');
