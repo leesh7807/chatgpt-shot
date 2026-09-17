@@ -28,3 +28,10 @@ test('lists recent Job state without reading page bodies', async () => {
   assert.deepEqual(await store.listInvocations('db'), [{ id: 'job-1', pageId: 'page-1', state: 'completed', error: '' }]);
   assert.deepEqual(query.sorts, [{ timestamp: 'created_time', direction: 'descending' }]);
 });
+
+test('cleans up a confirmed undelivered Invocation by archiving it', async () => {
+  const store = new NotionStore('test-token'); let update: any;
+  (store as any).client = { pages: { update: async (value: any) => { update = value; } } };
+  await store.deleteInvocation('page-1', 'job-1');
+  assert.deepEqual(update, { page_id: 'page-1', archived: true });
+});

@@ -1,103 +1,128 @@
-import { randomUUID } from 'node:crypto';
-import { fail } from './errors.js';
-import type { BrowserTransport } from './browser.js';
-import type { NotionStore } from './notion.js';
-import { markdownResult } from './serialize.js';
+import { fail, ShotError } from './errors.js';
+import type { BrowserTransport, Inspection } from './browser.js';
+import type { Invocation, NotionStore } from './notion.js';
 
-export type SubmitOptions = { acknowledgementMs?: number; executionMs?: number; pollMs?: number; log?: (event: string, id?: string) => void; signal?: AbortSignal };
-export type JobExecution = { job: { id: string; pageId: string; state: string; error: string }; completion: Promise<string>; created: boolean };
+export type SubmitOptions = { acknowledgementMs?: number; pollMs?: number; log?: (event: string, id?: string) => void; signal?: AbortSignal };
+export type JobExecution = { job: Invocation; completion: Promise<void> };
 export const DEFAULT_ACKNOWLEDGEMENT_MS = 45_000;
-export const DEFAULT_EXECUTION_MS = 30 * 60_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 export const wrapPrompt = (prompt: string, pageId: string) => `<task>\n${prompt}\n</task>\n\n<chatgpt-shot>\nThis block is supplied by chatgpt-shot and defines how to return the result.\n\nInvocation record:\nhttps://www.notion.so/${pageId.replace(/-/g, '')}\n\n1. Before starting the task, set State to \`in_progress\`.\n2. Complete the task in <task>.\n3. Write the complete result to the invocation page body.\n4. As the final action:\n   - success → set State to \`completed\`\n   - failure → write the reason to Error and set State to \`failed\`\n</chatgpt-shot>`;
 
+const accepted = (state: string) => state === 'in_progress' || state === 'completed' || state === 'failed';
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
+
+/**
+ * Admit one Job and resolve only after the remote writer has recorded acceptance.
+ *
+ * The local writer creates the initial pending record, but it never writes a remote
+ * lifecycle state. A confirmed non-delivery is the sole path that may archive that
+ * initial record locally.
+ */
 export async function startJob(store: NotionStore, databaseId: string, browser: BrowserTransport, prompt: string, id: string, options: SubmitOptions = {}): Promise<JobExecution> {
-  const ackMs = options.acknowledgementMs ?? DEFAULT_ACKNOWLEDGEMENT_MS, executionMs = options.executionMs ?? DEFAULT_EXECUTION_MS, pollMs = options.pollMs ?? 2_000, log = options.log ?? (() => {});
-  let invocation: { id: string; pageId: string; state: string; error: string } | undefined;
-  let acknowledged: { state: string; error: string; at: number } | undefined;
-  const cancelled = () => { if (options.signal?.aborted) fail('INVOCATION_CANCELLED', 'The caller cancelled this invocation.'); };
-  // Keep the synchronous primitive usable with minimal test/delivery stores; real Job creation
-  // always supplies the durable resolver.
-  const existing = typeof (store as any).findInvocation === 'function' ? await store.findInvocation(databaseId, id) : undefined;
-  if (existing) return { job: existing, completion: Promise.resolve(''), created: false };
-  let accepted!: (value: { id: string; pageId: string; state: string; error: string }) => void;
-  let rejected!: (reason: unknown) => void;
-  const acceptance = new Promise<{ id: string; pageId: string; state: string; error: string }>((resolve, reject) => { accepted = resolve; rejected = reject; });
-  const completion = browser.withBrowser(async () => {
+  const acknowledgementMs = options.acknowledgementMs ?? DEFAULT_ACKNOWLEDGEMENT_MS;
+  const pollMs = options.pollMs ?? 2_000;
+  const log = options.log ?? (() => {});
+  let invocation: Invocation | undefined;
+  let acceptedRemotely = false;
+  let delivery: Inspection = 'not_submitted';
+  let cleanedUp = false;
+
+  const cancelled = () => {
+    if (options.signal?.aborted) fail('ADMISSION_CANCELLED', `Job admission was cancelled for ${id}.`);
+  };
+  const inspect = async (): Promise<Inspection> => {
+    try { return await browser.inspectSubmission(id); }
+    catch { return 'uncertain'; }
+  };
+  const cleanup = async () => {
+    if (!invocation || cleanedUp) return;
+    cleanedUp = true;
+    await store.deleteInvocation(invocation.pageId, id);
+  };
+  const failUndelivered = async (reason: string): Promise<never> => {
+    await cleanup();
+    return fail('SUBMISSION_FAILED', `Job ${id} was not submitted: ${reason}`);
+  };
+  let resolveAcceptance!: (job: Invocation) => void;
+  let rejectAcceptance!: (error: unknown) => void;
+  const acceptance = new Promise<Invocation>((resolve, reject) => { resolveAcceptance = resolve; rejectAcceptance = reject; });
+  const admission = browser.withBrowser(async () => {
     try {
-      cancelled(); await browser.ensureAvailable(); cancelled(); await browser.ensureAuthenticated(); cancelled();
-      // The invocation must not exist until the actual fresh submission page has passed its own
-      // navigation/auth/composer preflight.
-      await browser.openFreshContext(); cancelled();
-      invocation = await store.createInvocation(databaseId, id); accepted(invocation); log('invocation_created', id); log('browser_context_ready', id);
-      let attempts = 0; let submissionMayExist = false;
-      const terminalizeUndelivered = async (error: unknown) => await store.failUndeliveredInvocation(invocation!.pageId, id, `Local delivery failed before prompt submission: ${error instanceof Error ? error.message : String(error)}`);
-      const attempt = async (fresh = false) => { cancelled(); if (fresh) { await browser.openFreshContext(); cancelled(); log('browser_context_ready', id); } await browser.fillPrompt(wrapPrompt(prompt, invocation!.pageId)); cancelled(); log('prompt_filled', id); attempts++; log('submission_attempted', id); submissionMayExist = true; await browser.submitPrompt(); cancelled(); };
-      const deliver = async (fresh = false): Promise<void> => {
-        try { await attempt(fresh); return; }
-        catch (error: any) {
-          if (error?.code !== 'SUBMISSION_UNCERTAIN') throw error;
-          log('submission_inspection_started', id);
-          const result = await browser.inspectSubmission(id).catch(() => 'uncertain' as const);
-          if (result === 'submitted') return;
-          if (result === 'uncertain') fail('SUBMISSION_UNCERTAIN', `Submission status for ${id} is uncertain; it was not retried.`);
-          submissionMayExist = false;
-          if (attempts >= 2) fail('ACKNOWLEDGMENT_TIMEOUT', `Second submission was not acknowledged for ${id}.`);
-          log('submission_retry_attempted', id); return deliver(true);
-        }
-      };
+      cancelled();
+      await browser.ensureAvailable();
+      cancelled();
+      await browser.ensureAuthenticated();
+      cancelled();
+      await browser.openFreshContext();
+      cancelled();
+
+      invocation = await store.createInvocation(databaseId, id);
+      log('invocation_created', id);
+
       try {
-        await deliver();
-        let acknowledgementStarted = Date.now(); let inspected = false;
-        while (true) {
-        const current = await store.readInvocation(invocation.pageId, id);
-          if (current.state !== 'pending') { log('acknowledged', id); acknowledged = { ...current, at: Date.now() }; break; }
-          if (!inspected && Date.now() - acknowledgementStarted >= ackMs) {
-            inspected = true; log('submission_inspection_started', id);
-            // Losing the invocation page after a successful browser submit makes delivery
-            // ambiguous; it is never safe to reinterpret that as ordinary browser unavailability.
-            const result = await browser.inspectSubmission(id).catch(() => 'uncertain' as const);
-            if (result === 'not_submitted') {
-              submissionMayExist = false;
-              if (attempts < 2) { log('submission_retry_attempted', id); await deliver(true); acknowledgementStarted = Date.now(); inspected = false; continue; }
-              fail('ACKNOWLEDGMENT_TIMEOUT', `Second submission was not acknowledged for ${id}.`);
-            }
-            if (result === 'uncertain') fail('SUBMISSION_UNCERTAIN', `Submission status for ${id} is uncertain; it was not retried.`);
-            fail('ACKNOWLEDGMENT_TIMEOUT', `Submitted invocation ${id} was not acknowledged by Notion.`);
-          }
-          await sleep(pollMs);
-        }
+        await browser.fillPrompt(wrapPrompt(prompt, invocation.pageId));
+        cancelled();
       } catch (error) {
-        if (!submissionMayExist) await terminalizeUndelivered(error);
-        throw error;
+        return await failUndelivered(errorMessage(error));
       }
-      if (!invocation || !acknowledged) fail('INTERNAL_ERROR', 'Invocation did not reach acknowledgment handling.');
-      const activeInvocation = invocation!; const acknowledgment = acknowledged!;
-      const handle = async (current: { state: string; error: string }) => {
-        if (current.state === 'completed') { log('terminal_completed', activeInvocation.id); return markdownResult(store, activeInvocation.pageId); }
-        if (current.state === 'failed') { if (!current.error.trim()) fail('INVALID_INVOCATION_STATE', `Invocation ${activeInvocation.id} failed without Error.`); log('terminal_failed', activeInvocation.id); fail('INVOCATION_FAILED', current.error); }
-        if (current.state !== 'in_progress') fail('INVALID_INVOCATION_STATE', `Invocation ${activeInvocation.id} has invalid State ${current.state}.`);
-        return undefined;
-      };
-      const immediate = await handle(acknowledgment); if (immediate !== undefined) return immediate;
+
+      // Once the submit operation starts, delivery is no longer safely inferable from
+      // local control flow. Keep that ownership conservative until evidence or remote
+      // acceptance is observed.
+      delivery = 'uncertain';
+      log('submission_attempted', id);
+      let acknowledgementStarted: number;
+      try {
+        await browser.submitPrompt();
+        acknowledgementStarted = Date.now();
+        cancelled();
+      } catch (error) {
+        // If the submit operation interrupted, the evidence probe is part of the
+        // post-submission admission window and must not extend that budget.
+        acknowledgementStarted = Date.now();
+        delivery = await inspect();
+          if (delivery === 'not_submitted') return await failUndelivered(errorMessage(error));
+        if (delivery === 'uncertain') fail('SUBMISSION_UNCERTAIN', `Submission status for ${id} is uncertain; the Job was not retried.`);
+      }
+
       while (true) {
-        const current = await store.readInvocation(activeInvocation.pageId, activeInvocation.id);
-        const result = await handle(current); if (result !== undefined) return result;
-        if (executionMs !== -1 && Date.now() - acknowledgment.at >= executionMs) { log('local_timeout', activeInvocation.id); fail('EXECUTION_TIMEOUT', `Invocation ${activeInvocation.id} did not reach a terminal state locally.`); }
+        cancelled();
+        const current = await store.readInvocation(invocation.pageId, id);
+        if (accepted(current.state)) {
+          acceptedRemotely = true;
+          log('accepted', id);
+          resolveAcceptance(current);
+          if (current.state === 'completed' || current.state === 'failed') return current;
+          while (true) {
+            await sleep(pollMs);
+            const terminal = await store.readInvocation(invocation.pageId, id);
+            if (terminal.state === 'completed' || terminal.state === 'failed') return terminal;
+            if (terminal.state !== 'in_progress') fail('INVALID_INVOCATION_STATE', `Invocation ${id} has invalid State ${terminal.state}.`);
+          }
+        }
+        if (current.state !== 'pending') fail('INVALID_INVOCATION_STATE', `Invocation ${id} has invalid State ${current.state}.`);
+        if (Date.now() - acknowledgementStarted >= acknowledgementMs) {
+          delivery = await inspect();
+          if (delivery === 'not_submitted') return await failUndelivered('delivery evidence confirmed that the prompt did not reach ChatGPT');
+          if (delivery === 'submitted') fail('ADMISSION_TIMEOUT', `Job ${id} was submitted but remote acceptance was not observed before the acknowledgement deadline.`);
+          fail('SUBMISSION_UNCERTAIN', `Submission status for ${id} is uncertain; the Job was not retried.`);
+        }
         await sleep(pollMs);
       }
-    } catch (error) { if (!invocation) rejected(error); throw error; }
-  }).finally(() => browser.close());
-  // Preflight can reject before acceptance is observable. Mark that background promise handled
-  // while still returning the original rejection to a caller that did receive a Job.
-  void completion.catch(() => {});
-  const job = await acceptance;
-  return { job, completion, created: true };
-}
+    } catch (error) {
+      // This guard is intentionally based on delivery evidence, never on the error
+      // category. Exceptions and interruptions after submit remain uncertain.
+      if (!acceptedRemotely && delivery === 'not_submitted') await cleanup();
+      if (!acceptedRemotely) rejectAcceptance(error);
+      if (error instanceof ShotError) throw error;
+      throw error;
+    }
+  }).finally(() => browser.close().catch(() => {}));
 
-// Compatibility for direct callers: create a caller-owned UUID and synchronously observe it.
-export async function submit(store: NotionStore, databaseId: string, browser: BrowserTransport, prompt: string, options: SubmitOptions = {}): Promise<string> {
-  const execution = await startJob(store, databaseId, browser, prompt, randomUUID(), options);
-  if (!execution.created) fail('INTERNAL_ERROR', 'A generated Job ID already exists.');
-  return execution.completion;
+  void admission.catch(() => {});
+  const job = await acceptance;
+  const completion = admission.then(() => undefined);
+  void completion.catch(() => {});
+  return { job, completion };
 }

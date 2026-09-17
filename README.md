@@ -1,12 +1,8 @@
 # chatgpt-shot
 
-`chatgpt-shot` is a local, one-shot task utility. You submit a prompt; ChatGPT Web performs the work; the completed Result is read back from the matching Notion Invocation record and returned to you.
+`chatgpt-shot` is a local utility for submitting one prompt to ChatGPT Web and tracking the matching durable Notion Invocation Job. It is repository-agnostic: configuration, the retained browser profile, and runtime discovery use XDG user locations. It never automates ChatGPT login.
 
-It is not tied to the directory you run it from. Your project files, Git repository, and project `.env` are never used.
-
-## First-time setup
-
-Install from this repository, build it, and expose its declared `chatgpt-shot` command on your user PATH:
+## Setup
 
 ```sh
 npm ci
@@ -14,73 +10,99 @@ npm run build
 npm link
 ```
 
-### Linux runtime prerequisite
+On Linux, normal operation requires `Xvfb` (for example, `sudo apt install xvfb` on Debian/Ubuntu). The browser runtime uses a private headful Chrome on a broker-owned X11 display. `chatgpt-shot login` opens the dedicated profile in visible system Chrome for manual authentication; enter credentials yourself, then close the window.
 
-Normal Linux operation requires the `Xvfb` executable. Install the package supplied by your distribution before starting the broker (for example, `sudo apt install xvfb` on Debian/Ubuntu or `sudo pacman -S xorg-server-xvfb` on Arch Linux). chatgpt-shot does not install it automatically; if it is unavailable, normal browser startup fails with `BROWSER_UNAVAILABLE` and an explanation.
-
-Open a commented template in your system's default text editor and enter the two required values:
-
-```sh
-chatgpt-shot config
-```
-
-Alternatively, set them without opening an editor or locating a dotfile:
+Configure the Notion token and Invocation database:
 
 ```sh
 chatgpt-shot config set NOTION_TOKEN 'secret_notion_token'
 chatgpt-shot config set CHATGPT_SHOT_NOTION_DATABASE_URL 'https://www.notion.so/your-invocation-database'
-chatgpt-shot config show
-```
-
-Optional user-level lifecycle limits are milliseconds; defaults are 45 seconds for acknowledgement and 30 minutes for execution:
-
-```sh
-chatgpt-shot config set CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS 45000
-chatgpt-shot config set CHATGPT_SHOT_EXECUTION_TIMEOUT_MS 1800000
-```
-
-Set `CHATGPT_SHOT_EXECUTION_TIMEOUT_MS` to `-1` to disable the **local execution** timeout and wait until the Invocation reaches a terminal state. This does not disable the 45-second acknowledgement timeout. An unlimited synchronous observer may be ended with `Ctrl-C`; an already accepted durable Job continues independently and can be read later.
-
-```sh
-chatgpt-shot config set CHATGPT_SHOT_EXECUTION_TIMEOUT_MS -1
-```
-
-`config show` deliberately reports only whether values are set; it never prints the token. `config path` prints the actual configuration-file path if you need it. The file is user-owned and mode `0600`; its default location is `~/.config/chatgpt-shot/.env` (or `$XDG_CONFIG_HOME/chatgpt-shot/.env`). Do not commit it. A running Service reloads this file for every newly accepted submission, so the next `submit` uses a successfully saved token/database setting; work already accepted keeps its own original Invocation configuration.
-
-Create or validate the configured Invocation database, then log in to ChatGPT once in your normal, user-visible system Chrome:
-
-```sh
 chatgpt-shot init
 chatgpt-shot login
 chatgpt-shot doctor
 ```
 
-`login` waits for you to finish manual authentication and close Chrome. It never enters credentials for you. It uses the dedicated chatgpt-shot profile on your current desktop so you can complete authentication normally.
+The configuration file is user-owned with mode `0600` at `~/.config/chatgpt-shot/.env`, or `$XDG_CONFIG_HOME/chatgpt-shot/.env`. The retained browser profile is at `~/.local/share/chatgpt-shot/chrome-profile`, and Service discovery is at `~/.cache/chatgpt-shot/runtime.json`; XDG overrides apply. `config show` never prints the token.
 
-Each submission is expected to use the model and reasoning-effort settings of the ChatGPT profile authenticated during `login`. chatgpt-shot does not verify either setting, so confirm them in ChatGPT when they matter to a task.
-
-## Everyday use
+The only optional lifecycle setting is the acknowledgement budget after prompt submission:
 
 ```sh
-chatgpt-shot submit "Summarize the attached material and write the result to the Invocation record."
+chatgpt-shot config set CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS 45000
 ```
 
-The canonical user and agent interface is `chatgpt-shot submit "<prompt>"`: it accepts exactly one non-empty positional prompt.
+Service startup, configuration/schema validation, Notion calls before submission, browser readiness, Invocation creation, prompt filling, and the prompt submission operation itself are not charged to this budget. There is no execution timeout: submission ends after remote acceptance, while terminal Result and Error remain Job read concerns.
 
-`submit` is synchronous: it returns only when this one invocation reaches `completed` (or a bounded failure/timeout). The command prints the exact completed Notion **Result** body to standard output, so a shell script can receive it directly:
+## Async Job submission
+
+The canonical flow is:
 
 ```sh
-result="$(chatgpt-shot submit "Write a three-bullet release summary.")"
-printf '%s\n' "$result"
+id="$(chatgpt-shot submit "Write a three-bullet release summary.")"
+
+chatgpt-shot jobs "$id"
 ```
 
-Behind the command, the Service creates a fresh Notion Invocation record with its own UUID, opens a fresh ChatGPT page, and sends ChatGPT the record link and delivery protocol. ChatGPT first acknowledges the record by changing `pending` to `in_progress`, then writes the complete Result into that same page and changes it to `completed`. The CLI reads that completed page body back; it does not treat the ChatGPT assistant message as the result. On success, standard output contains only that Result; errors are reported on standard error.
+On success, `submit` prints exactly one Service-generated UUID to standard output and exits after remote acceptance is observed. It does not print a Result, State, or Error, and it does not wait for terminal completion. `chatgpt-shot jobs` lists recent Jobs; `chatgpt-shot jobs <uuid>` reads the current Job snapshot:
 
-Every accepted submission is also a durable **Job**, identified by the UUID stored in the Notion `ID` property. If the synchronous observer ends after acceptance, its diagnostic includes the Job ID; use `chatgpt-shot jobs` to rediscover recent Jobs or `chatgpt-shot jobs <id>` to read a Job's current state, Error, or completed Result. Ending an observer does not cancel the accepted Job.
+```json
+{
+  "id": "...",
+  "state": "completed",
+  "error": null,
+  "result": "..."
+}
+```
 
-If the request cannot be safely confirmed after browser submission, `submit` fails rather than silently sending a duplicate prompt. A failure state includes the Invocation Error; an execution timeout means the local wait ended and the Notion record can be inspected for later progress. Unlike short health/control requests, submit has no separate client-side HTTP timeout: its Invocation lifecycle defines the normal terminal outcome.
+The durable Job is the existing Notion Invocation record. Its remote-owned lifecycle states are `in_progress`, `completed`, and `failed`; observing any of them proves remote acceptance, including when `completed` or `failed` is the first state observed. The existing remote Invocation protocol owns those writes. A failed Job's Error is the existing remote Error value and is returned unchanged by the Job read surface; submission errors are a separate caller-facing contract.
 
-`submit` starts the local Service when necessary. You normally do not need to manage it. For diagnostics or an orderly shutdown:
+After returning the UUID, the local Service may keep the browser context and a background observer alive until the remote Job reaches a terminal state. This does not make terminal completion part of the `submit` command.
+
+After the browser submit attempt, the adapter classifies prompt delivery from testable local evidence:
+
+* `not_submitted` means evidence confirms that the prompt did not reach ChatGPT. Only this status permits local cleanup of the initial pending Invocation, and it is returned as a submission failure. It is not represented as a remote `failed` Job.
+* `submitted` means evidence confirms prompt delivery. The local writer does not write State or Error and waits for remote acceptance.
+* `uncertain` means the submit action occurred but local evidence proves neither delivery nor non-delivery. It is a caller-facing `SUBMISSION_UNCERTAIN` failure; the local writer does not write State or Error and does not clean up the Invocation.
+
+An exception, interruption, acknowledgement timeout, or lost observer is not by itself evidence of `not_submitted`. If delivery cannot be proven either way, the result is `uncertain`. Once prompt delivery may have occurred, local admission failures never overwrite the remote Job lifecycle. Submission errors such as `ADMISSION_TIMEOUT`, `ADMISSION_CANCELLED`, `SUBMISSION_FAILED`, and `SUBMISSION_UNCERTAIN` are not Job lifecycle states and are not a submission history.
+
+## Local HTTP contract
+
+The Service binds only to `127.0.0.1` on an OS-selected port. Its owner-only discovery record contains `{ pid, host, port, protocolVersion, credential }`. Treat that file as discovery only, call health before trusting it, and send the same bearer credential on every request below.
+
+```http
+GET /health
+Authorization: Bearer <credential>
+```
+
+```http
+POST /jobs
+Authorization: Bearer <credential>
+Content-Type: application/json
+
+{"prompt":"<non-empty prompt>"}
+```
+
+The successful response is only:
+
+```json
+{"id":"<Service-generated UUID>"}
+```
+
+The response is sent after remote acceptance, even when the first observed state is `completed` or `failed`. Caller-supplied Job IDs are not accepted.
+
+```http
+GET /jobs
+Authorization: Bearer <credential>
+
+GET /jobs/<uuid>
+Authorization: Bearer <credential>
+```
+
+`GET /jobs/<uuid>` returns the current durable State, Result, and Error. `GET /jobs` returns recent Job summaries. All Job HTTP surfaces require bearer authentication; knowing a UUID is not enough to read or create a Job.
+
+Service failures return JSON `{ "code", "message" }` with a non-200 status. `in_progress`, `completed`, and `failed` are remote acceptance evidence, while `pending` is only the pre-acceptance Notion record state. Terminal Result and Error are read from the Job surface after submission.
+
+For diagnostics or orderly shutdown:
 
 ```sh
 chatgpt-shot start
@@ -89,20 +111,4 @@ chatgpt-shot port
 chatgpt-shot stop
 ```
 
-The Service binds only `127.0.0.1` on an OS-selected port. Its owner-only discovery record supplies an ephemeral bearer credential; independent local consumers use that authenticated HTTP contract for health, submission, and stop operations. Persistent Chrome session data lives at `~/.local/share/chatgpt-shot/chrome-profile` by default and runtime discovery at `~/.cache/chatgpt-shot/runtime.json`; XDG overrides apply.
-
-On Linux, normal broker operation starts ordinary headful Chrome on a broker-owned private Xvfb display rather than on your physical desktop. The broker explicitly selects Chrome's X11 backend for this child, including when the host desktop uses Wayland. Chrome keeps its authenticated dedicated profile, private CDP pipe, and persistent control page, while each submission still opens and closes only its own ChatGPT invocation page. Xvfb is a private framebuffer, not a visible desktop, so no chatgpt-shot Chrome window appears on your desktop and you do not need to keep or minimize one. This is not headless or stealth automation. `chatgpt-shot login` is intentionally different: it opens the same dedicated profile in a visible system Chrome window; after you authenticate and close it, the private-display runtime reuses that session.
-
-## Local HTTP contract
-
-The discovery record is JSON at `$XDG_CACHE_HOME/chatgpt-shot/runtime.json` (default `~/.cache/chatgpt-shot/runtime.json`), mode `0600`. It contains `{ pid, host, port, protocolVersion, credential }`. Treat it as discovery only: call health before trusting it. All requests use `Authorization: Bearer <credential>` and bind to the record's `127.0.0.1:port`.
-
-- `GET /health` returns `200 { "pid", "protocolVersion", "accepting" }` for the current Service.
-- `POST /jobs` accepts `{ "id": "UUID", "prompt": "..." }` and returns after the durable Job is accepted. Repeating an ID returns the existing Job without another submission.
-- `GET /jobs` returns recent durable Job IDs and states. `GET /jobs/:id` returns `{ "id", "state", "error", "result" }`; `result` is populated only for `completed` Jobs.
-- `POST /submit` remains the synchronous compatibility surface and returns `200 { "result": "completed Notion Result" }`, implemented over a new Job.
-- `POST /stop` accepts `{}` and returns `200 { "stopping": true }`; new submissions are rejected while accepted work drains.
-
-Service failures return JSON `{ "code", "message" }` with a non-200 status. Defined application codes—including `CHATGPT_AUTH_REQUIRED`, `SUBMISSION_UNCERTAIN`, `ACKNOWLEDGMENT_TIMEOUT`, `EXECUTION_TIMEOUT`, `INVOCATION_FAILED`, and `INVOCATION_CANCELLED`—must be handled by consumers rather than collapsed into a generic transport error. A client disconnect ends only its observation; it does not stop an accepted Job, other submissions, or the Service. Do not automatically resubmit a `SUBMISSION_UNCERTAIN` Job: inspect it by ID instead.
-
-The local `NOTION_TOKEN` and ChatGPT account's Notion connection are separate. `doctor` checks local Notion access and browser readiness, but one manually authenticated `submit` is the authoritative check that ChatGPT can update the Notion record and publish its Result.
+`stop` rejects new admissions and waits for current admission operations to finish. An accepted remote Job remains owned by ChatGPT and can be read later with its UUID.

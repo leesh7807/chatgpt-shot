@@ -65,7 +65,7 @@ export class NotionStore {
       return this.invocation(page, id);
     });
   } catch (e) { if (e instanceof ShotError) throw e; return fail('NOTION_UNAVAILABLE', 'Could not list Jobs.', e); } }
-  async failUndeliveredInvocation(pageId: string, id: string, reason: string): Promise<void> { try { await this.client.pages.update({ page_id: pageId, properties: { State: { select: { name: 'failed' } }, Error: { rich_text: [{ text: { content: reason.slice(0, 2_000) } }] } } }); } catch (e) { return fail('NOTION_UNAVAILABLE', `Could not terminalize undelivered invocation ${id}.`, e); } }
+  async deleteInvocation(pageId: string, id: string): Promise<void> { try { await this.client.pages.update({ page_id: pageId, archived: true }); } catch (e) { return fail('NOTION_UNAVAILABLE', `Could not clean up undelivered invocation ${id}.`, e); } }
   async readInvocation(pageId: string, id: string): Promise<Invocation> { try { return this.invocation(await this.client.pages.retrieve({ page_id: pageId }), id); } catch (e) { if (e instanceof ShotError) throw e; return fail('NOTION_UNAVAILABLE', `Could not read invocation ${id}.`, e); } }
   async children(pageId: string): Promise<any[]> { try { let cursor: string | undefined; const all: any[] = []; do { const r: any = await this.client.blocks.children.list({ block_id: pageId, start_cursor: cursor, page_size: 100 }); all.push(...r.results); cursor = r.has_more ? r.next_cursor : undefined; } while(cursor); return all; } catch (e) { return fail('RESULT_READ_FAILED', 'Could not read invocation Result.', e); } }
 }

@@ -8,7 +8,7 @@ class SignalHost extends EventEmitter {
   exit(code?: number): never { this.exitCodes.push(code ?? 0); return undefined as never; }
 }
 
-test('SIGINT closes the invocation tab before the CLI exits', async () => {
+test('SIGINT invokes cancellation before the CLI exits', async () => {
   const host = new SignalHost();
   let closes = 0;
   const remove = installCancellationHandler(async () => { closes++; }, host as any);

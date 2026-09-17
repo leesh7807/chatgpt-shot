@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { brokerSocket, chromeArguments, chromeEnvironment, privateDisplayArguments, privateDisplayFromOutput, privateXAuthority } from '../src/broker.js';
+import { brokerSocket, chromeArguments, chromeEnvironment, classifySubmissionEvidence, privateDisplayArguments, privateDisplayFromOutput, privateXAuthority } from '../src/broker.js';
 
 test('uses a short hashed owner-runtime socket path for deep repositories', () => {
   const root = `/tmp/${'deep/'.repeat(80)}repository`;
@@ -54,4 +54,11 @@ test('keeps Linux Chrome headful and selects the private X11 display', () => {
 
 test('does not select the X11 backend for non-Linux Chrome', () => {
   assert.ok(!chromeArguments('/tmp/chatgpt-shot-profile', 'darwin').includes('--ozone-platform=x11'));
+});
+
+test('classifies browser delivery from observable prompt evidence', () => {
+  assert.equal(classifySubmissionEvidence('job-1', { seen: true, composerValue: '' }), 'submitted');
+  assert.equal(classifySubmissionEvidence('job-1', { seen: false, composerValue: 'wrapped job-1 prompt' }), 'not_submitted');
+  assert.equal(classifySubmissionEvidence('job-1', { seen: false, composerValue: '' }), 'uncertain');
+  assert.equal(classifySubmissionEvidence('job-1', { seen: true, composerValue: 'job-1' }), 'uncertain');
 });
