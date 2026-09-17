@@ -29,7 +29,8 @@ test('every public command has local help on both supported flags', () => {
     ['start', /Usage: chatgpt-shot start\n\nStart the local Service/],
     ['status', /Usage: chatgpt-shot status\n\nReport whether/],
     ['port', /Usage: chatgpt-shot port\n\nPrint the port/],
-    ['submit', /Usage: chatgpt-shot submit "<prompt>"\n\nSubmit exactly one non-empty prompt/],
+    ['submit', /Usage: chatgpt-shot submit "<prompt>"\n\nSubmit exactly one non-empty prompt and print its accepted Job UUID/],
+    ['jobs', /Usage:\n  chatgpt-shot jobs[\s\S]*current State, Result, or Error/],
     ['stop', /Usage: chatgpt-shot stop\n\nStop the local Service/]
   ]);
   try {
@@ -49,7 +50,7 @@ test('every public command has local help on both supported flags', () => {
 
 test('help tokens resolve to their scope and are not submit prompts', () => {
   assert.deepEqual(parseCli(['--help']), { kind: 'help', scope: 'global' });
-  for (const command of ['config', 'init', 'login', 'doctor', 'start', 'status', 'port', 'submit', 'stop'] as const) {
+  for (const command of ['config', 'init', 'login', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'stop'] as const) {
     for (const flag of ['--help', '-h']) assert.deepEqual(parseCli([command, flag]), { kind: 'help', scope: command });
   }
   assert.deepEqual(parseCli(['submit', '--help']), { kind: 'help', scope: 'submit' });
@@ -58,7 +59,7 @@ test('help tokens resolve to their scope and are not submit prompts', () => {
 
 test('submit accepts one positional prompt exactly and preserves it', () => {
   assert.deepEqual(parseCli(['submit', 'review this']), { kind: 'command', command: 'submit', rest: ['review this'], prompt: 'review this' });
-  for (const args of [['submit'], ['submit', 'review', 'this'], ['submit', '']]) {
+  for (const args of [['submit'], ['submit', 'review', 'this'], ['submit', ''], ['submit', '--wait']]) {
     assert.throws(() => parseCli(args), (error: unknown) => error instanceof ShotError && error.code === 'CONFIG_INVALID' && error.message === 'Usage: chatgpt-shot submit "<prompt>"');
   }
 });
@@ -66,7 +67,7 @@ test('submit accepts one positional prompt exactly and preserves it', () => {
 test('submit rejects missing or multiple positional prompts before configuration is loaded', () => {
   const directory = mkdtempSync(join(tmpdir(), 'chatgpt-shot-cli-'));
   try {
-    for (const args of [['submit'], ['submit', 'review', 'this']]) {
+    for (const args of [['submit'], ['submit', 'review', 'this'], ['submit', '--wait']]) {
       const result = cli(args, directory);
       assert.equal(result.status, 1); assert.equal(result.stdout, '');
       assert.equal(result.stderr, 'CONFIG_INVALID: Usage: chatgpt-shot submit "<prompt>"\n');

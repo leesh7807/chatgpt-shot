@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { randomUUID } from 'node:crypto';
 import { loadConfig, openConfigInDefaultEditor, paths, readConfigValues, setConfigValue, type ConfigKey } from './config.js';
 import { ShotError, fail } from './errors.js';
 import { NotionStore, databaseIdFromUrl } from './notion.js';
@@ -14,6 +13,7 @@ type Command = typeof commands[number];
 type HelpScope = 'global' | Command;
 export type ParsedCli = { kind: 'help'; scope: HelpScope } | { kind: 'command'; command: Command; rest: string[]; prompt?: string };
 const submitUsage = 'Usage: chatgpt-shot submit "<prompt>"';
+const isUuid = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 
 const globalHelp = `Usage: chatgpt-shot <command> [arguments]
 
@@ -25,7 +25,7 @@ Commands:
   start   Start the local Service and print its port
   status  Report local Service health
   port    Print the healthy local Service port
-  submit  Submit one prompt and wait for its completed Result
+  submit  Submit one prompt and print its accepted Job UUID
   jobs    List durable Jobs or read one Job
   stop    Stop the local Service after accepted work drains
 
@@ -46,7 +46,7 @@ Forms:
   config set KEY VALUE   Save one supported configuration value.
 
 Supported keys: NOTION_TOKEN, CHATGPT_SHOT_NOTION_DATABASE_URL,
-CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS, CHATGPT_SHOT_EXECUTION_TIMEOUT_MS.`,
+CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS.`,
   init: `Usage: chatgpt-shot init
 
 Create or validate the configured Notion Invocation database.
@@ -77,9 +77,9 @@ Arguments: none.`,
 Print the port of the healthy local Service.
 
 Arguments: none.`,
-  submit: `${submitUsage}
+submit: `${submitUsage}
 
-Submit exactly one non-empty prompt and wait for its completed Result.
+Submit exactly one non-empty prompt and print its accepted Job UUID.
 
 Arguments:
   <prompt>   One positional prompt argument; quote it when it contains spaces.`,
@@ -87,7 +87,7 @@ Arguments:
   chatgpt-shot jobs
   chatgpt-shot jobs <id>
 
-List recent durable Jobs, or read one Job and its terminal Result or Error.`,
+List recent durable Jobs, or read one Job's current State, Result, or Error.`,
   stop: `Usage: chatgpt-shot stop
 
 Stop the local Service after accepted work drains.
@@ -105,7 +105,7 @@ export function parseCli(args: string[]): ParsedCli {
   if (rest.length === 1 && isHelp(rest[0])) return { kind: 'help', scope: command };
   if (command === 'submit') {
     const prompt = rest.length === 1 ? rest[0] : undefined;
-    if (!prompt?.trim()) fail('CONFIG_INVALID', submitUsage);
+    if (!prompt?.trim() || prompt === '--wait') fail('CONFIG_INVALID', submitUsage);
     return { kind: 'command', command, rest, prompt };
   }
   if (command === 'jobs' && rest.length > 1) fail('CONFIG_INVALID', 'Usage: chatgpt-shot jobs [id]');
@@ -123,8 +123,8 @@ export async function main(args: string[]) {
     const [action, key, ...valueParts] = rest; const state = paths();
     if (!action) { await openConfigInDefaultEditor(state); return out(`opened configuration: ${state.envPath}`); }
     if (action === 'path' && !key) return out(state.envPath);
-    if (action === 'show' && !key) { const values = readConfigValues(state); return out(`configuration: ${state.envPath}\nNOTION_TOKEN: ${values.NOTION_TOKEN ? 'set' : 'missing'}\nCHATGPT_SHOT_NOTION_DATABASE_URL: ${values.CHATGPT_SHOT_NOTION_DATABASE_URL ? 'set' : 'missing'}\nCHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS: ${values.CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS ?? '45000 (default)'}\nCHATGPT_SHOT_EXECUTION_TIMEOUT_MS: ${values.CHATGPT_SHOT_EXECUTION_TIMEOUT_MS ?? '1800000 (default)'}`); }
-    if (action === 'set' && (key === 'NOTION_TOKEN' || key === 'CHATGPT_SHOT_NOTION_DATABASE_URL' || key === 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS' || key === 'CHATGPT_SHOT_EXECUTION_TIMEOUT_MS') && valueParts.length) { setConfigValue(key as ConfigKey, valueParts.join(' '), state); return out(`saved ${key}`); }
+    if (action === 'show' && !key) { const values = readConfigValues(state); return out(`configuration: ${state.envPath}\nNOTION_TOKEN: ${values.NOTION_TOKEN ? 'set' : 'missing'}\nCHATGPT_SHOT_NOTION_DATABASE_URL: ${values.CHATGPT_SHOT_NOTION_DATABASE_URL ? 'set' : 'missing'}\nCHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS: ${values.CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS ?? '45000 (default)'}`); }
+    if (action === 'set' && (key === 'NOTION_TOKEN' || key === 'CHATGPT_SHOT_NOTION_DATABASE_URL' || key === 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS') && valueParts.length) { setConfigValue(key as ConfigKey, valueParts.join(' '), state); return out(`saved ${key}`); }
     return fail('CONFIG_INVALID', 'Usage: chatgpt-shot config [path|show|set KEY VALUE]');
   }
   const config = loadConfig(); const databaseId = databaseIdFromUrl(config.databaseUrl);
@@ -137,35 +137,14 @@ export async function main(args: string[]) {
   if (command === 'doctor') { const store = new NotionStore(config.notionToken); store.validateSchema(await store.database(databaseId)); const browser = new ChatGPTBrowser(config.browserProfilePath); await browser.withBrowser(async () => { await browser.ensureAvailable(); await browser.ensureAuthenticated(); await browser.openFreshContext(); }); out('OK: user configuration, Invocation database, browser profile, authenticated ChatGPT session, and composer are available. ChatGPT-to-Notion write access is not verified; confirm it with a smoke submit.'); return; }
   if (command === 'jobs') { const record = await ensureService(config); out(JSON.stringify(await call(record, rest[0] ? `/jobs/${rest[0]}` : '/jobs'))); return; }
   if (command === 'submit') {
-    const record = await ensureService(config); const id = randomUUID(); const controller = new AbortController();
-    const remove = installCancellationHandler(async () => {
-      controller.abort();
-      // A caller-generated ID is the recovery identity even when the create response is lost.
-      // The signal handler exits before main's catch block can report it.
-      process.stderr.write(`INVOCATION_CANCELLED: The synchronous observer ended. Job ID: ${id}.\n`);
-    });
+    const record = await ensureService(config); const controller = new AbortController();
+    const remove = installCancellationHandler(async () => { controller.abort(); });
     try {
-      await call(record, '/jobs', { id, prompt: parsed.prompt! }, controller.signal);
-      const acceptanceStarted = Date.now(); let acknowledgedAt: number | undefined;
-      while (true) {
-        if (controller.signal.aborted) fail('INVOCATION_CANCELLED', `The synchronous observer ended. Job ID: ${id}.`);
-        const job = await call<{ state: string; error: string | null; result: string | null }>(record, `/jobs/${id}`, undefined, controller.signal);
-        if (job.state === 'completed') { out(job.result!); return; }
-        if (job.state === 'failed') fail('INVOCATION_FAILED', `${job.error ?? 'Job failed.'} Job ID: ${id}.`);
-        if (job.state === 'pending' && Date.now() - acceptanceStarted >= config.acknowledgementMs) fail('ACKNOWLEDGMENT_TIMEOUT', `Job ${id} was not acknowledged locally.`);
-        if (job.state === 'in_progress') {
-          acknowledgedAt ??= Date.now();
-          if (config.executionMs !== -1 && Date.now() - acknowledgedAt >= config.executionMs) fail('EXECUTION_TIMEOUT', `The synchronous observer timed out. Job ID: ${id}.`);
-        }
-        await new Promise(resolve => setTimeout(resolve, 1_000));
-      }
-    } catch (error) {
-      // A create response can be lost after the server has accepted the caller-generated ID.
-      // Always preserve it so the caller can safely retry POST /jobs or query it later.
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes(`Job ID: ${id}`)) throw new ShotError(error instanceof ShotError ? error.code : 'INTERNAL_ERROR', `${message} Job ID: ${id}.`);
-      throw error;
+      const accepted = await call<{ id: string }>(record, '/jobs', { prompt: parsed.prompt! }, controller.signal);
+      if (!isUuid(accepted.id)) throw new ShotError('INTERNAL_ERROR', 'Service returned an invalid Job ID.');
+      out(accepted.id);
     } finally { remove(); }
+    return;
   }
   fail('CONFIG_INVALID', 'Usage: chatgpt-shot <config|init|login|doctor|start|status|port|submit|jobs|stop>');
 }
