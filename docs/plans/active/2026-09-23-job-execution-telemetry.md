@@ -62,8 +62,8 @@ Telemetry는 장기간 누적될 수 있는 개발·개선용 local diagnostic d
 
 ## chatgpt-shot review log
 
-- Reviewed HEAD: `d2b0706c4427a0d4d1d055280a5342c33ac69944`
-- Verdict: `FINDINGS`
-- Finding accepted: `test/job-telemetry.test.ts:6-8` hard-coded the developer's checkout directory name, so the canonical-root test failed in a differently named clone/worktree.
-- Applied commit: `2616838acc35d3ddcc86a922de615e4eb8357ee8`
-- Verification: independently reproduced the failure in `/tmp/chatgpt-shot-telemetry-fixed`; current checkout `npm test` 80/80 passed and `npm run build` passed before the review fix; alternate-worktree verification will be rerun on the fix HEAD.
+- Reviewed HEAD: `70da5a762fe163ef42ff36751e9bb39b04cac57c`
+- Verdict: `PASS`
+- Finding accepted from prior round: `test/job-telemetry.test.ts:6-8` checkout-name hardcoding; fixed by deriving the expected root from the test file location.
+- Applied commit: `70da5a762fe163ef42ff36751e9bb39b04cac57c`
+- Verification: `npm test` 80/80 passed, `npm run build` passed, `git diff HEAD^ HEAD --check` passed, and the telemetry-root test passed in a differently named worktree. PR ledger comments recorded the prior finding and this PASS.
