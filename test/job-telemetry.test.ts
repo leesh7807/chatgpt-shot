@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { chatgptShotRepositoryRoot, JOB_TELEMETRY_RELATIVE_PATH, jobTelemetryPath, LocalJobTelemetryWriter } from '../src/job-telemetry.js';
 
 test('resolves canonical telemetry storage from the executing checkout', () => {
-  assert.ok(chatgptShotRepositoryRoot?.endsWith('/chatgpt-shot-job-execution-telemetry'));
+  const expectedRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
+  assert.equal(chatgptShotRepositoryRoot, expectedRoot);
   assert.equal(jobTelemetryPath, join(chatgptShotRepositoryRoot!, JOB_TELEMETRY_RELATIVE_PATH));
 });
 

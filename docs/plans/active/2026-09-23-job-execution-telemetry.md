@@ -62,8 +62,8 @@ Telemetry는 장기간 누적될 수 있는 개발·개선용 local diagnostic d
 
 ## chatgpt-shot review log
 
-- Reviewed HEAD: `4adc25770b229c9120cddc46caa47eb86826b16d`
-- Verdict: blocked before review; GitHub reports no open PR for this branch and the request did not provide a PR URL
-- Findings: none; no `chatgpt-shot submit` code review was run
-- Applied commit: `4adc25770b229c9120cddc46caa47eb86826b16d`
-- Verification: `npm test` 80/80 passed, `npm run build` passed, `git diff HEAD^ HEAD --check` passed; canonical writer smoke append resolved to this checkout's `.local/chatgpt-shot/jobs.jsonl`
+- Reviewed HEAD: `d2b0706c4427a0d4d1d055280a5342c33ac69944`
+- Verdict: `FINDINGS`
+- Finding accepted: `test/job-telemetry.test.ts:6-8` hard-coded the developer's checkout directory name, so the canonical-root test failed in a differently named clone/worktree.
+- Applied commit: `2616838acc35d3ddcc86a922de615e4eb8357ee8`
+- Verification: independently reproduced the failure in `/tmp/chatgpt-shot-telemetry-fixed`; current checkout `npm test` 80/80 passed and `npm run build` passed before the review fix; alternate-worktree verification will be rerun on the fix HEAD.
