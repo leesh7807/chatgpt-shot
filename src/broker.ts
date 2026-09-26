@@ -6,12 +6,13 @@ import { homedir } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { fail, isStaleBrowserSessionError } from './errors.js';
 
-type Request = { operation: string; sessionId?: string; prompt?: string; invocationId?: string };
+type Request = { operation: string; sessionId?: string; prompt?: string; submissionMarker?: string; diagnostics?: boolean };
 type Response = { ok: true; value?: unknown } | { ok: false; code: string; message: string };
 type Message = { id?: number; sessionId?: string; result?: any; error?: { message: string } };
 export type SubmissionEvidence = { seen: boolean; composerValue: string };
 export type SubmissionInspection = 'submitted' | 'not_submitted' | 'uncertain';
-export const classifySubmissionEvidence = (invocationId: string, evidence: SubmissionEvidence): SubmissionInspection => evidence.seen && !evidence.composerValue.includes(invocationId) ? 'submitted' : !evidence.seen && evidence.composerValue.includes(invocationId) ? 'not_submitted' : 'uncertain';
+export const classifySubmissionEvidence = (submissionMarker: string, evidence: SubmissionEvidence): SubmissionInspection => !submissionMarker ? 'uncertain' : evidence.seen && !evidence.composerValue.includes(submissionMarker) ? 'submitted' : !evidence.seen && evidence.composerValue.includes(submissionMarker) ? 'not_submitted' : 'uncertain';
+export const SEND_BUTTON_LABEL_PATTERN = /^(?:send|send message|send prompt)$/i;
 type VirtualDisplay = { process: ChildProcess; display: string; authorizationPath: string };
 const uid = process.getuid?.();
 const ownedDirectory = (path: string) => { try { const stat = lstatSync(path); return stat.isDirectory() && (uid === undefined || stat.uid === uid) && (stat.mode & 0o022) === 0; } catch { return false; } };
@@ -114,7 +115,7 @@ class Page {
   constructor(readonly targetId: string, readonly sessionId: string, private readonly cdp: PipeCdp) {}
   async within<T>(deadline: number, operation: () => Promise<T>): Promise<T> { const previous = this.deadline; this.deadline = Math.min(previous, deadline); try { return await operation(); } finally { this.deadline = previous; } }
   private remaining() { const ms = this.deadline - Date.now(); if (ms <= 0) fail('BROWSER_UNAVAILABLE', 'ChatGPT browser operation exceeded its broker deadline.'); return Math.min(30_000, ms); }
-  async evaluate<T>(expression: string, args: unknown[] = []): Promise<T> { const result = await this.cdp.send('Runtime.evaluate', { expression: `(${expression})(...${JSON.stringify(args)})`, awaitPromise: true, returnByValue: true }, this.sessionId, this.remaining()); if (result.exceptionDetails) throw new Error(result.exceptionDetails.text ?? 'Page evaluation failed.'); return result.result.value as T; }
+  async evaluate<T>(expression: string, args: unknown[] = []): Promise<T> { const result = await this.cdp.send('Runtime.evaluate', { expression: `(${expression})(...${JSON.stringify(args)})`, awaitPromise: true, returnByValue: true }, this.sessionId, this.remaining()); if (result.exceptionDetails) { const detail = result.exceptionDetails.exception?.description ?? result.exceptionDetails.exception?.value ?? result.exceptionDetails.text ?? 'Page evaluation failed.'; throw new Error(String(detail).split('\n', 1)[0].slice(0, 500)); } return result.result.value as T; }
   async navigate(url = 'https://chatgpt.com/') {
     await this.cdp.send('Page.enable', {}, this.sessionId, this.remaining());
     const result = await this.cdp.send('Page.navigate', { url }, this.sessionId, this.remaining());
@@ -132,11 +133,25 @@ class Page {
 const visibility = `const visible=e=>{const s=getComputedStyle(e),b=e.getBoundingClientRect();return s.visibility!=='hidden'&&s.display!=='none'&&b.width>0&&b.height>0};`;
 const authProbe = `()=>{${visibility}const c=[...document.querySelectorAll('a,button')].filter(visible);const loginVisible=c.some(e=>/^(log in|sign up)$/i.test((e.textContent||'').trim())||/\\/(auth|login)/i.test(e.href||''));const accountVisible=c.some(e=>/(account|profile|settings|upgrade plan|my plan|log out|user menu|avatar)/i.test([e.getAttribute('aria-label'),e.getAttribute('title'),e.getAttribute('data-testid'),e.textContent].filter(Boolean).join(' ')))||[...document.querySelectorAll('[data-testid*="profile"],[data-testid*="account"],img[alt*="profile" i],img[alt*="avatar" i]')].some(visible);return {loginVisible,accountVisible,authenticated:!loginVisible&&accountVisible}}`;
 const composerProbe = `()=>{${visibility}return [...document.querySelectorAll('textarea,[contenteditable="true"]')].some(visible)}`;
+const browserDiagnosticProbe = `(marker,expected,basePath)=>{${visibility}const composers=[...document.querySelectorAll('textarea,[contenteditable="true"]')].filter(visible);const controls=[...document.querySelectorAll('button,[role="button"]')].filter(visible);const relevant=/send|submit|message|prompt|stop|voice|audio|arrow|enter|go/i;const describe=(e,includeText=false)=>{const text=(e.textContent||'').trim().slice(0,60);return {tag:e.tagName.toLowerCase(),role:e.getAttribute('role'),ariaLabel:e.getAttribute('aria-label'),title:e.getAttribute('title'),placeholder:e.getAttribute('placeholder')||e.getAttribute('data-placeholder'),testId:e.getAttribute('data-testid'),...(includeText&&relevant.test(text)?{text}:{}),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true'}};const composer=composers[0];const value=e=>e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'');const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let messageContainsMarker=false,node;while(node=walker.nextNode()){const parent=node.parentElement;if(!parent?.closest('textarea,[contenteditable="true"]')&&node.textContent?.includes(marker)){messageContainsMarker=true;break}}const buttonCandidates=controls.map(e=>describe(e,true));const sendLikeCandidates=buttonCandidates.filter(b=>relevant.test([b.ariaLabel,b.title,b.testId,b.text].filter(Boolean).join(' '))).slice(0,20);return {path:location.pathname,composerCount:composers.length,composer:composer?{...describe(composer),valueLength:value(composer).length,containsSubmissionMarker:value(composer).includes(marker),matchesFilledPrompt:typeof expected==='string'?value(composer)===expected:null}:null,messageContainsMarker,routeChanged:typeof basePath==='string'&&location.pathname!==basePath,visibleControlCount:controls.length,sendLikeCandidates,stopControlVisible:controls.some(e=>/stop|cancel generation/i.test([e.getAttribute('aria-label'),e.getAttribute('title'),e.getAttribute('data-testid'),e.textContent].filter(Boolean).join(' ')))}}`;
+const sendControlProbe = `(marker)=>{${visibility}const labelPattern=new RegExp(${JSON.stringify(SEND_BUTTON_LABEL_PATTERN.source)},'i');const describe=e=>e?{tag:e.tagName.toLowerCase(),role:e.getAttribute('role'),ariaLabel:e.getAttribute('aria-label'),title:e.getAttribute('title'),testId:e.getAttribute('data-testid'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true'}:null;const value=e=>e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'');const composer=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);if(!marker||!composer||!value(composer).includes(marker))return {method:'not_ready',reason:'composer_marker_missing'};const isSend=e=>{const labels=[e.getAttribute('aria-label'),e.getAttribute('title'),e.textContent].filter(Boolean);return labels.some(label=>labelPattern.test(label.trim()))||/^(?:send|submit)-button$/i.test(e.getAttribute('data-testid')||'')};const button=[...document.querySelectorAll('button,[role="button"]')].find(e=>visible(e)&&isSend(e));if(!button)return {method:'wait',reason:'send_button_not_found'};if(button.disabled||button.getAttribute('aria-disabled')==='true')return {method:'wait',reason:'send_button_disabled',button:describe(button)};const selected=describe(button);button.click();return {method:'click',button:selected}}`;
 
 class Broker {
   private process?: ChildProcess; private display?: VirtualDisplay; private cdp?: PipeCdp; private control?: Page; private starting?: Promise<void>; private startingChild?: ChildProcess; private startingDisplay?: VirtualDisplay; private startingCdp?: PipeCdp; private stopping = false;
   private readonly pages = new Map<string, Page>();
+  private readonly diagnosticPrompts = new Map<string, string>();
+  private readonly diagnosticPaths = new Map<string, string>();
   constructor(private readonly root: string) {}
+  private async diagnosticSnapshot(page: Page, sessionId: string, submissionMarker: string | undefined, stage: string) {
+    try {
+      const value = await page.evaluate<Record<string, unknown> & { path?: string }>(browserDiagnosticProbe, [submissionMarker ?? '', this.diagnosticPrompts.get(sessionId), this.diagnosticPaths.get(sessionId)]);
+      if (!this.diagnosticPaths.has(sessionId) && typeof value.path === 'string') this.diagnosticPaths.set(sessionId, value.path);
+      const { path: _path, ...snapshot } = value;
+      return { stage, ...snapshot };
+    } catch (error: any) {
+      return { stage, observationError: error?.code ?? 'BROWSER_DIAGNOSTIC_FAILED' };
+    }
+  }
   private async runtime() {
     if (this.stopping) fail('BROWSER_UNAVAILABLE', 'Browser broker is shutting down.');
     if (this.cdp && this.control) return;
@@ -210,17 +225,47 @@ class Broker {
       }
       if (request.operation === 'open') { const deadline = Date.now() + 75_000; const page = await this.createPage(this.cdp!, deadline); try { await page.within(deadline, async () => { await page.navigate(); const auth = await this.auth(page); if (!auth.authenticated) fail('CHATGPT_AUTH_REQUIRED', 'ChatGPT authentication is required. Run `chatgpt-shot login`.'); await this.composer(page); }); const id = randomUUID(); this.pages.set(id, page); return id; } catch (error) { await page.close().catch(() => {}); throw error; } }
       const page = request.sessionId ? this.pages.get(request.sessionId) : undefined; if (!page) return fail('BROWSER_UNAVAILABLE', 'Browser invocation page is unavailable.');
-      if (request.operation === 'fill') { const deadline = Date.now() + 45_000; await page.within(deadline, async () => { await this.composer(page); await page.evaluate(`value=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);if(!e)throw new Error('composer unavailable');e.focus();if(e instanceof HTMLTextAreaElement){const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;s.call(e,value)}else e.textContent=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}`, [request.prompt ?? '']); }); return; }
-      if (request.operation === 'submit') { const clicked = await page.evaluate<boolean>(`()=>{${visibility}const b=[...document.querySelectorAll('button')].find(e=>/send prompt|send message/i.test([e.getAttribute('aria-label'),e.textContent].filter(Boolean).join(' '))&&!e.disabled&&visible(e));if(!b)return false;b.click();return true}`); if (!clicked) await this.cdp!.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }, page.sessionId).then(() => this.cdp!.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }, page.sessionId)); return; }
-      if (request.operation === 'inspect') { const id = request.invocationId ?? ''; const value = await page.evaluate<{ seen: boolean; value: string }>(`id=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let seen=false,node;while(node=walker.nextNode()){const parent=node.parentElement;if(!parent?.closest('textarea,[contenteditable="true"]')&&node.textContent?.includes(id)){seen=true;break}}return {seen,value:e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'')}}`, [id]); return classifySubmissionEvidence(id, { seen: value.seen, composerValue: value.value }); }
-      if (request.operation === 'close') { await page.close().catch(() => {}); this.pages.delete(request.sessionId!); return; }
+      if (request.operation === 'fill') {
+        const deadline = Date.now() + 45_000;
+        await page.within(deadline, async () => {
+          await this.composer(page);
+          await page.evaluate(`value=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);if(!e)throw new Error('composer unavailable');e.focus();if(e instanceof HTMLTextAreaElement){const s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;s.call(e,value)}else e.textContent=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}`, [request.prompt ?? '']);
+        });
+        if (!request.diagnostics) return;
+        if (request.sessionId) this.diagnosticPrompts.set(request.sessionId, request.prompt ?? '');
+        return this.diagnosticSnapshot(page, request.sessionId!, request.submissionMarker, 'after_fill');
+      }
+      if (request.operation === 'submit') {
+        const before = request.diagnostics ? await this.diagnosticSnapshot(page, request.sessionId!, request.submissionMarker, 'before_submit') : undefined;
+        const result = await page.within(Date.now() + 7_000, async () => {
+          const deadline = Date.now() + 5_000;
+          let action = await page.evaluate<{ method: 'click' | 'wait' | 'not_ready'; reason?: string; button?: Record<string, unknown> }>(sendControlProbe, [request.submissionMarker ?? '']);
+          while (action.method === 'wait' && Date.now() < deadline) {
+            await delay(100);
+            action = await page.evaluate(sendControlProbe, [request.submissionMarker ?? '']);
+          }
+          return action.method === 'wait' ? { ...action, method: 'not_ready' as const } : action;
+        });
+        const after = request.diagnostics ? await this.diagnosticSnapshot(page, request.sessionId!, request.submissionMarker, 'after_submit_immediate') : undefined;
+        return { ...result, ...(request.diagnostics ? { before, after } : {}) };
+      }
+      if (request.operation === 'snapshot' && request.diagnostics) return this.diagnosticSnapshot(page, request.sessionId!, request.submissionMarker, 'snapshot');
+      if (request.operation === 'inspect') {
+        const marker = request.submissionMarker ?? '';
+        if (!marker) return 'uncertain';
+        const value = await page.evaluate<{ seen: boolean; value: string }>(`marker=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let seen=false,node;while(node=walker.nextNode()){const parent=node.parentElement;if(!parent?.closest('textarea,[contenteditable="true"]')&&node.textContent?.includes(marker)){seen=true;break}}return {seen,value:e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'')}}`, [marker]);
+        const inspection = classifySubmissionEvidence(marker, { seen: value.seen, composerValue: value.value });
+        if (!request.diagnostics) return inspection;
+        return { inspection, snapshot: await this.diagnosticSnapshot(page, request.sessionId!, marker, 'acceptance_deadline') };
+      }
+      if (request.operation === 'close') { await page.close().catch(() => {}); this.pages.delete(request.sessionId!); this.diagnosticPrompts.delete(request.sessionId!); this.diagnosticPaths.delete(request.sessionId!); return; }
       fail('INTERNAL_ERROR', `Unsupported broker operation ${request.operation}.`);
     } catch (error) {
-      if (request.sessionId && isStaleBrowserSessionError(error)) this.pages.delete(request.sessionId);
+      if (request.sessionId && isStaleBrowserSessionError(error)) { this.pages.delete(request.sessionId); this.diagnosticPrompts.delete(request.sessionId); this.diagnosticPaths.delete(request.sessionId); }
       throw error;
     }
   }
-  async discard(sessionId: string) { const page = this.pages.get(sessionId); if (!page) return; this.pages.delete(sessionId); await page.close().catch(() => {}); }
+  async discard(sessionId: string) { const page = this.pages.get(sessionId); this.pages.delete(sessionId); this.diagnosticPrompts.delete(sessionId); this.diagnosticPaths.delete(sessionId); if (!page) return; await page.close().catch(() => {}); }
   async close() {
     this.stopping = true;
     // A startup has not published ownership yet, but it still owns the profile.
@@ -234,7 +279,7 @@ class Broker {
     await this.terminate(startingChild);
     await this.terminateDisplay(startingDisplay);
     await Promise.all([...this.pages.values()].map((page) => page.close().catch(() => {})));
-    this.pages.clear(); this.cdp?.close(); const child = this.process; const display = this.display;
+    this.pages.clear(); this.diagnosticPrompts.clear(); this.diagnosticPaths.clear(); this.cdp?.close(); const child = this.process; const display = this.display;
     this.process = undefined; this.display = undefined; this.cdp = undefined; this.control = undefined;
     await this.terminate(child);
     await this.terminateDisplay(display);

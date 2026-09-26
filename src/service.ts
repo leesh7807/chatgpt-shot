@@ -3,7 +3,7 @@ import type { BrowserTransport, Inspection } from './browser.js';
 import type { Invocation, NotionStore } from './notion.js';
 import { LocalJobTelemetryWriter, type JobTelemetryError, type JobTelemetryWriter } from './job-telemetry.js';
 
-export type SubmitOptions = { acknowledgementMs?: number; pollMs?: number; telemetry?: JobTelemetryWriter; signal?: AbortSignal };
+export type SubmitOptions = { acknowledgementMs?: number; pollMs?: number; telemetry?: JobTelemetryWriter; signal?: AbortSignal; diagnostics?: boolean };
 export type JobExecution = { job: Invocation; completion: Promise<void> };
 export const DEFAULT_ACKNOWLEDGEMENT_MS = 45_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -52,7 +52,8 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
   };
   const inspect = async (): Promise<Inspection> => {
     try {
-      const result = await browser.inspectSubmission(id);
+      if (!invocation) return 'uncertain';
+      const result = await browser.inspectSubmission(invocation.pageId.replace(/-/g, ''));
       event('submission_inspected', { inspection: result });
       return result;
     } catch (error) {
@@ -98,7 +99,8 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
 
       try {
         stage = 'prompt_filling';
-        await browser.fillPrompt(wrapPrompt(prompt, invocation.pageId));
+        const submissionMarker = invocation.pageId.replace(/-/g, '');
+        await browser.fillPrompt(wrapPrompt(prompt, invocation.pageId), submissionMarker);
         event('prompt_filled');
         cancelled();
       } catch (error) {
@@ -113,7 +115,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
       event('submission_attempted');
       let acknowledgementStarted: number;
       try {
-        await browser.submitPrompt();
+        await browser.submitPrompt(invocation.pageId.replace(/-/g, ''));
         acknowledgementStarted = Date.now();
         event('submit_returned');
         cancelled();
@@ -159,6 +161,12 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
         await sleep(pollMs);
       }
     } catch (error) {
+      if (options.diagnostics && error instanceof ShotError) {
+        try {
+          const diagnostics = browser.diagnosticReport?.();
+          if (diagnostics?.length) error.diagnostics = diagnostics;
+        } catch { /* one-shot diagnostics must not change Job failure semantics */ }
+      }
       // This guard is intentionally based on delivery evidence, never on the error
       // category. Exceptions and interruptions after submit remain uncertain.
       if (!acceptedRemotely && delivery === 'not_submitted') await cleanup();

@@ -40,8 +40,9 @@ Telemetry는 장기간 누적될 수 있는 개발·개선용 local diagnostic d
 3. 정상 중심 event는 `admission_started`, `invocation_created`, `prompt_filled`, `submission_attempted`, `submit_returned`, `accepted`, `terminal_observed`다. `accepted`와 `terminal_observed`에는 관측 State를 함께 기록한다.
 4. 실제 비정상 경로에만 admission failure의 기존 code/message, local observer failure의 단계와 진단 error, inspection 결과, cleanup 결과, caller cancellation을 기록한다.
 5. Telemetry writer는 best-effort side effect다. 기록 실패는 예외를 Job lifecycle로 전파하지 않으며 public stdout/stderr contract도 오염하지 않는다.
-6. 기존 acknowledgement semantics, submission uncertainty, cleanup 권한, remote State ownership, local HTTP/CLI payload와 Notion schema는 protected scope다. Browser 내부 CDP/DOM/polling 세부 계측과 public telemetry 조회 API/CLI는 추가하지 않는다.
+6. 기존 acknowledgement semantics, submission uncertainty, cleanup 권한, remote State ownership, normal local HTTP/CLI payload와 Notion schema는 protected scope다. Persistent lifecycle telemetry에는 Browser 내부 CDP/DOM/polling 세부 내용을 넣지 않고 public telemetry 조회 API/CLI도 추가하지 않는다.
 7. 파일·모듈·타입·주요 함수 이름은 local Job telemetry 책임을 직접 드러내며 범용 observability/event bus 추상화는 만들지 않는다.
+8. 이후 사용자가 승인한 `submit --diagnostics`는 UI 회귀 조사를 위한 명시적 일회성 진단 경로다. 프롬프트 원문이나 네트워크 본문 없이 composer/control 요약과 전송 후 상태만 실패 응답으로 해당 CLI에 반환하며 영속 telemetry는 변경하지 않는다.
 
 ## Verification
 

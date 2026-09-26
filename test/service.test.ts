@@ -34,6 +34,7 @@ class Browser {
   opens = 0;
   inspections = 0;
   closes = 0;
+  submissionMarkers: string[] = [];
   inspected: 'submitted' | 'not_submitted' | 'uncertain' = 'submitted';
   authenticated = true;
   openError?: Error;
@@ -44,9 +45,9 @@ class Browser {
   async ensureAvailable() {}
   async ensureAuthenticated() { if (!this.authenticated) throw new ShotError('CHATGPT_AUTH_REQUIRED', 'required'); }
   async openFreshContext() { this.opens++; if (this.openError) throw this.openError; }
-  async fillPrompt() { if (this.fillError) throw this.fillError; }
-  async submitPrompt() { this.attempts++; if (this.submitError) throw this.submitError; }
-  async inspectSubmission() { this.inspections++; if (this.inspectError) throw this.inspectError; return this.inspected; }
+  async fillPrompt(_prompt: string, submissionMarker: string) { this.submissionMarkers.push(submissionMarker); if (this.fillError) throw this.fillError; }
+  async submitPrompt(submissionMarker: string) { this.submissionMarkers.push(submissionMarker); this.attempts++; if (this.submitError) throw this.submitError; }
+  async inspectSubmission(submissionMarker: string) { this.submissionMarkers.push(submissionMarker); this.inspections++; if (this.inspectError) throw this.inspectError; return this.inspected; }
   async close() { this.closes++; }
 }
 
@@ -63,7 +64,8 @@ const options = { acknowledgementMs: 20, pollMs: 1, telemetry: silentTelemetry }
 test('records the normal local execution boundaries in order', async () => {
   const telemetry = new Telemetry();
   const store = new Store([job('in_progress'), job('completed')]);
-  const result = await startJob(store as any, 'db', new Browser() as any, 'task', 'job-1', { ...options, telemetry });
+  const browser = new Browser();
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-1', { ...options, telemetry });
   await result.completion;
 
   assert.deepEqual(telemetry.events.map(event => event.event), [
@@ -71,8 +73,20 @@ test('records the normal local execution boundaries in order', async () => {
     'submit_returned', 'accepted', 'terminal_observed'
   ]);
   assert.ok(telemetry.events.every(event => event.job_id === 'job-1' && event.timestamp));
+  assert.deepEqual(browser.submissionMarkers, ['page1', 'page1']);
   assert.equal(telemetry.events.find(event => event.event === 'accepted')?.state, 'in_progress');
   assert.equal(telemetry.events.find(event => event.event === 'terminal_observed')?.state, 'completed');
+});
+
+test('uses the wrapped Notion page marker for uncertain-delivery inspection', async () => {
+  const browser = new Browser();
+  browser.submitError = new Error('transport interrupted');
+  browser.inspected = 'not_submitted';
+  await assert.rejects(
+    () => startJob(new Store([job('pending')]) as any, 'db', browser as any, 'task', 'job-1', options),
+    (error: unknown) => error instanceof ShotError && error.code === 'SUBMISSION_FAILED'
+  );
+  assert.deepEqual(browser.submissionMarkers, ['page1', 'page1', 'page1']);
 });
 
 test('records fast terminal acceptance and terminal observation from the same readback', async () => {
@@ -161,6 +175,16 @@ test('uncertain evidence after acknowledgement timeout is a caller failure witho
   const store = new Store([job('pending')]);
   await assert.rejects(() => startJob(store as any, 'db', browser as any, 'task', 'job-1', { ...options, acknowledgementMs: 0 }), (error: any) => error.code === 'SUBMISSION_UNCERTAIN');
   assert.equal(store.deleted.length, 0);
+});
+
+test('returns one-shot browser diagnostics only when explicitly requested', async () => {
+  const browser = new Browser() as Browser & { diagnosticReport(): Array<Record<string, unknown>> };
+  browser.inspected = 'uncertain';
+  browser.diagnosticReport = () => [{ offset_ms: 12, stage: 'after_fill', composerMatchesFilledPrompt: true }];
+  await assert.rejects(
+    () => startJob(new Store([job('pending')]) as any, 'db', browser as any, 'task', 'job-1', { ...options, acknowledgementMs: 0, diagnostics: true }),
+    (error: any) => error.code === 'SUBMISSION_UNCERTAIN' && error.diagnostics?.[0]?.stage === 'after_fill'
+  );
 });
 
 test('submit exception is classified from delivery evidence, not exception type', async () => {

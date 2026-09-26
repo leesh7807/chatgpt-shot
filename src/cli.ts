@@ -11,8 +11,8 @@ const out = (value: string) => process.stdout.write(`${value}\n`);
 const commands = ['config', 'init', 'login', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'stop'] as const;
 type Command = typeof commands[number];
 type HelpScope = 'global' | Command;
-export type ParsedCli = { kind: 'help'; scope: HelpScope } | { kind: 'command'; command: Command; rest: string[]; prompt?: string };
-const submitUsage = 'Usage: chatgpt-shot submit "<prompt>"';
+export type ParsedCli = { kind: 'help'; scope: HelpScope } | { kind: 'command'; command: Command; rest: string[]; prompt?: string; diagnostics?: boolean };
+const submitUsage = 'Usage: chatgpt-shot submit [--diagnostics] "<prompt>"';
 const isUuid = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 
 const globalHelp = `Usage: chatgpt-shot <command> [arguments]
@@ -80,9 +80,11 @@ Arguments: none.`,
 submit: `${submitUsage}
 
 Submit exactly one non-empty prompt and print its accepted Job UUID.
+Add --diagnostics to include redacted browser observations on submission failure.
 
 Arguments:
-  <prompt>   One positional prompt argument; quote it when it contains spaces.`,
+  <prompt>        One positional prompt argument; quote it when it contains spaces.
+  --diagnostics   Return editor, send-control, and post-submit observations on failure.`,
   jobs: `Usage:
   chatgpt-shot jobs
   chatgpt-shot jobs <id>
@@ -104,9 +106,11 @@ export function parseCli(args: string[]): ParsedCli {
   const command = candidate as Command;
   if (rest.length === 1 && isHelp(rest[0])) return { kind: 'help', scope: command };
   if (command === 'submit') {
-    const prompt = rest.length === 1 ? rest[0] : undefined;
+    const diagnostics = rest[0] === '--diagnostics';
+    const promptArgs = diagnostics ? rest.slice(1) : rest;
+    const prompt = promptArgs.length === 1 ? promptArgs[0] : undefined;
     if (!prompt?.trim() || prompt === '--wait') fail('CONFIG_INVALID', submitUsage);
-    return { kind: 'command', command, rest, prompt };
+    return { kind: 'command', command, rest, prompt, ...(diagnostics ? { diagnostics: true } : {}) };
   }
   if (command === 'jobs' && rest.length > 1) fail('CONFIG_INVALID', 'Usage: chatgpt-shot jobs [id]');
   return { kind: 'command', command, rest };
@@ -140,7 +144,7 @@ export async function main(args: string[]) {
     const record = await ensureService(config); const controller = new AbortController();
     const remove = installCancellationHandler(async () => { controller.abort(); });
     try {
-      const accepted = await call<{ id: string }>(record, '/jobs', { prompt: parsed.prompt! }, controller.signal);
+      const accepted = await call<{ id: string }>(record, '/jobs', { prompt: parsed.prompt!, ...(parsed.diagnostics ? { diagnostics: true } : {}) }, controller.signal);
       if (!isUuid(accepted.id)) throw new ShotError('INTERNAL_ERROR', 'Service returned an invalid Job ID.');
       out(accepted.id);
     } finally { remove(); }
@@ -148,4 +152,4 @@ export async function main(args: string[]) {
   }
   fail('CONFIG_INVALID', 'Usage: chatgpt-shot <config|init|login|doctor|start|status|port|submit|jobs|stop>');
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) main(process.argv.slice(2)).catch(e => { if (e instanceof ShotError) { process.stderr.write(`${e.code}: ${e.message}\n`); process.exitCode = 1; } else { process.stderr.write(`INTERNAL_ERROR: ${e instanceof Error ? e.message : String(e)}\n`); process.exitCode = 1; } });
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) main(process.argv.slice(2)).catch(e => { if (e instanceof ShotError) { process.stderr.write(`${e.code}: ${e.message}\n`); if (e.diagnostics !== undefined) process.stderr.write(`BROWSER_DIAGNOSTICS: ${JSON.stringify(e.diagnostics, null, 2)}\n`); process.exitCode = 1; } else { process.stderr.write(`INTERNAL_ERROR: ${e instanceof Error ? e.message : String(e)}\n`); process.exitCode = 1; } });

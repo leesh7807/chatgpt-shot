@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { brokerSocket, chromeArguments, chromeEnvironment, classifySubmissionEvidence, privateDisplayArguments, privateDisplayFromOutput, privateXAuthority } from '../src/broker.js';
+import { brokerSocket, chromeArguments, chromeEnvironment, classifySubmissionEvidence, privateDisplayArguments, privateDisplayFromOutput, privateXAuthority, SEND_BUTTON_LABEL_PATTERN } from '../src/broker.js';
 
 test('uses a short hashed owner-runtime socket path for deep repositories', () => {
   const root = `/tmp/${'deep/'.repeat(80)}repository`;
@@ -57,8 +57,18 @@ test('does not select the X11 backend for non-Linux Chrome', () => {
 });
 
 test('classifies browser delivery from observable prompt evidence', () => {
-  assert.equal(classifySubmissionEvidence('job-1', { seen: true, composerValue: '' }), 'submitted');
-  assert.equal(classifySubmissionEvidence('job-1', { seen: false, composerValue: 'wrapped job-1 prompt' }), 'not_submitted');
-  assert.equal(classifySubmissionEvidence('job-1', { seen: false, composerValue: '' }), 'uncertain');
-  assert.equal(classifySubmissionEvidence('job-1', { seen: true, composerValue: 'job-1' }), 'uncertain');
+  const marker = '0123456789abcdef0123456789abcdef';
+  const wrappedPrompt = `Invocation record: https://www.notion.so/${marker}`;
+  assert.equal(classifySubmissionEvidence(marker, { seen: true, composerValue: '' }), 'submitted');
+  assert.equal(classifySubmissionEvidence(marker, { seen: false, composerValue: wrappedPrompt }), 'not_submitted');
+  assert.equal(classifySubmissionEvidence(marker, { seen: false, composerValue: '' }), 'uncertain');
+  assert.equal(classifySubmissionEvidence(marker, { seen: true, composerValue: marker }), 'uncertain');
+});
+
+test('recognizes the current Send button label without matching unrelated actions', () => {
+  assert.equal(SEND_BUTTON_LABEL_PATTERN.test('Send'), true);
+  assert.equal(SEND_BUTTON_LABEL_PATTERN.test('Send Message'), true);
+  assert.equal(SEND_BUTTON_LABEL_PATTERN.test('Send Prompt'), true);
+  assert.equal(SEND_BUTTON_LABEL_PATTERN.test('Stop generating'), false);
+  assert.equal(SEND_BUTTON_LABEL_PATTERN.test('Resend'), false);
 });

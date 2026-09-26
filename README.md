@@ -53,6 +53,12 @@ On success, `submit` prints exactly one Service-generated UUID to standard outpu
 }
 ```
 
+For one-off browser troubleshooting, add `--diagnostics` to `submit`. On failure, the CLI prints redacted browser observations to standard error: the detected composer and send controls, whether the filled value still matches, whether the Job ID appeared in a user message, and whether the conversation route changed. It samples immediately after submission and at 500 ms, 2 s, and 5 s. Prompt text and network bodies are not included, and these observations are returned to the requesting CLI without being persisted.
+
+```sh
+chatgpt-shot submit --diagnostics "Reply with the exact phrase: probe received."
+```
+
 The durable Job is the existing Notion Invocation record. Its remote-owned lifecycle states are `in_progress`, `completed`, and `failed`; observing any of them proves remote acceptance, including when `completed` or `failed` is the first state observed. The existing remote Invocation protocol owns those writes. A failed Job's Error is the existing remote Error value and is returned unchanged by the Job read surface; submission errors are a separate caller-facing contract.
 
 After returning the UUID, the local Service may keep the browser context and a background observer alive until the remote Job reaches a terminal state. This does not make terminal completion part of the `submit` command.
