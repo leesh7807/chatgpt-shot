@@ -14,10 +14,10 @@ test('bounds incomplete request bodies independently of accepted Job draining', 
 });
 
 test('restores a defined Service submission failure code at the HTTP client boundary', async () => {
-  const server = createServer((_, response) => { response.writeHead(500, { 'content-type': 'application/json' }); response.end(JSON.stringify({ code: 'SUBMISSION_UNCERTAIN', message: 'status unknown' })); });
+  const server = createServer((_, response) => { response.writeHead(500, { 'content-type': 'application/json' }); response.end(JSON.stringify({ code: 'SUBMISSION_UNCERTAIN', message: 'status unknown', diagnostics: [{ stage: 'after_fill', promptMatches: true }] })); });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const address = server.address(); assert.ok(address && typeof address !== 'string');
-  try { await assert.rejects(call({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'test' }, '/jobs', { prompt: 'x' }), (error: unknown) => error instanceof ShotError && error.code === 'SUBMISSION_UNCERTAIN'); }
+  try { await assert.rejects(call({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'test' }, '/jobs', { prompt: 'x' }), (error: unknown) => error instanceof ShotError && error.code === 'SUBMISSION_UNCERTAIN' && JSON.stringify(error.diagnostics) === '[{"stage":"after_fill","promptMatches":true}]'); }
   finally { server.close(); await once(server, 'close'); }
 });
 

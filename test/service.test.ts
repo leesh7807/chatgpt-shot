@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { startJob, wrapPrompt } from '../src/service.js';
 import { ShotError } from '../src/errors.js';
+import type { JobTelemetryRecord, JobTelemetryWriter } from '../src/job-telemetry.js';
 
 type State = 'pending' | 'in_progress' | 'completed' | 'failed';
 type Snapshot = { id: string; pageId: string; state: State; error: string };
@@ -33,6 +34,7 @@ class Browser {
   opens = 0;
   inspections = 0;
   closes = 0;
+  submissionMarkers: string[] = [];
   inspected: 'submitted' | 'not_submitted' | 'uncertain' = 'submitted';
   authenticated = true;
   openError?: Error;
@@ -43,14 +45,61 @@ class Browser {
   async ensureAvailable() {}
   async ensureAuthenticated() { if (!this.authenticated) throw new ShotError('CHATGPT_AUTH_REQUIRED', 'required'); }
   async openFreshContext() { this.opens++; if (this.openError) throw this.openError; }
-  async fillPrompt() { if (this.fillError) throw this.fillError; }
-  async submitPrompt() { this.attempts++; if (this.submitError) throw this.submitError; }
-  async inspectSubmission() { this.inspections++; if (this.inspectError) throw this.inspectError; return this.inspected; }
+  async fillPrompt(_prompt: string, submissionMarker: string) { this.submissionMarkers.push(submissionMarker); if (this.fillError) throw this.fillError; }
+  async submitPrompt(submissionMarker: string) { this.submissionMarkers.push(submissionMarker); this.attempts++; if (this.submitError) throw this.submitError; }
+  async inspectSubmission(submissionMarker: string) { this.submissionMarkers.push(submissionMarker); this.inspections++; if (this.inspectError) throw this.inspectError; return this.inspected; }
   async close() { this.closes++; }
 }
 
+class Telemetry implements JobTelemetryWriter {
+  events: JobTelemetryRecord[] = [];
+  record(event: JobTelemetryRecord) { this.events.push(event); }
+}
+
+const silentTelemetry: JobTelemetryWriter = { record() {} };
+
 const job = (state: State, error = '') => ({ id: 'job-1', pageId: 'page-1', state, error });
-const options = { acknowledgementMs: 20, pollMs: 1 };
+const options = { acknowledgementMs: 20, pollMs: 1, telemetry: silentTelemetry };
+
+test('records the normal local execution boundaries in order', async () => {
+  const telemetry = new Telemetry();
+  const store = new Store([job('in_progress'), job('completed')]);
+  const browser = new Browser();
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-1', { ...options, telemetry });
+  await result.completion;
+
+  assert.deepEqual(telemetry.events.map(event => event.event), [
+    'admission_started', 'invocation_created', 'prompt_filled', 'submission_attempted',
+    'submit_returned', 'accepted', 'terminal_observed'
+  ]);
+  assert.ok(telemetry.events.every(event => event.job_id === 'job-1' && event.timestamp));
+  assert.deepEqual(browser.submissionMarkers, ['page1', 'page1']);
+  assert.equal(telemetry.events.find(event => event.event === 'accepted')?.state, 'in_progress');
+  assert.equal(telemetry.events.find(event => event.event === 'terminal_observed')?.state, 'completed');
+});
+
+test('uses the wrapped Notion page marker for uncertain-delivery inspection', async () => {
+  const browser = new Browser();
+  browser.submitError = new Error('transport interrupted');
+  browser.inspected = 'not_submitted';
+  await assert.rejects(
+    () => startJob(new Store([job('pending')]) as any, 'db', browser as any, 'task', 'job-1', options),
+    (error: unknown) => error instanceof ShotError && error.code === 'SUBMISSION_FAILED'
+  );
+  assert.deepEqual(browser.submissionMarkers, ['page1', 'page1', 'page1']);
+});
+
+test('records fast terminal acceptance and terminal observation from the same readback', async () => {
+  const telemetry = new Telemetry();
+  const result = await startJob(new Store([job('failed', 'remote failure')]) as any, 'db', new Browser() as any, 'task', 'job-1', { ...options, telemetry });
+  assert.equal(result.job.state, 'failed');
+  assert.deepEqual(telemetry.events.map(event => event.event), [
+    'admission_started', 'invocation_created', 'prompt_filled', 'submission_attempted',
+    'submit_returned', 'accepted', 'terminal_observed'
+  ]);
+  assert.equal(telemetry.events.find(event => event.event === 'accepted')?.state, 'failed');
+  assert.equal(telemetry.events.find(event => event.event === 'terminal_observed')?.state, 'failed');
+});
 
 test('remote in_progress is acceptance and startJob does not wait for terminal Result', async () => {
   const store = new DelayedTerminalStore([job('in_progress'), job('completed')]);
@@ -87,6 +136,21 @@ test('pre-submission failure is cleaned up and returned as SUBMISSION_FAILED', a
   assert.equal(browser.attempts, 0);
 });
 
+test('records actual inspection and cleanup evidence without inventing later success events', async () => {
+  const telemetry = new Telemetry();
+  const browser = new Browser();
+  browser.inspected = 'not_submitted';
+  const store = new Store([job('pending')]);
+  await assert.rejects(() => startJob(store as any, 'db', browser as any, 'task', 'job-1', { ...options, acknowledgementMs: 0, telemetry }), (error: any) => error.code === 'SUBMISSION_FAILED');
+  assert.deepEqual(telemetry.events.map(event => event.event), [
+    'admission_started', 'invocation_created', 'prompt_filled', 'submission_attempted',
+    'submit_returned', 'submission_inspected', 'cleanup', 'admission_failed'
+  ]);
+  assert.equal(telemetry.events.find(event => event.event === 'submission_inspected')?.inspection, 'not_submitted');
+  assert.equal(telemetry.events.find(event => event.event === 'cleanup')?.outcome, 'succeeded');
+  assert.equal(telemetry.events.at(-1)?.error?.code, 'SUBMISSION_FAILED');
+});
+
 test('confirmed not_submitted evidence permits cleanup but never writes remote failed state', async () => {
   const browser = new Browser();
   browser.inspected = 'not_submitted';
@@ -111,6 +175,16 @@ test('uncertain evidence after acknowledgement timeout is a caller failure witho
   const store = new Store([job('pending')]);
   await assert.rejects(() => startJob(store as any, 'db', browser as any, 'task', 'job-1', { ...options, acknowledgementMs: 0 }), (error: any) => error.code === 'SUBMISSION_UNCERTAIN');
   assert.equal(store.deleted.length, 0);
+});
+
+test('returns one-shot browser diagnostics only when explicitly requested', async () => {
+  const browser = new Browser() as Browser & { diagnosticReport(): Array<Record<string, unknown>> };
+  browser.inspected = 'uncertain';
+  browser.diagnosticReport = () => [{ offset_ms: 12, stage: 'after_fill', composerMatchesFilledPrompt: true }];
+  await assert.rejects(
+    () => startJob(new Store([job('pending')]) as any, 'db', browser as any, 'task', 'job-1', { ...options, acknowledgementMs: 0, diagnostics: true }),
+    (error: any) => error.code === 'SUBMISSION_UNCERTAIN' && error.diagnostics?.[0]?.stage === 'after_fill'
+  );
 });
 
 test('submit exception is classified from delivery evidence, not exception type', async () => {
@@ -148,6 +222,39 @@ test('delivery uncertainty is preserved across inspection failure', async () => 
   assert.equal(store.deleted.length, 0);
 });
 
+test('records caller-facing admission failures with their existing error', async () => {
+  const telemetry = new Telemetry();
+  const browser = new Browser();
+  browser.authenticated = false;
+  await assert.rejects(() => startJob(new Store([]) as any, 'db', browser as any, 'task', 'job-1', { ...options, telemetry }), (error: any) => error.code === 'CHATGPT_AUTH_REQUIRED');
+  assert.deepEqual(telemetry.events.map(event => event.event), ['admission_started', 'admission_failed']);
+  assert.equal(telemetry.events[1].stage, 'authentication');
+  assert.deepEqual(telemetry.events[1].error, { code: 'CHATGPT_AUTH_REQUIRED', message: 'required' });
+});
+
+test('records acceptance-after observer failures without changing caller acceptance', async () => {
+  class ObserverFailureStore extends Store {
+    async readInvocation(pageId: string, id: string): Promise<Snapshot> {
+      if (this.reads > 0) throw new ShotError('NOTION_UNAVAILABLE', 'terminal read failed');
+      return super.readInvocation(pageId, id);
+    }
+  }
+  const telemetry = new Telemetry();
+  const result = await startJob(new ObserverFailureStore([job('in_progress')]) as any, 'db', new Browser() as any, 'task', 'job-1', { ...options, telemetry });
+  assert.equal(result.job.state, 'in_progress');
+  await assert.rejects(result.completion, (error: any) => error.code === 'NOTION_UNAVAILABLE');
+  assert.equal(telemetry.events.at(-1)?.event, 'observer_failed');
+  assert.equal(telemetry.events.at(-1)?.stage, 'terminal_observation');
+  assert.deepEqual(telemetry.events.at(-1)?.error, { code: 'NOTION_UNAVAILABLE', message: 'terminal read failed' });
+});
+
+test('telemetry writer failure does not change the normal Job flow', async () => {
+  const failingTelemetry: JobTelemetryWriter = { record() { throw new Error('telemetry unavailable'); } };
+  const result = await startJob(new Store([job('completed')]) as any, 'db', new Browser() as any, 'task', 'job-1', { ...options, telemetry: failingTelemetry });
+  assert.equal(result.job.state, 'completed');
+  await result.completion;
+});
+
 test('acknowledgement budget starts after prompt submission, not before it', async () => {
   const store = new DelayedStore([job('in_progress'), job('completed')]);
   const result = await startJob(store as any, 'db', new Browser() as any, 'task', 'job-1', { acknowledgementMs: 1, pollMs: 1 });
@@ -171,10 +278,12 @@ test('authentication and fresh-context failures happen before Invocation creatio
 
 test('caller cancellation is ADMISSION_CANCELLED and closes its browser context', async () => {
   const browser = new Browser();
+  const telemetry = new Telemetry();
   const controller = new AbortController();
   controller.abort();
-  await assert.rejects(() => startJob(new Store([]) as any, 'db', browser as any, 'task', 'job-1', { ...options, signal: controller.signal }), (error: any) => error.code === 'ADMISSION_CANCELLED');
+  await assert.rejects(() => startJob(new Store([]) as any, 'db', browser as any, 'task', 'job-1', { ...options, telemetry, signal: controller.signal }), (error: any) => error.code === 'ADMISSION_CANCELLED');
   assert.equal(browser.closes, 1);
+  assert.deepEqual(telemetry.events.map(event => event.event), ['admission_started', 'caller_cancelled', 'admission_failed']);
 });
 
 test('wrapped prompt separates the caller task from the Notion delivery contract', () => {

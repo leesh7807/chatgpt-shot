@@ -53,6 +53,12 @@ On success, `submit` prints exactly one Service-generated UUID to standard outpu
 }
 ```
 
+For one-off browser troubleshooting, add `--diagnostics` to `submit`. On failure, the CLI prints redacted browser observations to standard error: the detected composer and send controls, whether the filled value still matches, whether the Job ID appeared in a user message, and whether the conversation route changed. It samples immediately after submission and at 500 ms, 2 s, and 5 s. Prompt text and network bodies are not included, and these observations are returned to the requesting CLI without being persisted.
+
+```sh
+chatgpt-shot submit --diagnostics "Reply with the exact phrase: probe received."
+```
+
 The durable Job is the existing Notion Invocation record. Its remote-owned lifecycle states are `in_progress`, `completed`, and `failed`; observing any of them proves remote acceptance, including when `completed` or `failed` is the first state observed. The existing remote Invocation protocol owns those writes. A failed Job's Error is the existing remote Error value and is returned unchanged by the Job read surface; submission errors are a separate caller-facing contract.
 
 After returning the UUID, the local Service may keep the browser context and a background observer alive until the remote Job reaches a terminal state. This does not make terminal completion part of the `submit` command.
@@ -64,6 +70,18 @@ After the browser submit attempt, the adapter classifies prompt delivery from te
 * `uncertain` means the submit action occurred but local evidence proves neither delivery nor non-delivery. It is a caller-facing `SUBMISSION_UNCERTAIN` failure; the local writer does not write State or Error and does not clean up the Invocation.
 
 An exception, interruption, acknowledgement timeout, or lost observer is not by itself evidence of `not_submitted`. If delivery cannot be proven either way, the result is `uncertain`. Once prompt delivery may have occurred, local admission failures never overwrite the remote Job lifecycle. Submission errors such as `ADMISSION_TIMEOUT`, `ADMISSION_CANCELLED`, `SUBMISSION_FAILED`, and `SUBMISSION_UNCERTAIN` are not Job lifecycle states and are not a submission history.
+
+## Local execution telemetry
+
+The Service records best-effort local execution events in the checkout that contains the running `chatgpt-shot` package:
+
+```text
+.local/chatgpt-shot/jobs.jsonl
+```
+
+Each JSONL record is correlated by Job UUID and includes the local observation timestamp. The records cover admission, Invocation creation, prompt preparation, submission, remote acceptance, terminal observation, and actual diagnostic paths such as submission inspection, cleanup, cancellation, and observer failure. Timestamps describe when this local process observed an event; they are not remote state-transition timestamps.
+
+This is local-only diagnostic data, not a public Job surface or an additional Job lifecycle. It is not stored in XDG user state/data/cache locations, is not written to the Notion Invocation, and does not change `submit`, `jobs`, acknowledgement, cleanup, or remote State behavior. Delete the checkout's `.local/chatgpt-shot/` directory to remove its telemetry.
 
 ## Local HTTP contract
 

@@ -6,6 +6,7 @@ export type ErrorCode =
   | 'RESULT_READ_FAILED' | 'RESULT_SERIALIZATION_FAILED' | 'NOT_FOUND' | 'SERVICE_STOPPING' | 'INTERNAL_ERROR';
 
 export class ShotError extends Error {
+  diagnostics?: unknown;
   constructor(readonly code: ErrorCode, message: string, readonly cause?: unknown) { super(message); }
 }
 export const STALE_BROWSER_SESSION_MESSAGE = 'Session with given id not found';
