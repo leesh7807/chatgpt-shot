@@ -1,13 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { chatgptShotRepositoryRoot, JOB_TELEMETRY_RELATIVE_PATH, jobTelemetryPath, LocalJobTelemetryWriter } from '../src/job-telemetry.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { JOB_TELEMETRY_RELATIVE_PATH, jobTelemetryPath, LocalJobTelemetryWriter } from '../src/job-telemetry.js';
 
-test('resolves canonical telemetry storage from the executing checkout', () => {
-  const expectedRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
-  assert.equal(chatgptShotRepositoryRoot, expectedRoot);
-  assert.equal(jobTelemetryPath, join(chatgptShotRepositoryRoot!, JOB_TELEMETRY_RELATIVE_PATH));
+test('resolves telemetry under the XDG cache location', () => {
+  const prior = process.env.XDG_CACHE_HOME; const directory = mkdtempSync(join(tmpdir(), 'chatgpt-shot-telemetry-'));
+  try {
+    process.env.XDG_CACHE_HOME = directory;
+    assert.equal(jobTelemetryPath(), join(directory, JOB_TELEMETRY_RELATIVE_PATH));
+  } finally { if (prior === undefined) delete process.env.XDG_CACHE_HOME; else process.env.XDG_CACHE_HOME = prior; rmSync(directory, { recursive: true, force: true }); }
 });
 
 test('local writer treats storage errors as best-effort', () => {

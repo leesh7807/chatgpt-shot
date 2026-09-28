@@ -13,7 +13,7 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const responseError = (error: unknown) => error instanceof ShotError ? { code: error.code, message: error.message, ...(error.diagnostics ? { diagnostics: error.diagnostics } : {}) } : { code: 'INTERNAL_ERROR', message: error instanceof Error ? error.message : String(error) };
 export function readDiscovery(config: Pick<Config, 'discoveryPath'> = loadConfig()): Discovery | undefined { try { const record = JSON.parse(readFileSync(config.discoveryPath, 'utf8')); return record?.host === '127.0.0.1' && Number.isInteger(record.port) && typeof record.credential === 'string' ? record : undefined; } catch { return undefined; } }
 function publish(config: Config, record: Discovery) { const temporary = `${config.discoveryPath}.${process.pid}.${randomBytes(4).toString('hex')}`; writeFileSync(temporary, JSON.stringify(record), { mode: 0o600 }); chmodSync(temporary, 0o600); renameSync(temporary, config.discoveryPath); chmodSync(config.discoveryPath, 0o600); }
-function removeDiscovery(config: Pick<Config, 'discoveryPath'>, credential?: string) { const current = readDiscovery(config); if (!credential || current?.credential === credential) try { unlinkSync(config.discoveryPath); } catch {} }
+export function removeDiscovery(config: Pick<Config, 'discoveryPath'>, expectedCredential: string) { const current = readDiscovery(config); if (current?.credential !== expectedCredential) return; try { unlinkSync(config.discoveryPath); } catch {} }
 export const JOB_TRANSPORT_TIMEOUT_MS = 0;
 export const REQUEST_BODY_TIMEOUT_MS = 30_000;
 export async function call<T>(record: Discovery, path: string, body?: unknown, signal?: AbortSignal): Promise<T> { return await new Promise<T>((resolve, reject) => { const payload = body === undefined ? undefined : JSON.stringify(body); const timeout = path === '/jobs' && body !== undefined ? JOB_TRANSPORT_TIMEOUT_MS : 10_000; const req = httpRequest({ host: record.host, port: record.port, path, method: body === undefined ? 'GET' : 'POST', headers: { authorization: `Bearer ${record.credential}`, ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}) }, ...(timeout ? { timeout } : {}) }, res => { let text = ''; res.setEncoding('utf8'); res.on('data', c => text += c); res.on('end', () => { try { const parsed = JSON.parse(text) as { code?: unknown; message?: unknown; diagnostics?: unknown }; if (res.statusCode !== 200) { if (isErrorCode(parsed.code)) { const error = new ShotError(parsed.code, typeof parsed.message === 'string' ? parsed.message : 'Service request failed.'); if (parsed.diagnostics !== undefined) error.diagnostics = parsed.diagnostics; reject(error); } else reject(new Error(typeof parsed.message === 'string' ? parsed.message : 'Service request failed.')); } else resolve(parsed as T); } catch (error) { reject(error); } }); }); const abort = () => req.destroy(new ShotError('ADMISSION_CANCELLED', 'The caller cancelled Job admission.')); if (signal?.aborted) return abort(); signal?.addEventListener('abort', abort, { once: true }); req.once('error', reject); if (timeout) req.once('timeout', () => req.destroy(new Error('Service request timed out.'))); if (payload) req.write(payload); req.end(); }); }
@@ -24,23 +24,45 @@ type StartupLock = StartupRecord & { fd: number };
 function readStartup(config: Config): StartupRecord | undefined { try { const record = JSON.parse(readFileSync(config.lockPath, 'utf8')); return Number.isInteger(record?.pid) && typeof record?.token === 'string' ? record : undefined; } catch { return undefined; } }
 function lock(config: Config): StartupLock | undefined { try { const fd = openSync(config.lockPath, 'wx', 0o600); const record = { pid: process.pid, token: randomBytes(24).toString('base64url') }; writeFileSync(fd, JSON.stringify(record)); chmodSync(config.lockPath, 0o600); return { fd, ...record }; } catch { return undefined; } }
 function releaseStartup(config: Config, token: string, fd?: number) { try { if (readStartup(config)?.token === token) unlinkSync(config.lockPath); } catch {} finally { if (fd !== undefined) try { closeSync(fd); } catch {} } }
-function reclaimStaleStartup(config: Config): boolean { const owner = readStartup(config); if (owner && processAlive(owner.pid)) return false; try { unlinkSync(config.lockPath); return true; } catch { return false; } }
+function reclaimStaleStartup(config: Config): boolean { const owner = readStartup(config); if (owner && processAlive(owner.pid)) return false; if (readStartup(config)?.token !== owner?.token) return false; try { unlinkSync(config.lockPath); return true; } catch { return false; } }
 function claimStartup(config: Config, token: string): boolean { const owner = readStartup(config); if (owner?.token !== token) return false; writeFileSync(config.lockPath, JSON.stringify({ pid: process.pid, token }), { mode: 0o600 }); chmodSync(config.lockPath, 0o600); return true; }
 export async function ensureService(config = loadConfig()): Promise<Discovery> {
   for (let n = 0; n < 100; n++) {
     const existing = await healthy(config); if (existing) return existing;
-    const stale = readDiscovery(config); if (stale && !processAlive(stale.pid)) removeDiscovery(config);
     const startup = lock(config);
     if (!startup) { reclaimStaleStartup(config); await delay(100); continue; }
-    const child = spawn(process.execPath, [...process.execArgv, process.argv[1], '__service'], { detached: true, stdio: 'ignore', env: { ...process.env, CHATGPT_SHOT_STARTUP_TOKEN: startup.token } }); child.unref();
+    let child: ReturnType<typeof spawn> | undefined; let serviceOwnsStartup = false;
     try {
-      for (let wait = 0; wait < 100; wait++) { const found = await healthy(config); if (found) return found; await delay(100); }
+      const stale = readDiscovery(config); if (stale && !processAlive(stale.pid)) removeDiscovery(config, stale.credential);
+      child = spawn(process.execPath, [...process.execArgv, process.argv[1], '__service'], { detached: true, stdio: 'ignore', env: { ...process.env, CHATGPT_SHOT_STARTUP_TOKEN: startup.token } }); child.unref();
+      for (let wait = 0; wait < 100; wait++) {
+        const found = await healthy(config);
+        if (found) {
+          if (found.pid === child.pid) serviceOwnsStartup = true;
+          else child.kill('SIGTERM');
+          return found;
+        }
+        await delay(100);
+      }
       if (child.exitCode === null) child.kill('SIGTERM');
-    } finally { releaseStartup(config, startup.token, startup.fd); }
+    } finally {
+      // The Service keeps the startup token for its lifetime; only close the
+      // parent's descriptor after the child has claimed that ownership.
+      if (serviceOwnsStartup) { try { closeSync(startup.fd); } catch {} }
+      else releaseStartup(config, startup.token, startup.fd);
+    }
   }
   return fail('BROWSER_UNAVAILABLE', 'Could not start a healthy chatgpt-shot Service.') as never;
 }
-export async function stopService(config: Pick<Config, 'discoveryPath'> = loadConfig()): Promise<void> { const record = await healthy(config); if (!record) { removeDiscovery(config); return; } await call(record, '/stop', {}); while (await healthy(config)) await delay(100); }
+export async function stopService(config: Pick<Config, 'discoveryPath'> = loadConfig()): Promise<void> {
+  const record = await healthy(config);
+  if (!record) {
+    if (existsSync(config.discoveryPath)) return fail('BROWSER_UNAVAILABLE', 'Service health could not be confirmed; discovery was preserved and no stop request was sent.') as never;
+    return;
+  }
+  await call(record, '/stop', {});
+  while ((await healthy(config))?.credential === record.credential) await delay(100);
+}
 export async function login(config = loadConfig()) { await stopService(config); await manualLogin(config.browserProfilePath); }
 export async function runService(): Promise<void> {
   const config = loadConfig(); const startupToken = process.env.CHATGPT_SHOT_STARTUP_TOKEN;

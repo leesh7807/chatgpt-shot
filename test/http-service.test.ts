@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { call, JOB_TRANSPORT_TIMEOUT_MS, REQUEST_BODY_TIMEOUT_MS } from '../src/http-service.js';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { call, JOB_TRANSPORT_TIMEOUT_MS, readDiscovery, removeDiscovery, REQUEST_BODY_TIMEOUT_MS, stopService } from '../src/http-service.js';
 import { ShotError } from '../src/errors.js';
 
 test('Job admission has no shorter client-side transport timeout', () => {
@@ -41,4 +44,53 @@ test('caller cancellation is distinct from remote Job failure', async () => {
     controller.abort();
     await assert.rejects(request, (error: unknown) => error instanceof ShotError && error.code === 'ADMISSION_CANCELLED');
   } finally { server.close(); await once(server, 'close'); }
+});
+
+test('discovery cleanup preserves a replacement owned by another Service generation', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'chatgpt-shot-discovery-'));
+  const config = { discoveryPath: join(directory, 'runtime.json') };
+  try {
+    writeFileSync(config.discoveryPath, JSON.stringify({ pid: process.pid, host: '127.0.0.1', port: 12345, protocolVersion: 1, credential: 'generation-b' }));
+    removeDiscovery(config, 'generation-a');
+    assert.equal(readDiscovery(config)?.credential, 'generation-b');
+    removeDiscovery(config, 'generation-b');
+    assert.equal(existsSync(config.discoveryPath), false);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('stopService preserves discovery and reports failure when health cannot be confirmed', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'chatgpt-shot-stop-'));
+  const config = { discoveryPath: join(directory, 'runtime.json') };
+  const server = createServer((_, response) => { response.writeHead(503, { 'content-type': 'application/json' }); response.end(JSON.stringify({ code: 'SERVICE_STOPPING', message: 'temporarily unavailable' })); });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  try {
+    writeFileSync(config.discoveryPath, JSON.stringify({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'current-generation' }));
+    await assert.rejects(stopService(config), (error: unknown) => error instanceof ShotError && error.code === 'BROWSER_UNAVAILABLE');
+    assert.equal(readDiscovery(config)?.credential, 'current-generation');
+  } finally {
+    server.close(); await once(server, 'close');
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('stopService does not wait on a replacement discovery generation', { timeout: 1_000 }, async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'chatgpt-shot-stop-generation-'));
+  const config = { discoveryPath: join(directory, 'runtime.json') };
+  let port = 0;
+  const server = createServer((request, response) => {
+    if (request.url === '/health') { response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify({ pid: process.pid, protocolVersion: 1 })); return; }
+    writeFileSync(config.discoveryPath, JSON.stringify({ pid: process.pid, host: '127.0.0.1', port, protocolVersion: 1, credential: 'generation-b' }));
+    response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify({ stopping: true }));
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const address = server.address(); assert.ok(address && typeof address !== 'string'); port = address.port;
+  try {
+    writeFileSync(config.discoveryPath, JSON.stringify({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'generation-a' }));
+    await stopService(config);
+    assert.equal(readDiscovery(config)?.credential, 'generation-b');
+  } finally {
+    server.close(); await once(server, 'close');
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

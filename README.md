@@ -73,15 +73,17 @@ An exception, interruption, acknowledgement timeout, or lost observer is not by 
 
 ## Local execution telemetry
 
-The Service records best-effort local execution events in the checkout that contains the running `chatgpt-shot` package:
+The Service records best-effort local execution events in the XDG cache:
 
 ```text
-.local/chatgpt-shot/jobs.jsonl
+$XDG_CACHE_HOME/chatgpt-shot/jobs.jsonl
 ```
+
+When `XDG_CACHE_HOME` is unset, the path is `~/.cache/chatgpt-shot/jobs.jsonl`.
 
 Each JSONL record is correlated by Job UUID and includes the local observation timestamp. The records cover admission, Invocation creation, prompt preparation, submission, remote acceptance, terminal observation, and actual diagnostic paths such as submission inspection, cleanup, cancellation, and observer failure. Timestamps describe when this local process observed an event; they are not remote state-transition timestamps.
 
-This is local-only diagnostic data, not a public Job surface or an additional Job lifecycle. It is not stored in XDG user state/data/cache locations, is not written to the Notion Invocation, and does not change `submit`, `jobs`, acknowledgement, cleanup, or remote State behavior. Delete the checkout's `.local/chatgpt-shot/` directory to remove its telemetry.
+This is local-only diagnostic data, not a public Job surface or an additional Job lifecycle. It is not written to the Notion Invocation and does not change `submit`, `jobs`, acknowledgement, cleanup, or remote State behavior. Delete the XDG cache file to remove its telemetry.
 
 ## Local HTTP contract
 

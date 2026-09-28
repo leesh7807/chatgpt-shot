@@ -1,9 +1,9 @@
-import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
 import type { State } from './notion.js';
 
-export const JOB_TELEMETRY_RELATIVE_PATH = '.local/chatgpt-shot/jobs.jsonl';
+export const JOB_TELEMETRY_RELATIVE_PATH = 'chatgpt-shot/jobs.jsonl';
 
 export type JobTelemetryEventName =
   | 'admission_started'
@@ -35,27 +35,14 @@ export interface JobTelemetryWriter {
   record(event: JobTelemetryRecord): void;
 }
 
-const repositoryRootFrom = (start: string): string | undefined => {
-  let current = start;
-  while (true) {
-    if (existsSync(join(current, 'package.json')) && existsSync(join(current, '.git'))) return current;
-    const parent = dirname(current);
-    if (parent === current) return undefined;
-    current = parent;
-  }
-};
-
-export const chatgptShotRepositoryRoot = repositoryRootFrom(dirname(fileURLToPath(import.meta.url)));
-export const jobTelemetryPath = chatgptShotRepositoryRoot
-  ? join(chatgptShotRepositoryRoot, JOB_TELEMETRY_RELATIVE_PATH)
-  : undefined;
+export const jobTelemetryPath = () => join(process.env.XDG_CACHE_HOME?.trim() || join(homedir(), '.cache'), JOB_TELEMETRY_RELATIVE_PATH);
 
 /**
  * Best-effort local diagnostic writer. Its filesystem errors are intentionally
  * isolated from Job admission and observer control flow by record().
  */
 export class LocalJobTelemetryWriter implements JobTelemetryWriter {
-  constructor(private readonly path: string | undefined = jobTelemetryPath) {}
+  constructor(private readonly path: string | undefined = jobTelemetryPath()) {}
 
   record(event: JobTelemetryRecord): void {
     if (!this.path) return;
