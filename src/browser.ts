@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { brokerRequest, brokerSocket } from './broker.js';
+import { paths } from './config.js';
 import { fail, isStaleBrowserSessionError } from './errors.js';
 
 export type Inspection = 'submitted' | 'not_submitted' | 'uncertain';
@@ -12,28 +13,38 @@ const profilePath = (profile: string) => profile;
 const systemChrome = () => [process.env.CHATGPT_SHOT_BROWSER, '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome'].find((path): path is string => Boolean(path && existsSync(path)));
 async function request(root: string, operation: string, sessionId?: string, prompt?: string, submissionMarker?: string, send: typeof brokerRequest = brokerRequest, diagnostics = false) { try { return await send(root, { operation, sessionId, prompt, submissionMarker, ...(diagnostics ? { diagnostics: true } : {}) }); } catch (error: any) { if (error.code) return fail(error.code, error.message); throw error; } }
 export async function ensureBroker(profile: string) {
+  const assertProfileAvailable = () => { if (existsSync(paths().manualOpenLockPath)) fail('SERVICE_BUSY', 'The retained browser profile is open for manual use.'); };
   const absent = (error: any) => error?.code === 'ENOENT' || error?.code === 'ECONNREFUSED';
+  assertProfileAvailable();
   try { await request(profile, 'ensure'); return; } catch (error: any) {
     if (!absent(error)) throw error;
     if (error.code === 'ECONNREFUSED') try { unlinkSync(brokerSocket(profile)); } catch {}
   }
+  assertProfileAvailable();
   if (!existsSync(process.argv[1])) fail('BROWSER_UNAVAILABLE', 'Cannot locate the chatgpt-shot broker entry point.');
   // Development execution via tsx supplies the TypeScript loader through execArgv; retain it when
   // the detached broker is spawned so the broker has the same executable semantics as its caller.
   const child = spawn(process.execPath, [...process.execArgv, process.argv[1], '__broker'], { detached: true, stdio: 'ignore' }); child.unref();
-  for (let attempt = 0; attempt < 50; attempt++) { try { await request(profile, 'ensure'); return; } catch (error: any) { if (!absent(error)) throw error; await wait(100); } }
+  for (let attempt = 0; attempt < 50; attempt++) { try { assertProfileAvailable(); await request(profile, 'ensure'); return; } catch (error: any) { if (error?.code === 'SERVICE_BUSY') { await shutdownBroker(profile).catch(() => {}); throw error; } if (!absent(error)) throw error; await wait(100); } }
   fail('BROWSER_UNAVAILABLE', 'Could not start the local ChatGPT browser broker.');
 }
-export async function manualLogin(profile: string): Promise<void> {
-  await shutdownBroker(profile);
-  const executable = systemChrome(); if (!executable) fail('BROWSER_UNAVAILABLE', 'A supported system Chrome executable is required for manual login.');
+export async function openProfileBrowser(profile: string, onSpawn?: (pid: number) => void): Promise<void> {
+  const executable = systemChrome(); if (!executable) fail('BROWSER_UNAVAILABLE', 'A supported system Chrome executable is required to open the retained profile.');
   const path = profilePath(profile); mkdirSync(path, { recursive: true, mode: 0o700 });
-  await new Promise<void>((resolve, reject) => { const child: import('node:child_process').ChildProcess = spawn(executable!, [`--user-data-dir=${path}`, '--profile-directory=Default', '--no-first-run', '--no-default-browser-check', 'https://chatgpt.com/'], { stdio: 'ignore' }); child.once('error', reject); child.once('close', () => resolve()); });
+  await new Promise<void>((resolve, reject) => {
+    let child: import('node:child_process').ChildProcess | undefined;
+    try {
+      child = spawn(executable!, [`--user-data-dir=${path}`, '--profile-directory=Default', '--no-first-run', '--no-default-browser-check', 'https://chatgpt.com/'], { stdio: 'ignore' });
+      if (onSpawn) { if (child.pid === undefined) throw new Error('Chrome did not expose its process ID.'); onSpawn(child.pid); }
+    } catch (error) { child?.kill('SIGTERM'); reject(error); return; }
+    child.once('error', reject);
+    child.once('close', () => resolve());
+  });
 }
 export async function shutdownBroker(root: string): Promise<void> {
   try { await request(root, 'shutdown'); }
   catch (error: any) {
-    // No broker is the normal first-login and already-shut-down state. Do not conceal a live
+    // No broker is the normal initial-open and already-shut-down state. Do not conceal a live
     // broker's shutdown failure, which has a different error category.
     if (error?.code === 'ENOENT' || error?.code === 'ECONNREFUSED') return;
     throw error;
@@ -93,7 +104,7 @@ export class ChatGPTBrowser implements BrowserTransport {
     let status: { authenticated?: boolean };
     try { status = await this.rpc('auth'); }
     catch (error) { if (isStaleBrowserSessionError(error)) fail('BROWSER_UNAVAILABLE', 'The retained browser session disappeared while checking authentication.'); throw error; }
-    if (!status?.authenticated) fail('CHATGPT_AUTH_REQUIRED', 'ChatGPT authentication is required. Run `chatgpt-shot login`.');
+    if (!status?.authenticated) fail('CHATGPT_AUTH_REQUIRED', 'ChatGPT authentication is required. Run `chatgpt-shot open`.');
   }
   async openFreshContext() {
     try { await this.openFreshContextOnce(); }

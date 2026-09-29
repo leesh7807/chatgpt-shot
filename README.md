@@ -10,7 +10,9 @@ npm run build
 npm link
 ```
 
-On Linux, normal operation requires `Xvfb` (for example, `sudo apt install xvfb` on Debian/Ubuntu). The browser runtime uses a private headful Chrome on a broker-owned X11 display. `chatgpt-shot login` opens the dedicated profile in visible system Chrome for manual authentication; enter credentials yourself, then close the window.
+On Linux, normal operation requires `Xvfb` (for example, `sudo apt install xvfb` on Debian/Ubuntu). The browser runtime uses a private headful Chrome on a broker-owned X11 display. `chatgpt-shot open` opens the retained profile in visible system Chrome for manual sign-in or browser checks such as a Cloudflare challenge. It does not automate authentication or verify that the external page accepted the interaction.
+
+When the Service is running, `open` keeps its HTTP process and discovery record alive. If work is already in progress, `open` returns `SERVICE_BUSY` without cancelling it. While the retained profile is open, new submissions receive `SERVICE_BUSY`. Close Chrome to resume submissions; the Service starts its private browser broker again when needed. If the Service is absent, `open` opens the profile without starting it. Use `start` separately when you want the Service running.
 
 Configure the Notion token and Invocation database:
 
@@ -18,7 +20,7 @@ Configure the Notion token and Invocation database:
 chatgpt-shot config set NOTION_TOKEN 'secret_notion_token'
 chatgpt-shot config set CHATGPT_SHOT_NOTION_DATABASE_URL 'https://www.notion.so/your-invocation-database'
 chatgpt-shot init
-chatgpt-shot login
+chatgpt-shot open
 chatgpt-shot doctor
 ```
 
@@ -93,6 +95,18 @@ The Service binds only to `127.0.0.1` on an OS-selected port. Its owner-only dis
 GET /health
 Authorization: Bearer <credential>
 ```
+
+The health response includes `accepting` and `state` (`ready`, `browser-open`, or `stopping`). It is `false` while the Service is stopping or the retained browser profile is open for manual use.
+
+```http
+POST /prepare-open
+Authorization: Bearer <credential>
+Content-Type: application/json
+
+{"token":"<current profile reservation token>"}
+```
+
+As part of `chatgpt-shot open`, the CLI acquires a profile lock and calls `POST /prepare-open` to ask a running Service to release its private browser broker. The CLI then opens visible Chrome locally and holds the lock until that browser process exits. This keeps the Service and `runtime.json` available, rejects submissions with `SERVICE_BUSY`, and lets `stop` shut down the Service while Chrome remains open. `/prepare-open` returns `SERVICE_BUSY` if an admitted Job or another manual browser session is active. Closing Chrome does not verify sign-in or a browser challenge.
 
 ```http
 POST /jobs

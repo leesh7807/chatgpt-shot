@@ -5,10 +5,10 @@ import { loadConfig, openConfigInDefaultEditor, paths, readConfigValues, setConf
 import { ShotError, fail } from './errors.js';
 import { NotionStore, databaseIdFromUrl } from './notion.js';
 import { ChatGPTBrowser } from './browser.js';
-import { call, ensureService, healthy, login, runService, stopService } from './http-service.js';
+import { call, ensureService, healthy, openBrowser, runService, serviceStatus, stopService } from './http-service.js';
 import { installCancellationHandler } from './cancellation.js';
 const out = (value: string) => process.stdout.write(`${value}\n`);
-const commands = ['config', 'init', 'login', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'stop'] as const;
+const commands = ['config', 'init', 'open', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'stop'] as const;
 type Command = typeof commands[number];
 type HelpScope = 'global' | Command;
 export type ParsedCli = { kind: 'help'; scope: HelpScope } | { kind: 'command'; command: Command; rest: string[]; prompt?: string; diagnostics?: boolean };
@@ -20,7 +20,7 @@ const globalHelp = `Usage: chatgpt-shot <command> [arguments]
 Commands:
   config  View or update user configuration
   init    Create or validate the Notion Invocation database
-  login   Open Chrome for manual ChatGPT authentication
+  open    Open the retained browser profile for manual interaction
   doctor  Check configuration, Notion, and browser readiness
   start   Start the local Service and print its port
   status  Report local Service health
@@ -52,9 +52,12 @@ CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS.`,
 Create or validate the configured Notion Invocation database.
 
 Arguments: none.`,
-  login: `Usage: chatgpt-shot login
+  open: `Usage: chatgpt-shot open
 
-Open the dedicated Chrome profile for manual ChatGPT authentication.
+Open the retained Chrome profile for manual sign-in or browser checks.
+When the Service is running, it stays available but rejects new submissions until Chrome closes.
+Existing work is never cancelled; retry open after it becomes idle.
+Closing Chrome does not verify authentication or browser-check results.
 
 Arguments: none.`,
   doctor: `Usage: chatgpt-shot doctor
@@ -105,6 +108,7 @@ export function parseCli(args: string[]): ParsedCli {
   if (!candidate || !isCommand(candidate)) fail('CONFIG_INVALID', `Usage: chatgpt-shot <command|--help>`);
   const command = candidate as Command;
   if (rest.length === 1 && isHelp(rest[0])) return { kind: 'help', scope: command };
+  if (command === 'open' && rest.length) fail('CONFIG_INVALID', 'Usage: chatgpt-shot open');
   if (command === 'submit') {
     const diagnostics = rest[0] === '--diagnostics';
     const promptArgs = diagnostics ? rest.slice(1) : rest;
@@ -133,9 +137,9 @@ export async function main(args: string[]) {
   }
   const config = loadConfig(); const databaseId = databaseIdFromUrl(config.databaseUrl);
   if (command === 'init') { if (rest.length) return fail('CONFIG_INVALID', 'Usage: chatgpt-shot init'); const store = new NotionStore(config.notionToken); const database = await store.database(databaseId); try { store.validateSchema(database); out(`already initialized: ${databaseId}`); } catch (error) { if (!(error instanceof ShotError) || error.code !== 'NOTION_SCHEMA_INVALID' || !store.isProvisionable(database)) throw error; await store.initializeSchema(database); store.validateSchema(await store.database(databaseId)); out(`initialized: ${databaseId}`); } return; }
-  if (command === 'login') { out('Plain system Chrome opened with the dedicated chatgpt-shot profile. Authenticate manually, then close it to continue.'); await login(config); out('ChatGPT authentication is available in the retained service profile.'); return; }
+  if (command === 'open') { out('Opening the retained browser profile in system Chrome for manual sign-in or browser checks. Close Chrome to finish; the result is not verified.'); await openBrowser(config); out('Manual browser session closed. Authentication and browser-check results were not verified.'); return; }
   if (command === 'start') { out(String((await ensureService(config)).port)); return; }
-  if (command === 'status') { const record = await healthy(config); out(record ? `healthy ${record.host}:${record.port} pid=${record.pid}` : 'absent'); return; }
+  if (command === 'status') { const status = await serviceStatus(config); out(!status ? 'absent' : `${status.state === 'ready' ? 'healthy' : status.state} ${status.record.host}:${status.record.port} pid=${status.record.pid}`); return; }
   if (command === 'port') { const record = await healthy(config); if (!record) return fail('BROWSER_UNAVAILABLE', 'No healthy chatgpt-shot Service is running.'); out(String(record.port)); return; }
   if (command === 'stop') { await stopService(config); out('chatgpt-shot Service stopped.'); return; }
   if (command === 'doctor') { const store = new NotionStore(config.notionToken); store.validateSchema(await store.database(databaseId)); const browser = new ChatGPTBrowser(config.browserProfilePath); await browser.withBrowser(async () => { await browser.ensureAvailable(); await browser.ensureAuthenticated(); await browser.openFreshContext(); }); out('OK: user configuration, Invocation database, browser profile, authenticated ChatGPT session, and composer are available. ChatGPT-to-Notion write access is not verified; confirm it with a smoke submit.'); return; }
@@ -150,6 +154,6 @@ export async function main(args: string[]) {
     } finally { remove(); }
     return;
   }
-  fail('CONFIG_INVALID', 'Usage: chatgpt-shot <config|init|login|doctor|start|status|port|submit|jobs|stop>');
+  fail('CONFIG_INVALID', 'Usage: chatgpt-shot <config|init|open|doctor|start|status|port|submit|jobs|stop>');
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) main(process.argv.slice(2)).catch(e => { if (e instanceof ShotError) { process.stderr.write(`${e.code}: ${e.message}\n`); if (e.diagnostics !== undefined) process.stderr.write(`BROWSER_DIAGNOSTICS: ${JSON.stringify(e.diagnostics, null, 2)}\n`); process.exitCode = 1; } else { process.stderr.write(`INTERNAL_ERROR: ${e instanceof Error ? e.message : String(e)}\n`); process.exitCode = 1; } });

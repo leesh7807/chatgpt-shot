@@ -24,7 +24,7 @@ test('every public command has local help on both supported flags', () => {
   const expected = new Map([
     ['config', /Usage:\n  chatgpt-shot config\n  chatgpt-shot config path\n  chatgpt-shot config show\n  chatgpt-shot config set KEY VALUE/],
     ['init', /Usage: chatgpt-shot init\n\nCreate or validate/],
-    ['login', /Usage: chatgpt-shot login\n\nOpen the dedicated Chrome profile/],
+    ['open', /Usage: chatgpt-shot open\n\nOpen the retained Chrome profile/],
     ['doctor', /Usage: chatgpt-shot doctor\n\nCheck configuration/],
     ['start', /Usage: chatgpt-shot start\n\nStart the local Service/],
     ['status', /Usage: chatgpt-shot status\n\nReport whether/],
@@ -50,7 +50,7 @@ test('every public command has local help on both supported flags', () => {
 
 test('help tokens resolve to their scope and are not submit prompts', () => {
   assert.deepEqual(parseCli(['--help']), { kind: 'help', scope: 'global' });
-  for (const command of ['config', 'init', 'login', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'stop'] as const) {
+  for (const command of ['config', 'init', 'open', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'stop'] as const) {
     for (const flag of ['--help', '-h']) assert.deepEqual(parseCli([command, flag]), { kind: 'help', scope: command });
   }
   assert.deepEqual(parseCli(['submit', '--help']), { kind: 'help', scope: 'submit' });
