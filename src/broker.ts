@@ -13,6 +13,8 @@ export type SubmissionEvidence = { seen: boolean; composerValue: string };
 export type SubmissionInspection = 'submitted' | 'not_submitted' | 'uncertain';
 export const classifySubmissionEvidence = (submissionMarker: string, evidence: SubmissionEvidence): SubmissionInspection => !submissionMarker ? 'uncertain' : evidence.seen && !evidence.composerValue.includes(submissionMarker) ? 'submitted' : !evidence.seen && evidence.composerValue.includes(submissionMarker) ? 'not_submitted' : 'uncertain';
 export const SEND_BUTTON_LABEL_PATTERN = /^(?:send|send message|send prompt)$/i;
+const SEND_BUTTON_READY_TIMEOUT_MS = 10_000;
+const SUBMIT_ACTION_TIMEOUT_MS = SEND_BUTTON_READY_TIMEOUT_MS + 2_000;
 type VirtualDisplay = { process: ChildProcess; display: string; authorizationPath: string };
 const uid = process.getuid?.();
 const ownedDirectory = (path: string) => { try { const stat = lstatSync(path); return stat.isDirectory() && (uid === undefined || stat.uid === uid) && (stat.mode & 0o022) === 0; } catch { return false; } };
@@ -237,8 +239,8 @@ class Broker {
       }
       if (request.operation === 'submit') {
         const before = request.diagnostics ? await this.diagnosticSnapshot(page, request.sessionId!, request.submissionMarker, 'before_submit') : undefined;
-        const result = await page.within(Date.now() + 7_000, async () => {
-          const deadline = Date.now() + 5_000;
+        const result = await page.within(Date.now() + SUBMIT_ACTION_TIMEOUT_MS, async () => {
+          const deadline = Date.now() + SEND_BUTTON_READY_TIMEOUT_MS;
           let action = await page.evaluate<{ method: 'click' | 'wait' | 'not_ready'; reason?: string; button?: Record<string, unknown> }>(sendControlProbe, [request.submissionMarker ?? '']);
           while (action.method === 'wait' && Date.now() < deadline) {
             await delay(100);
