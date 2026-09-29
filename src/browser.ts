@@ -5,8 +5,10 @@ import { paths } from './config.js';
 import { fail, isStaleBrowserSessionError } from './errors.js';
 
 export type Inspection = 'submitted' | 'not_submitted' | 'uncertain';
+export type SubmitAttempt = 'clicked' | 'not_attempted';
+export type InspectionOptions = { settleMs?: number };
 export type BrowserDiagnosticEntry = { offset_ms: number; stage: string; [key: string]: unknown };
-export interface BrowserTransport { withBrowser<T>(operation: () => Promise<T>): Promise<T>; ensureAvailable(): Promise<void>; ensureAuthenticated(): Promise<void>; openFreshContext(): Promise<void>; fillPrompt(prompt: string, submissionMarker: string): Promise<void>; submitPrompt(submissionMarker: string): Promise<void>; inspectSubmission(submissionMarker: string): Promise<Inspection>; close(): Promise<void>; diagnosticReport?(): BrowserDiagnosticEntry[]; }
+export interface BrowserTransport { withBrowser<T>(operation: () => Promise<T>): Promise<T>; ensureAvailable(): Promise<void>; ensureAuthenticated(): Promise<void>; openFreshContext(): Promise<void>; fillPrompt(prompt: string, submissionMarker: string): Promise<void>; submitPrompt(submissionMarker: string): Promise<SubmitAttempt | void>; inspectSubmission(submissionMarker: string, options?: InspectionOptions): Promise<Inspection>; close(): Promise<void>; diagnosticReport?(): BrowserDiagnosticEntry[]; }
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const profilePath = (profile: string) => profile;
@@ -138,27 +140,51 @@ export class ChatGPTBrowser implements BrowserTransport {
     try {
       const result = await this.rpc('submit', sessionId, undefined, submissionMarker) as { method?: string } | undefined;
       this.collectDiagnostic(result, 'submit');
-      if (result?.method === 'not_ready') fail('SUBMISSION_UNCERTAIN', 'The ChatGPT Send button was not ready; no click was attempted.');
+      if (result?.method === 'not_ready') return 'not_attempted';
       if (result?.method !== 'click') fail('SUBMISSION_UNCERTAIN', 'The ChatGPT Send button action could not be confirmed.');
       if (this.diagnosticsEnabled) this.observationTask = this.sampleAfterSubmit(sessionId!, submissionMarker);
+      return 'clicked';
     }
     catch (error: any) {
       if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); fail('SUBMISSION_UNCERTAIN', 'The browser session disappeared while submitting; the submission outcome is uncertain.'); }
       fail('SUBMISSION_UNCERTAIN', `Browser transport failed while submitting: ${error?.message ?? String(error)}`);
     }
   }
-  async inspectSubmission(submissionMarker: string): Promise<Inspection> {
+  async inspectSubmission(submissionMarker: string, options: InspectionOptions = {}): Promise<Inspection> {
     if (!this.sessionId) return 'uncertain';
     try {
       if (this.observationTask) await this.observationTask;
-      const result = await this.rpc('inspect', this.sessionId, undefined, submissionMarker);
-      if (this.diagnosticsEnabled && result && typeof result === 'object') {
-        this.collectDiagnostic(result, 'inspection');
-        return (result as { inspection: Inspection }).inspection;
+      const settleMs = Math.max(0, options.settleMs ?? 0);
+      const checkpoints = settleMs > 0 ? [...new Set([0, 500, 1_500, 3_000, settleMs].filter((time) => time <= settleMs))] : [0];
+      const started = Date.now();
+      let last: Inspection = 'uncertain';
+      let allNotSubmitted = true;
+      let successfulSamples = 0;
+      let lastError: unknown;
+      for (const checkpoint of checkpoints) {
+        if (checkpoint > 0) await wait(Math.max(0, started + checkpoint - Date.now()));
+        try {
+          const result = await this.rpc('inspect', this.sessionId, undefined, submissionMarker);
+          let observed: Inspection;
+          if (this.diagnosticsEnabled && result && typeof result === 'object') {
+            this.collectDiagnostic(result, 'inspection');
+            const value = (result as { inspection?: unknown }).inspection;
+            observed = value === 'submitted' || value === 'not_submitted' ? value : 'uncertain';
+          } else observed = result === 'submitted' || result === 'not_submitted' ? result : 'uncertain';
+          successfulSamples++;
+          last = observed;
+          if (observed === 'submitted') return 'submitted';
+          if (observed !== 'not_submitted') allNotSubmitted = false;
+        } catch (error) {
+          if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); return 'uncertain'; }
+          lastError = error;
+          last = 'uncertain';
+          allNotSubmitted = false;
+        }
       }
-      return result as Inspection;
-    }
-    catch (error) { if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); return 'uncertain'; } throw error; }
+      if (!successfulSamples && lastError) throw lastError;
+      return last === 'not_submitted' && allNotSubmitted ? 'not_submitted' : 'uncertain';
+    } catch (error) { if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); return 'uncertain'; } throw error; }
   }
   diagnosticReport() { return this.diagnostics.map(entry => ({ ...entry })); }
   async close() { if (this.sessionId) await this.rpc('close', this.sessionId).catch(() => {}); this.sessionId = undefined; }

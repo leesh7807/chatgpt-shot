@@ -6,6 +6,7 @@ import { LocalJobTelemetryWriter, type JobTelemetryError, type JobTelemetryWrite
 export type SubmitOptions = { acknowledgementMs?: number; pollMs?: number; telemetry?: JobTelemetryWriter; signal?: AbortSignal; diagnostics?: boolean };
 export type JobExecution = { job: Invocation; completion: Promise<void> };
 export const DEFAULT_ACKNOWLEDGEMENT_MS = 45_000;
+const SUBMISSION_SETTLE_MS = 5_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const wrapPrompt = (prompt: string, pageId: string) => `<task>\n${prompt}\n</task>\n\n<chatgpt-shot>\nThis block is supplied by chatgpt-shot and defines how to return the result.\n\nInvocation record:\nhttps://www.notion.so/${pageId.replace(/-/g, '')}\n\n1. Before starting the task, set State to \`in_progress\`.\n2. Complete the task in <task>.\n3. Write the complete result to the invocation page body.\n4. As the final action:\n   - success → set State to \`completed\`\n   - failure → write the reason to Error and set State to \`failed\`\n</chatgpt-shot>`;
@@ -53,7 +54,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
   const inspect = async (): Promise<Inspection> => {
     try {
       if (!invocation) return 'uncertain';
-      const result = await browser.inspectSubmission(invocation.pageId.replace(/-/g, ''));
+      const result = await browser.inspectSubmission(invocation.pageId.replace(/-/g, ''), { settleMs: SUBMISSION_SETTLE_MS });
       event('submission_inspected', { inspection: result });
       return result;
     } catch (error) {
@@ -115,7 +116,11 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
       event('submission_attempted');
       let acknowledgementStarted: number;
       try {
-        await browser.submitPrompt(invocation.pageId.replace(/-/g, ''));
+        const attempt = await browser.submitPrompt(invocation.pageId.replace(/-/g, ''));
+        if (attempt === 'not_attempted') {
+          delivery = 'not_submitted';
+          return await failUndelivered('the Send control did not become ready; no click was attempted');
+        }
         acknowledgementStarted = Date.now();
         event('submit_returned');
         cancelled();

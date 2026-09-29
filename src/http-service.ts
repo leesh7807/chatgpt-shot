@@ -164,6 +164,13 @@ export async function runService(): Promise<void> {
   const credential = randomBytes(32).toString('base64url'); let stopping = false; let openingBrowser = false; let active = 0; let server: ReturnType<typeof createServer>;
   const admissions = new Set<AbortController>();
   const json = (res: any, status: number, body: unknown) => { if (!res.destroyed) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); } };
+  const jsonError = (res: any, error: unknown) => {
+    if (error instanceof ShotError && error.code === 'NOTION_RATE_LIMITED') {
+      if (error.retryAfterSeconds !== undefined) res.setHeader('retry-after', String(error.retryAfterSeconds));
+      return json(res, 429, responseError(error));
+    }
+    return json(res, 500, responseError(error));
+  };
   const durable = async (store: NotionStore, databaseId: string, id: string) => {
     const invocation = await store.findInvocation(databaseId, id);
     if (!invocation) return undefined;
@@ -201,7 +208,7 @@ export async function runService(): Promise<void> {
       try { const current = loadConfig(); const store = new NotionStore(current.notionToken); const databaseId = databaseIdFromUrl(current.databaseUrl); store.validateSchema(await store.database(databaseId));
         if (match) { const value = await durable(store, databaseId, match[1]); return value ? json(res, 200, value) : json(res, 404, { code: 'NOT_FOUND', message: 'Job does not exist.' }); }
         const jobs = await store.listInvocations(databaseId); return json(res, 200, { jobs: jobs.map(job => ({ id: job.id, state: job.state, error: job.error || null })) });
-      } catch (error) { return json(res, 500, responseError(error)); }
+      } catch (error) { return jsonError(res, error); }
     }
     if (req.url !== '/jobs' || req.method !== 'POST') { req.resume(); return json(res, 404, { code: 'NOT_FOUND', message: 'Service is not accepting this request.' }); }
     if (stopping || openingBrowser || existsSync(config.manualOpenLockPath)) { if (existsSync(config.manualOpenLockPath)) reclaimStaleManualOpen(config); const manualOpen = existsSync(config.manualOpenLockPath); req.resume(); return json(res, 503, stopping ? { code: 'SERVICE_STOPPING', message: 'Service is not accepting this request.' } : { code: 'SERVICE_BUSY', message: manualOpen ? 'The browser profile is open for manual use. Retry after the browser window closes.' : 'Service is preparing the browser profile.' }); }
@@ -218,7 +225,13 @@ export async function runService(): Promise<void> {
         const admission = new AbortController(); admissions.add(admission);
         try { const run = await startJob(store, databaseId, new ChatGPTBrowser(current.browserProfilePath, undefined, diagnostics), prompt, id, { acknowledgementMs: current.acknowledgementMs, signal: admission.signal, diagnostics }); active++; void run.completion.catch(() => {}).finally(() => { active--; }); return json(res, 200, { id }); }
         finally { admissions.delete(admission); }
-      } catch (error) { const manualOpen = existsSync(config.manualOpenLockPath); if (manualOpen) reclaimStaleManualOpen(config); return json(res, stopping || openingBrowser || manualOpen ? 503 : 500, stopping ? { code: 'SERVICE_STOPPING', message: 'Service is not accepting this request.' } : openingBrowser || manualOpen ? { code: 'SERVICE_BUSY', message: 'The browser profile is reserved for manual use. Retry after the browser window closes.' } : responseError(error)); }
+      } catch (error) {
+        const manualOpen = existsSync(config.manualOpenLockPath);
+        if (manualOpen) reclaimStaleManualOpen(config);
+        if (stopping) return json(res, 503, { code: 'SERVICE_STOPPING', message: 'Service is not accepting this request.' });
+        if (openingBrowser || manualOpen) return json(res, 503, { code: 'SERVICE_BUSY', message: 'The browser profile is reserved for manual use. Retry after the browser window closes.' });
+        return jsonError(res, error);
+      }
     });
   });
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => resolve()); }); const address = server.address(); if (!address || typeof address === 'string') return fail('INTERNAL_ERROR', 'Service did not obtain a TCP port.') as never; publish(config, { pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential }); process.once('SIGTERM', () => void stop()); process.once('SIGINT', () => void stop());
