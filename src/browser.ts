@@ -5,15 +5,17 @@ import { paths } from './config.js';
 import { fail, isStaleBrowserSessionError } from './errors.js';
 
 export type Inspection = 'submitted' | 'not_submitted' | 'uncertain';
-export type SubmitAttempt = 'clicked' | 'not_attempted';
+export type SubmitAttempt = { outcome: 'clicked'; method?: string } | { outcome: 'not_attempted'; reason: string };
+export type SubmissionInspection = { inspection: Inspection; messageMarkerSeen?: boolean; composerMarkerPresent?: boolean; composerPresent?: boolean; sampleCount?: number; reason?: string };
 export type InspectionOptions = { settleMs?: number };
 export type BrowserDiagnosticEntry = { offset_ms: number; stage: string; [key: string]: unknown };
-export interface BrowserTransport { withBrowser<T>(operation: () => Promise<T>): Promise<T>; ensureAvailable(): Promise<void>; ensureAuthenticated(): Promise<void>; openFreshContext(): Promise<void>; fillPrompt(prompt: string, submissionMarker: string): Promise<void>; submitPrompt(submissionMarker: string): Promise<SubmitAttempt | void>; inspectSubmission(submissionMarker: string, options?: InspectionOptions): Promise<Inspection>; close(): Promise<void>; diagnosticReport?(): BrowserDiagnosticEntry[]; }
+export interface BrowserTransport { withBrowser<T>(operation: () => Promise<T>): Promise<T>; ensureAvailable(): Promise<void>; ensureAuthenticated(): Promise<void>; openFreshContext(): Promise<void>; fillPrompt(prompt: string, submissionMarker: string): Promise<void>; submitPrompt(submissionMarker: string): Promise<SubmitAttempt>; inspectSubmission(submissionMarker: string, options?: InspectionOptions): Promise<SubmissionInspection | Inspection>; close(): Promise<void>; diagnosticReport?(): BrowserDiagnosticEntry[]; }
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const pendingBrokerStarts = new Map<string, Promise<void>>();
 const profilePath = (profile: string) => profile;
 const systemChrome = () => [process.env.CHATGPT_SHOT_BROWSER, '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome'].find((path): path is string => Boolean(path && existsSync(path)));
-async function request(root: string, operation: string, sessionId?: string, prompt?: string, submissionMarker?: string, send: typeof brokerRequest = brokerRequest, diagnostics = false) { try { return await send(root, { operation, sessionId, prompt, submissionMarker, ...(diagnostics ? { diagnostics: true } : {}) }); } catch (error: any) { if (error.code) return fail(error.code, error.message); throw error; } }
+async function request(root: string, operation: string, sessionId?: string, prompt?: string, submissionMarker?: string, send: typeof brokerRequest = brokerRequest, diagnostics = false) { try { return await send(root, { operation, sessionId, prompt, submissionMarker, ...(diagnostics ? { diagnostics: true } : {}) }); } catch (error: any) { if (error.code) return fail(error.code, error.message, error); throw error; } }
 export async function ensureBroker(profile: string) {
   const assertProfileAvailable = () => { if (existsSync(paths().manualOpenLockPath)) fail('SERVICE_BUSY', 'The retained browser profile is open for manual use.'); };
   const absent = (error: any) => error?.code === 'ENOENT' || error?.code === 'ECONNREFUSED';
@@ -23,12 +25,23 @@ export async function ensureBroker(profile: string) {
     if (error.code === 'ECONNREFUSED') try { unlinkSync(brokerSocket(profile)); } catch {}
   }
   assertProfileAvailable();
+  const socket = brokerSocket(profile);
+  const existingStart = pendingBrokerStarts.get(socket);
+  if (existingStart) {
+    await existingStart;
+    await request(profile, 'ensure');
+    return;
+  }
   if (!existsSync(process.argv[1])) fail('BROWSER_UNAVAILABLE', 'Cannot locate the chatgpt-shot broker entry point.');
-  // Development execution via tsx supplies the TypeScript loader through execArgv; retain it when
-  // the detached broker is spawned so the broker has the same executable semantics as its caller.
-  const child = spawn(process.execPath, [...process.execArgv, process.argv[1], '__broker'], { detached: true, stdio: 'ignore' }); child.unref();
-  for (let attempt = 0; attempt < 50; attempt++) { try { assertProfileAvailable(); await request(profile, 'ensure'); return; } catch (error: any) { if (error?.code === 'SERVICE_BUSY') { await shutdownBroker(profile).catch(() => {}); throw error; } if (!absent(error)) throw error; await wait(100); } }
-  fail('BROWSER_UNAVAILABLE', 'Could not start the local ChatGPT browser broker.');
+  const starting = (async () => {
+    // Development execution via tsx supplies the TypeScript loader through execArgv; retain it when
+    // the detached broker is spawned so the broker has the same executable semantics as its caller.
+    const child = spawn(process.execPath, [...process.execArgv, process.argv[1], '__broker'], { detached: true, stdio: 'ignore' }); child.unref();
+    for (let attempt = 0; attempt < 50; attempt++) { try { assertProfileAvailable(); await request(profile, 'ensure'); return; } catch (error: any) { if (error?.code === 'SERVICE_BUSY') { await shutdownBroker(profile).catch(() => {}); throw error; } if (!absent(error)) throw error; await wait(100); } }
+    fail('BROWSER_UNAVAILABLE', 'Could not start the local ChatGPT browser broker.');
+  })();
+  pendingBrokerStarts.set(socket, starting);
+  try { await starting; } finally { if (pendingBrokerStarts.get(socket) === starting) pendingBrokerStarts.delete(socket); }
 }
 export async function openProfileBrowser(profile: string, onSpawn?: (pid: number) => void): Promise<void> {
   const executable = systemChrome(); if (!executable) fail('BROWSER_UNAVAILABLE', 'A supported system Chrome executable is required to open the retained profile.');
@@ -95,12 +108,21 @@ export class ChatGPTBrowser implements BrowserTransport {
     }
   }
   private async invalidateSession() {
-    const sessionId = this.sessionId;
-    this.sessionId = undefined;
-    if (sessionId) await this.rpc('close', sessionId).catch(() => {});
+    if (this.sessionId) await this.close();
   }
   private async openFreshContextOnce() { await this.close(); this.sessionId = await this.rpc('open'); }
-  async withBrowser<T>(operation: () => Promise<T>) { try { return await operation(); } finally { await this.close(); } }
+  async withBrowser<T>(operation: () => Promise<T>) {
+    let value!: T;
+    let operationError: unknown;
+    try { value = await operation(); } catch (error) { operationError = error; }
+    try { await this.close(); }
+    catch (closeError) {
+      if (operationError && typeof operationError === 'object') (operationError as any).browserCloseError = closeError;
+      else throw closeError;
+    }
+    if (operationError) throw operationError;
+    return value;
+  }
   async ensureAvailable() { await ensureBroker(this.profile); }
   async ensureAuthenticated() {
     let status: { authenticated?: boolean };
@@ -134,30 +156,29 @@ export class ChatGPTBrowser implements BrowserTransport {
       }
     }
   }
-  async submitPrompt(submissionMarker: string) {
+  async submitPrompt(submissionMarker: string): Promise<SubmitAttempt> {
     const sessionId = this.sessionId;
     if (!sessionId) fail('BROWSER_UNAVAILABLE', 'Browser invocation page is unavailable.');
     try {
-      const result = await this.rpc('submit', sessionId, undefined, submissionMarker) as { method?: string } | undefined;
+      const result = await this.rpc('submit', sessionId, undefined, submissionMarker) as { method?: string; reason?: string } | undefined;
       this.collectDiagnostic(result, 'submit');
-      if (result?.method === 'not_ready') return 'not_attempted';
-      if (result?.method !== 'click') fail('SUBMISSION_UNCERTAIN', 'The ChatGPT Send button action could not be confirmed.');
+      if (result?.method === 'not_ready') return { outcome: 'not_attempted', reason: safeReason(result?.reason) ?? 'send_control_not_ready' };
+      if (result?.method !== 'click') fail('SUBMISSION_UNCERTAIN', 'The ChatGPT Send button action could not be confirmed.', result);
       if (this.diagnosticsEnabled) this.observationTask = this.sampleAfterSubmit(sessionId!, submissionMarker);
-      return 'clicked';
+      return { outcome: 'clicked', method: 'click' };
     }
     catch (error: any) {
-      if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); fail('SUBMISSION_UNCERTAIN', 'The browser session disappeared while submitting; the submission outcome is uncertain.'); }
-      fail('SUBMISSION_UNCERTAIN', `Browser transport failed while submitting: ${error?.message ?? String(error)}`);
+      if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); fail('SUBMISSION_UNCERTAIN', 'The browser session disappeared while submitting; the submission outcome is uncertain.', error); }
+      return fail('SUBMISSION_UNCERTAIN', 'The browser transport did not confirm the submission action.', error);
     }
   }
-  async inspectSubmission(submissionMarker: string, options: InspectionOptions = {}): Promise<Inspection> {
-    if (!this.sessionId) return 'uncertain';
+  async inspectSubmission(submissionMarker: string, options: InspectionOptions = {}): Promise<SubmissionInspection> {
+    if (!this.sessionId) return { inspection: 'uncertain', reason: 'browser_session_missing', sampleCount: 0 };
     try {
-      if (this.observationTask) await this.observationTask;
       const settleMs = Math.max(0, options.settleMs ?? 0);
       const checkpoints = settleMs > 0 ? [...new Set([0, 500, 1_500, 3_000, settleMs].filter((time) => time <= settleMs))] : [0];
       const started = Date.now();
-      let last: Inspection = 'uncertain';
+      let last: SubmissionInspection = { inspection: 'uncertain', reason: 'insufficient_ui_evidence' };
       let allNotSubmitted = true;
       let successfulSamples = 0;
       let lastError: unknown;
@@ -165,29 +186,61 @@ export class ChatGPTBrowser implements BrowserTransport {
         if (checkpoint > 0) await wait(Math.max(0, started + checkpoint - Date.now()));
         try {
           const result = await this.rpc('inspect', this.sessionId, undefined, submissionMarker);
-          let observed: Inspection;
+          let observed: SubmissionInspection;
           if (this.diagnosticsEnabled && result && typeof result === 'object') {
             this.collectDiagnostic(result, 'inspection');
-            const value = (result as { inspection?: unknown }).inspection;
-            observed = value === 'submitted' || value === 'not_submitted' ? value : 'uncertain';
-          } else observed = result === 'submitted' || result === 'not_submitted' ? result : 'uncertain';
+            const value = result as { inspection?: unknown; messageMarkerSeen?: unknown; composerMarkerPresent?: unknown; composerPresent?: unknown; reason?: unknown };
+            observed = {
+              inspection: value.inspection === 'submitted' || value.inspection === 'not_submitted' ? value.inspection : 'uncertain',
+              ...(typeof value.messageMarkerSeen === 'boolean' ? { messageMarkerSeen: value.messageMarkerSeen } : {}),
+              ...(typeof value.composerMarkerPresent === 'boolean' ? { composerMarkerPresent: value.composerMarkerPresent } : {}),
+              ...(typeof value.composerPresent === 'boolean' ? { composerPresent: value.composerPresent } : {}),
+              ...(typeof value.reason === 'string' ? { reason: safeReason(value.reason) ?? 'insufficient_ui_evidence' } : {}),
+            };
+          } else if (result && typeof result === 'object') {
+            const value = result as { inspection?: unknown; messageMarkerSeen?: unknown; composerMarkerPresent?: unknown; composerPresent?: unknown; reason?: unknown };
+            observed = {
+              inspection: value.inspection === 'submitted' || value.inspection === 'not_submitted' ? value.inspection : 'uncertain',
+              ...(typeof value.messageMarkerSeen === 'boolean' ? { messageMarkerSeen: value.messageMarkerSeen } : {}),
+              ...(typeof value.composerMarkerPresent === 'boolean' ? { composerMarkerPresent: value.composerMarkerPresent } : {}),
+              ...(typeof value.composerPresent === 'boolean' ? { composerPresent: value.composerPresent } : {}),
+              ...(typeof value.reason === 'string' ? { reason: safeReason(value.reason) ?? 'insufficient_ui_evidence' } : {}),
+            };
+          } else observed = { inspection: result === 'submitted' || result === 'not_submitted' ? result : 'uncertain' };
           successfulSamples++;
           last = observed;
-          if (observed === 'submitted') return 'submitted';
-          if (observed !== 'not_submitted') allNotSubmitted = false;
+          if (observed.inspection === 'submitted') return { ...observed, sampleCount: successfulSamples };
+          if (observed.inspection !== 'not_submitted') allNotSubmitted = false;
         } catch (error) {
-          if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); return 'uncertain'; }
+          if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); return { inspection: 'uncertain', reason: 'stale_browser_session' }; }
           lastError = error;
-          last = 'uncertain';
+          last = { inspection: 'uncertain', reason: 'insufficient_ui_evidence' };
           allNotSubmitted = false;
         }
       }
       if (!successfulSamples && lastError) throw lastError;
-      return last === 'not_submitted' && allNotSubmitted ? 'not_submitted' : 'uncertain';
-    } catch (error) { if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); return 'uncertain'; } throw error; }
+      return { ...last, inspection: last.inspection === 'not_submitted' && allNotSubmitted ? 'not_submitted' : 'uncertain', sampleCount: successfulSamples };
+    } catch (error) { if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); return { inspection: 'uncertain', reason: 'stale_browser_session' }; } throw error; }
   }
   diagnosticReport() { return this.diagnostics.map(entry => ({ ...entry })); }
-  async close() { if (this.sessionId) await this.rpc('close', this.sessionId).catch(() => {}); this.sessionId = undefined; }
+  async close() {
+    const sessionId = this.sessionId;
+    if (!sessionId) return;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const result = await this.rpc('close', sessionId) as { closed?: unknown; verified?: unknown } | undefined;
+        if (result?.closed !== true || result?.verified !== true) throw new Error('Broker did not confirm that the Chrome target was closed.');
+        this.sessionId = undefined;
+        return;
+      }
+      catch (error) { lastError = error; if (attempt === 0) await wait(100); }
+    }
+    fail('BROWSER_CONTEXT_CLOSE_FAILED', 'The submission browser tab could not be confirmed closed.', lastError);
+  }
 }
+
+const safeReason = (value: unknown) => typeof value === 'string' && ['composer_marker_missing', 'send_button_not_found', 'send_button_disabled', 'composer_missing', 'marker_in_message', 'marker_in_composer', 'marker_seen_in_both', 'marker_seen_in_neither', 'browser_session_missing', 'stale_browser_session', 'insufficient_ui_evidence', 'marker_missing', 'send_control_not_ready'].includes(value) ? value : undefined;
+
 
 export { brokerSocket };

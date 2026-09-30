@@ -1,4 +1,6 @@
 import { Client } from '@notionhq/client';
+import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { fail, ShotError, type ErrorCode } from './errors.js';
 
 export const STATES = ['pending', 'in_progress', 'completed', 'failed'] as const;
@@ -27,7 +29,7 @@ function failNotion(error: unknown, fallbackCode: ErrorCode, fallbackMessage: st
   const cause = error as any;
   const code = typeof cause?.code === 'string' ? cause.code : undefined;
   const status = typeof cause?.status === 'number' ? cause.status : undefined;
-  if (status === 429 || code === 'rate_limited') {
+  if (status === 429 || status === 529 || code === 'rate_limited' || code === 'service_overload') {
     const body = notionBody(cause);
     const additional = body?.additional_data;
     const rawRetryAfter = responseHeader(cause?.headers, 'retry-after') ?? additional?.retry_after;
@@ -39,12 +41,173 @@ function failNotion(error: unknown, fallbackCode: ErrorCode, fallbackMessage: st
       Number.isSafeInteger(retryAfter) && retryAfter! >= 0 ? `Retry after ${retryAfter} seconds.` : undefined,
       reason === 'public_api_request_blocked' ? 'This connection is blocked; contact Notion support.' : undefined,
     ].filter((part): part is string => typeof part === 'string' && part.length > 0).join(' ');
-    const rateLimited = new ShotError('NOTION_RATE_LIMITED', `Notion API rate limit reached (HTTP ${status ?? 429}, ${code ?? 'rate_limited'}).${details ? ` ${details}` : ''}`, error);
+    const rateLimited = new ShotError('NOTION_RATE_LIMITED', `Notion API request was throttled or overloaded (HTTP ${status ?? (code === 'service_overload' ? 529 : 429)}, ${code ?? 'rate_limited'}).${details ? ` ${details}` : ''}`, error);
     if (Number.isSafeInteger(retryAfter) && retryAfter! >= 0) rateLimited.retryAfterSeconds = retryAfter;
+    rateLimited.retryable = reason !== 'public_api_request_blocked';
+    rateLimited.httpStatus = status;
     throw rateLimited;
   }
-  return fail(fallbackCode, fallbackMessage, error);
+  const wrapped = new ShotError(fallbackCode, fallbackMessage, error);
+  wrapped.httpStatus = status;
+  wrapped.retryable = status !== undefined
+    ? [500, 502, 503, 504].includes(status)
+    : ['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT', 'notionhq_client_request_timeout'].includes(code ?? '');
+  throw wrapped;
 }
+
+export type NotionRequestTelemetry = {
+  operation: string;
+  outcome: 'success' | 'retry' | 'failed';
+  duration_ms: number;
+  error?: { code?: string; network_code?: string; status?: number; retry_after_seconds?: number };
+  details?: { attempt?: number; queue_wait_ms?: number; retry_after_seconds?: number; http_status?: number; rate_limit_reason?: string };
+};
+
+type RequestParameters = Parameters<Client['request']>[0];
+type ScheduledRequest = <T>(operation: string, method: string, request: () => Promise<T>, observer?: (event: NotionRequestTelemetry) => void, safeRead?: boolean, signal?: AbortSignal) => Promise<T>;
+const REQUEST_SPACING_MS = 334;
+const MAX_REQUEST_ATTEMPTS = 3;
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const cancelledRequest = () => new ShotError('ADMISSION_CANCELLED', 'The Notion request was cancelled before it started.');
+const abortableDelay = async (ms: number, signal?: AbortSignal) => {
+  if (signal?.aborted) throw cancelledRequest();
+  if (ms <= 0) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let abortListener: (() => void) | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      timer = setTimeout(resolve, ms);
+      if (signal) {
+        abortListener = () => { if (timer) clearTimeout(timer); reject(cancelledRequest()); };
+        signal.addEventListener('abort', abortListener, { once: true });
+        if (signal.aborted) abortListener();
+      }
+    });
+  } finally { if (timer) clearTimeout(timer); if (abortListener) signal?.removeEventListener('abort', abortListener); }
+};
+const abortableWaitFor = async <T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> => {
+  if (!signal) return promise;
+  if (signal.aborted) throw cancelledRequest();
+  let abortListener: (() => void) | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      abortListener = () => reject(cancelledRequest());
+      signal.addEventListener('abort', abortListener, { once: true });
+      if (signal.aborted) abortListener();
+    })]);
+  } finally { if (abortListener) signal.removeEventListener('abort', abortListener); }
+};
+
+function retryAfterSeconds(error: any): number | undefined {
+  const body = notionBody(error);
+  const raw = responseHeader(error?.headers, 'retry-after') ?? body?.additional_data?.retry_after;
+  const value = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : undefined;
+  return Number.isSafeInteger(value) && value! >= 0 ? value : undefined;
+}
+
+function notionOperation(parameters: RequestParameters): string {
+  const path = parameters.path.split('?')[0].replace(/^\/+|\/+$/g, '').split('/');
+  const method = parameters.method.toUpperCase();
+  if (path[0] === 'databases') return path[1] === 'query' || path[2] === 'query' ? 'databases.query' : method === 'GET' ? 'databases.retrieve' : method === 'PATCH' ? 'databases.update' : 'databases.request';
+  if (path[0] === 'pages') return path.length === 1 ? 'pages.create' : method === 'GET' ? 'pages.retrieve' : method === 'PATCH' ? 'pages.update' : 'pages.request';
+  if (path[0] === 'blocks' && path[2] === 'children') return method === 'GET' ? 'blocks.children.list' : 'blocks.children.append';
+  if (path[0] === 'blocks') return method === 'GET' ? 'blocks.retrieve' : method === 'PATCH' ? 'blocks.update' : 'blocks.delete';
+  return `${path[0] ?? 'unknown'}.request`;
+}
+
+export class NotionRequestQueue {
+  private reservation: Promise<void> = Promise.resolve();
+  private nextStartAt = 0;
+  private cooldownUntil = 0;
+
+  private async reserveStart(signal?: AbortSignal): Promise<number> {
+    const previous = this.reservation;
+    let release!: () => void;
+    this.reservation = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      await abortableWaitFor(previous, signal);
+      const waitMs = Math.max(0, this.nextStartAt - Date.now(), this.cooldownUntil - Date.now());
+      if (waitMs) await abortableDelay(waitMs, signal);
+      this.nextStartAt = Date.now() + REQUEST_SPACING_MS;
+      return waitMs;
+    } finally { release(); }
+  }
+
+  private defer(ms: number): void {
+    this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + ms);
+  }
+
+  async run<T>(operation: string, method: string, request: () => Promise<T>, observer?: (event: NotionRequestTelemetry) => void, safeRead = false, signal?: AbortSignal): Promise<T> {
+    for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt++) {
+      let queueWaitMs: number;
+      try { queueWaitMs = await this.reserveStart(signal); }
+      catch (error) {
+        try { observer?.({ operation, outcome: 'failed', duration_ms: 0, error: { code: error instanceof ShotError ? error.code : 'QUEUE_CANCELLED' }, details: { attempt } }); } catch { /* telemetry is best effort */ }
+        throw error;
+      }
+      if (signal?.aborted) throw cancelledRequest();
+      const started = performance.now();
+      try {
+        const result = await request();
+        try { observer?.({ operation, outcome: 'success', duration_ms: performance.now() - started, details: { attempt, queue_wait_ms: queueWaitMs } }); } catch { /* telemetry is best effort */ }
+        return result;
+      } catch (error: any) {
+        const status = typeof error?.status === 'number' ? error.status : undefined;
+        const code = typeof error?.code === 'string' ? error.code : undefined;
+        const retryAfter = retryAfterSeconds(error);
+        const body = notionBody(error);
+        const reason = typeof body?.additional_data?.rate_limit_reason === 'string' ? body.additional_data.rate_limit_reason : undefined;
+        const rateLimited = status === 429 || status === 529 || code === 'rate_limited' || code === 'service_overload';
+        const serverReadFailure = safeRead && [500, 502, 503, 504].includes(status ?? 0);
+        const retryable = rateLimited ? reason !== 'public_api_request_blocked' : serverReadFailure;
+        const exponentialDelayMs = Math.min(30_000, 1_000 * 2 ** (attempt - 1));
+        const nextWaitMs = Math.max(retryAfter !== undefined ? retryAfter * 1_000 : 0, exponentialDelayMs);
+        if (rateLimited && retryable) this.defer(nextWaitMs);
+        const errorDetails = {
+          ...(code && /^[A-Za-z0-9_.:-]{1,96}$/.test(code) ? { code } : {}),
+          ...(status !== undefined ? { status } : {}),
+          ...(retryAfter !== undefined ? { retry_after_seconds: retryAfter } : {}),
+          ...(typeof error?.code === 'string' && /^[A-Z0-9_]{1,96}$/.test(error.code) ? { network_code: error.code } : {}),
+        };
+        if (retryable && attempt < MAX_REQUEST_ATTEMPTS) {
+          try { observer?.({ operation, outcome: 'retry', duration_ms: performance.now() - started, error: errorDetails, details: { attempt, queue_wait_ms: queueWaitMs, retry_after_seconds: retryAfter, http_status: status, rate_limit_reason: reason } }); } catch { /* telemetry is best effort */ }
+          try { await abortableDelay(nextWaitMs + Math.floor(Math.random() * 251), signal); }
+          catch (cancelError) {
+            try { observer?.({ operation, outcome: 'failed', duration_ms: 0, error: { code: cancelError instanceof ShotError ? cancelError.code : 'QUEUE_CANCELLED' }, details: { attempt } }); } catch { /* telemetry is best effort */ }
+            throw cancelError;
+          }
+          continue;
+        }
+        try { observer?.({ operation, outcome: 'failed', duration_ms: performance.now() - started, error: errorDetails, details: { attempt, queue_wait_ms: queueWaitMs, retry_after_seconds: retryAfter, http_status: status, rate_limit_reason: reason } }); } catch { /* telemetry is best effort */ }
+        throw error;
+      }
+    }
+    throw new Error('Notion request retry loop ended unexpectedly.');
+  }
+}
+
+const queuesByConnection = new Map<string, NotionRequestQueue>();
+function requestQueue(token: string): NotionRequestQueue {
+  const key = createHash('sha256').update(token).digest('hex');
+  let queue = queuesByConnection.get(key);
+  if (!queue) { queue = new NotionRequestQueue(); queuesByConnection.set(key, queue); }
+  return queue;
+}
+
+function scheduledClient(token: string, observer?: (event: NotionRequestTelemetry) => void, signal: () => AbortSignal | undefined = () => undefined): Client {
+  const client = new Client({ auth: token });
+  const original = client.request.bind(client);
+  const queue = requestQueue(token);
+  client.request = ((parameters: RequestParameters) => {
+    const operation = notionOperation(parameters);
+    const method = parameters.method.toUpperCase();
+    const safeRead = ['GET', 'HEAD'].includes(method) || /\.query$|\.list$|\.retrieve$/.test(operation);
+    return queue.run(operation, method, () => original(parameters), observer, safeRead, signal());
+  }) as typeof client.request;
+  return client;
+}
+
+export type NotionRequestObserver = (event: NotionRequestTelemetry) => void;
 export function databaseIdFromUrl(value: string): string {
   const matched = value.match(/[0-9a-f]{32}(?:[?#].*)?$/i)?.[0]?.slice(0, 32) ?? value.match(/[0-9a-f]{8}-[0-9a-f-]{27,}/i)?.[0];
   if (!matched) fail('CONFIG_INVALID', 'The Notion database URL does not contain a database ID.');
@@ -52,7 +215,13 @@ export function databaseIdFromUrl(value: string): string {
 }
 export class NotionStore {
   readonly client: Client;
-  constructor(token: string) { this.client = new Client({ auth: token }); }
+  private requestSignal?: AbortSignal;
+  private requestTelemetryEnabled = true;
+  constructor(token: string, requestObserver?: NotionRequestObserver) {
+    this.client = scheduledClient(token, event => { if (this.requestTelemetryEnabled) requestObserver?.(event); }, () => this.requestSignal);
+  }
+  setRequestSignal(signal?: AbortSignal): void { this.requestSignal = signal; }
+  setRequestTelemetryEnabled(enabled: boolean): void { this.requestTelemetryEnabled = enabled; }
   async database(id: string): Promise<any> { try { return await this.client.databases.retrieve({ database_id: id }); } catch (e) { return failNotion(e, 'NOTION_UNAVAILABLE', 'Configured Invocation database is inaccessible.'); } }
   validateSchema(database: any): void {
     for (const [name, type] of [['ID','title'],['State','select'],['Error','rich_text'],['Created At','created_time'],['Updated At','last_edited_time']] as const) if (database.properties?.[name]?.type !== type) fail('NOTION_SCHEMA_INVALID', `Required ${name} property is missing or incompatible.`);

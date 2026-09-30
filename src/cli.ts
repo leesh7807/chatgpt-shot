@@ -7,8 +7,9 @@ import { NotionStore, databaseIdFromUrl } from './notion.js';
 import { ChatGPTBrowser } from './browser.js';
 import { call, ensureService, healthy, openBrowser, runService, serviceStatus, stopService } from './http-service.js';
 import { installCancellationHandler } from './cancellation.js';
+import { readRecentJobTelemetry } from './job-telemetry.js';
 const out = (value: string) => process.stdout.write(`${value}\n`);
-const commands = ['config', 'init', 'open', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'stop'] as const;
+const commands = ['config', 'init', 'open', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'attempts', 'stop'] as const;
 type Command = typeof commands[number];
 type HelpScope = 'global' | Command;
 export type ParsedCli = { kind: 'help'; scope: HelpScope } | { kind: 'command'; command: Command; rest: string[]; prompt?: string; diagnostics?: boolean };
@@ -27,6 +28,7 @@ Commands:
   port    Print the healthy local Service port
   submit  Submit one prompt and print its accepted Job UUID
   jobs    List durable Jobs or read one Job
+  attempts Analyze the latest 100 local submission attempts
   stop    Stop the local Service after accepted work drains
 
 Run "chatgpt-shot <command> --help" for command usage.`;
@@ -93,6 +95,11 @@ Arguments:
   chatgpt-shot jobs <id>
 
 List recent durable Jobs, or read one Job's current State, Result, or Error.`,
+  attempts: `Usage:
+  chatgpt-shot attempts
+  chatgpt-shot attempts <uuid>
+
+Read the latest 100 local submission diagnostic trails without contacting Notion.`,
   stop: `Usage: chatgpt-shot stop
 
 Stop the local Service after accepted work drains.
@@ -117,6 +124,7 @@ export function parseCli(args: string[]): ParsedCli {
     return { kind: 'command', command, rest, prompt, ...(diagnostics ? { diagnostics: true } : {}) };
   }
   if (command === 'jobs' && rest.length > 1) fail('CONFIG_INVALID', 'Usage: chatgpt-shot jobs [id]');
+  if (command === 'attempts' && (rest.length > 1 || (rest[0] !== undefined && !isUuid(rest[0])))) fail('CONFIG_INVALID', 'Usage: chatgpt-shot attempts [uuid]');
   return { kind: 'command', command, rest };
 }
 
@@ -127,11 +135,12 @@ export async function main(args: string[]) {
   const parsed = parseCli(args);
   if (parsed.kind === 'help') return out(parsed.scope === 'global' ? globalHelp : commandHelp[parsed.scope]);
   const { command, rest } = parsed;
+  if (command === 'attempts') return out(JSON.stringify({ attempts: readRecentJobTelemetry(undefined, rest[0]) }, null, 2));
   if (command === 'config') {
     const [action, key, ...valueParts] = rest; const state = paths();
     if (!action) { await openConfigInDefaultEditor(state); return out(`opened configuration: ${state.envPath}`); }
     if (action === 'path' && !key) return out(state.envPath);
-    if (action === 'show' && !key) { const values = readConfigValues(state); return out(`configuration: ${state.envPath}\nNOTION_TOKEN: ${values.NOTION_TOKEN ? 'set' : 'missing'}\nCHATGPT_SHOT_NOTION_DATABASE_URL: ${values.CHATGPT_SHOT_NOTION_DATABASE_URL ? 'set' : 'missing'}\nCHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS: ${values.CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS ?? '45000 (default)'}`); }
+    if (action === 'show' && !key) { const values = readConfigValues(state); return out(`configuration: ${state.envPath}\nNOTION_TOKEN: ${values.NOTION_TOKEN ? 'set' : 'missing'}\nCHATGPT_SHOT_NOTION_DATABASE_URL: ${values.CHATGPT_SHOT_NOTION_DATABASE_URL ? 'set' : 'missing'}\nCHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS: ${values.CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS ?? '180000 (3 minutes default)'}`); }
     if (action === 'set' && (key === 'NOTION_TOKEN' || key === 'CHATGPT_SHOT_NOTION_DATABASE_URL' || key === 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS') && valueParts.length) { setConfigValue(key as ConfigKey, valueParts.join(' '), state); return out(`saved ${key}`); }
     return fail('CONFIG_INVALID', 'Usage: chatgpt-shot config [path|show|set KEY VALUE]');
   }

@@ -20,6 +20,7 @@ test('reopens a fresh page when opening a page hits a stale browser session', as
   const browser = new ChatGPTBrowser('profile', async (_root, request) => {
     operations.push(request);
     if (request.operation === 'open' && opens++ === 0) throw stale();
+    if (request.operation === 'close') return { closed: true, verified: true };
     return request.operation === 'open' ? 'session-2' : undefined;
   });
 
@@ -35,6 +36,7 @@ test('recovers fill through a fresh page without submitting twice', async () => 
     operations.push(request);
     if (request.operation === 'open') return opens++ === 0 ? 'session-1' : 'session-2';
     if (request.operation === 'fill' && request.sessionId === 'session-1') throw stale();
+    if (request.operation === 'close') return { closed: true, verified: true };
     return undefined;
   });
 
@@ -54,6 +56,7 @@ test('invalidates a stale page during submit and preserves submission uncertaint
     operations.push(request);
     if (request.operation === 'open') return 'session-1';
     if (request.operation === 'submit') throw stale();
+    if (request.operation === 'close') return { closed: true, verified: true };
     return undefined;
   });
 
@@ -69,11 +72,12 @@ test('invalidates a stale page during inspection and returns uncertain', async (
     operations.push(request);
     if (request.operation === 'open') return 'session-1';
     if (request.operation === 'inspect') throw stale();
+    if (request.operation === 'close') return { closed: true, verified: true };
     return undefined;
   });
 
   await browser.openFreshContext();
-  assert.equal(await browser.inspectSubmission('invocation-1'), 'uncertain');
+  assert.equal((await browser.inspectSubmission('invocation-1')).inspection, 'uncertain');
   assert.deepEqual(operations.map(({ operation }) => operation), ['open', 'inspect', 'close']);
 });
 
@@ -105,11 +109,43 @@ test('opt-in browser diagnostics are redacted and leave submission classificatio
   await browser.openFreshContext();
   const marker = 'page-marker-1';
   await browser.fillPrompt('private wrapped prompt', marker);
-  await assert.rejects(() => browser.submitPrompt(marker), (error: unknown) => error instanceof ShotError && error.code === 'SUBMISSION_UNCERTAIN');
-  assert.equal(await browser.inspectSubmission(marker), 'uncertain');
+  assert.deepEqual(await browser.submitPrompt(marker), { outcome: 'not_attempted', reason: 'send_button_disabled' });
+  assert.equal((await browser.inspectSubmission(marker)).inspection, 'uncertain');
 
   assert.ok(operations.filter(operation => ['fill', 'submit', 'inspect'].includes(operation.operation)).every(operation => operation.diagnostics === true));
   assert.ok(operations.filter(operation => ['fill', 'submit', 'inspect'].includes(operation.operation)).every(operation => operation.submissionMarker === marker));
   assert.deepEqual(browser.diagnosticReport().map(entry => entry.stage), ['after_fill', 'submit_action', 'before_submit', 'after_submit_immediate', 'submission_classification', 'acceptance_deadline']);
   assert.ok(!JSON.stringify(browser.diagnosticReport()).includes('private wrapped prompt'));
+});
+
+test('simultaneous jobs use separate browser sessions and close their own tabs', async () => {
+  const calls: Operation[] = []; let nextSession = 0;
+  const send = async (_root: string, request: Operation) => {
+    calls.push(request);
+    if (request.operation === 'open') return `session-${++nextSession}`;
+    if (request.operation === 'submit') return { method: 'click' };
+    if (request.operation === 'close') return { closed: true, verified: true };
+    return undefined;
+  };
+  const left = new ChatGPTBrowser('profile', send);
+  const right = new ChatGPTBrowser('profile', send);
+  await Promise.all([
+    left.withBrowser(async () => { await left.openFreshContext(); await left.fillPrompt('left prompt', 'left-marker'); await left.submitPrompt('left-marker'); }),
+    right.withBrowser(async () => { await right.openFreshContext(); await right.fillPrompt('right prompt', 'right-marker'); await right.submitPrompt('right-marker'); }),
+  ]);
+  const fills = calls.filter(call => call.operation === 'fill');
+  const closes = calls.filter(call => call.operation === 'close');
+  assert.equal(new Set(fills.map(call => call.sessionId)).size, 2);
+  assert.deepEqual(new Set(closes.map(call => call.sessionId)), new Set(fills.map(call => call.sessionId)));
+});
+
+test('does not report browser close success unless the broker verifies the target is gone', async () => {
+  let closes = 0;
+  const browser = new ChatGPTBrowser('profile', async (_root, request) => {
+    if (request.operation === 'open') return 'session-1';
+    if (request.operation === 'close') { closes++; return { closed: true, verified: false }; }
+  });
+  await browser.openFreshContext();
+  await assert.rejects(() => browser.close(), (error: any) => error instanceof ShotError && error.code === 'BROWSER_CONTEXT_CLOSE_FAILED');
+  assert.equal(closes, 2);
 });

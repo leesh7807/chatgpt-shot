@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { brokerSocket, chromeArguments, chromeEnvironment, classifySubmissionEvidence, privateDisplayArguments, privateDisplayFromOutput, privateXAuthority, SEND_BUTTON_LABEL_PATTERN } from '../src/broker.js';
+import { brokerSocket, chromeArguments, chromeEnvironment, classifySubmissionEvidence, closeTargetAndVerify, privateDisplayArguments, privateDisplayFromOutput, privateXAuthority, SEND_BUTTON_LABEL_PATTERN } from '../src/broker.js';
 
 test('uses a short hashed owner-runtime socket path for deep repositories', () => {
   const root = `/tmp/${'deep/'.repeat(80)}repository`;
@@ -56,13 +56,13 @@ test('does not select the X11 backend for non-Linux Chrome', () => {
   assert.ok(!chromeArguments('/tmp/chatgpt-shot-profile', 'darwin').includes('--ozone-platform=x11'));
 });
 
-test('classifies browser delivery from observable prompt evidence', () => {
+test('classifies browser delivery from observable prompt evidence and prioritizes a visible message marker', () => {
   const marker = '0123456789abcdef0123456789abcdef';
   const wrappedPrompt = `Invocation record: https://www.notion.so/${marker}`;
   assert.equal(classifySubmissionEvidence(marker, { seen: true, composerValue: '' }), 'submitted');
   assert.equal(classifySubmissionEvidence(marker, { seen: false, composerValue: wrappedPrompt }), 'not_submitted');
   assert.equal(classifySubmissionEvidence(marker, { seen: false, composerValue: '' }), 'uncertain');
-  assert.equal(classifySubmissionEvidence(marker, { seen: true, composerValue: marker }), 'uncertain');
+  assert.equal(classifySubmissionEvidence(marker, { seen: true, composerValue: marker }), 'submitted');
 });
 
 test('recognizes the current Send button label without matching unrelated actions', () => {
@@ -71,4 +71,20 @@ test('recognizes the current Send button label without matching unrelated action
   assert.equal(SEND_BUTTON_LABEL_PATTERN.test('Send Prompt'), true);
   assert.equal(SEND_BUTTON_LABEL_PATTERN.test('Stop generating'), false);
   assert.equal(SEND_BUTTON_LABEL_PATTERN.test('Resend'), false);
+});
+
+test('verifies a Chrome target is absent before declaring its tab closed', async () => {
+  const targets = new Set(['target-1']); let closeCalls = 0;
+  await closeTargetAndVerify(async () => { closeCalls++; targets.delete('target-1'); return { success: true }; }, async () => targets.has('target-1'), 2, 2, 0);
+  assert.equal(closeCalls, 1);
+  assert.equal(targets.has('target-1'), false);
+});
+
+test('retains a close failure when the Chrome target remains open', async () => {
+  let closeCalls = 0;
+  await assert.rejects(
+    () => closeTargetAndVerify(async () => { closeCalls++; return { success: true }; }, async () => true, 3, 1, 0),
+    (error: any) => error.code === 'BROWSER_CONTEXT_CLOSE_FAILED',
+  );
+  assert.equal(closeCalls, 3);
 });

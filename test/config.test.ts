@@ -23,7 +23,7 @@ test('creates an owner-only commented configuration template', () => {
     const contents = readFileSync(state.envPath, 'utf8');
     assert.match(contents, /# Fill in the two required values below\./);
     assert.match(contents, /NOTION_TOKEN=\nCHATGPT_SHOT_NOTION_DATABASE_URL=\n/);
-    assert.match(contents, /Optional acknowledgement limit after prompt submission/);
+    assert.match(contents, /Optional acknowledgement limit from prompt-fill attempt through Notion acceptance/);
     assert.doesNotMatch(contents, /CHATGPT_SHOT_EXECUTION_TIMEOUT_MS/);
     assert.equal(statSync(state.envPath).mode & 0o777, 0o600);
   } finally { if (prior === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prior; rmSync(directory, { recursive: true, force: true }); }

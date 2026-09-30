@@ -22,13 +22,13 @@ export function loadConfig(): Config {
   if (!env.NOTION_TOKEN?.trim()) fail('CONFIG_INVALID', 'NOTION_TOKEN is required in the chatgpt-shot user configuration.');
   if (!env.CHATGPT_SHOT_NOTION_DATABASE_URL?.trim()) fail('CONFIG_INVALID', 'CHATGPT_SHOT_NOTION_DATABASE_URL is required in the chatgpt-shot user configuration.');
   const rawAcknowledgement = env.CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS?.trim();
-  const acknowledgementMs = rawAcknowledgement ? Number(rawAcknowledgement) : 45_000;
+  const acknowledgementMs = rawAcknowledgement ? Number(rawAcknowledgement) : 180_000;
   if (!Number.isSafeInteger(acknowledgementMs) || acknowledgementMs <= 0) fail('CONFIG_INVALID', 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS must be a positive integer in milliseconds.');
   return { ...state, notionToken: env.NOTION_TOKEN, databaseUrl: env.CHATGPT_SHOT_NOTION_DATABASE_URL, acknowledgementMs };
 }
 export type ConfigKey = 'NOTION_TOKEN' | 'CHATGPT_SHOT_NOTION_DATABASE_URL' | 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS';
 const keys: ConfigKey[] = ['NOTION_TOKEN', 'CHATGPT_SHOT_NOTION_DATABASE_URL', 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS'];
-const template = `# chatgpt-shot user configuration\n# Fill in the two required values below. Keep the value after each equals sign.\nNOTION_TOKEN=\nCHATGPT_SHOT_NOTION_DATABASE_URL=\n\n# Optional acknowledgement limit after prompt submission, in milliseconds.\n# CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS=45000\n`;
+const template = `# chatgpt-shot user configuration\n# Fill in the two required values below. Keep the value after each equals sign.\nNOTION_TOKEN=\nCHATGPT_SHOT_NOTION_DATABASE_URL=\n\n# Optional acknowledgement limit from prompt-fill attempt through Notion acceptance, in milliseconds. Defaults to 180000 (3 minutes).\n# CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS=180000\n`;
 export function ensureConfigFile(state = paths()): void {
   if (existsSync(state.envPath)) return;
   try { writeFileSync(state.envPath, template, { encoding: 'utf8', mode: 0o600, flag: 'wx' }); }

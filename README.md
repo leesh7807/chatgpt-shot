@@ -26,13 +26,13 @@ chatgpt-shot doctor
 
 The configuration file is user-owned with mode `0600` at `~/.config/chatgpt-shot/.env`, or `$XDG_CONFIG_HOME/chatgpt-shot/.env`. The retained browser profile is at `~/.local/share/chatgpt-shot/chrome-profile`, and Service discovery is at `~/.cache/chatgpt-shot/runtime.json`; XDG overrides apply. `config show` never prints the token.
 
-The only optional lifecycle setting is the acknowledgement budget after prompt submission:
+The optional acknowledgement budget starts immediately before the Service attempts to fill the prompt. It includes prompt filling, waiting for the Send control, the browser submit call, and observing remote acceptance in Notion. It defaults to 3 minutes:
 
 ```sh
-chatgpt-shot config set CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS 45000
+chatgpt-shot config set CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS 180000
 ```
 
-Service startup, configuration/schema validation, Notion calls before submission, browser readiness, Invocation creation, prompt filling, and the prompt submission operation itself are not charged to this budget. There is no execution timeout: submission ends after remote acceptance, while terminal Result and Error remain Job read concerns.
+Service startup, configuration/schema validation, browser readiness, and pending Invocation creation happen before this budget. If the Service does not observe `in_progress`, `completed`, or `failed` by the deadline, `submit` returns a failure and does not retry or mark the remote Invocation failed. A later remote State change does not change that response. There is no execution timeout: submission ends after remote acceptance, while terminal Result and Error remain Job read concerns.
 
 ## Async Job submission
 
@@ -63,15 +63,24 @@ chatgpt-shot submit --diagnostics "Reply with the exact phrase: probe received."
 
 The durable Job is the existing Notion Invocation record. Its remote-owned lifecycle states are `in_progress`, `completed`, and `failed`; observing any of them proves remote acceptance, including when `completed` or `failed` is the first state observed. The existing remote Invocation protocol owns those writes. A failed Job's Error is the existing remote Error value and is returned unchanged by the Job read surface; submission errors are a separate caller-facing contract.
 
-After returning the UUID, the local Service may keep the browser context and a background observer alive until the remote Job reaches a terminal state. This does not make terminal completion part of the `submit` command.
+After observing remote acceptance, the Service closes the Job's browser tab and confirms that its Chrome target is gone before returning the UUID. The background observer then reads Notion only until the remote Job reaches a terminal state. This does not make terminal completion part of the `submit` command.
 
 After the browser submit attempt, the adapter classifies prompt delivery from testable local evidence:
 
 * `not_submitted` means evidence confirms that the prompt did not reach ChatGPT. Only this status permits local cleanup of the initial pending Invocation, and it is returned as a submission failure. It is not represented as a remote `failed` Job.
 * `submitted` means evidence confirms prompt delivery. The local writer does not write State or Error and waits for remote acceptance.
-* `uncertain` means the submit action occurred but local evidence proves neither delivery nor non-delivery. It is a caller-facing `SUBMISSION_UNCERTAIN` failure; the local writer does not write State or Error and does not clean up the Invocation.
+* `uncertain` means local evidence proves neither delivery nor non-delivery. It does not end admission early: the Service continues checking Notion until acceptance or the configured deadline. If no acceptance is observed by then, it returns `SUBMISSION_UNCERTAIN` and retains the Invocation.
 
 An exception, interruption, acknowledgement timeout, or lost observer is not by itself evidence of `not_submitted`. If delivery cannot be proven either way, the result is `uncertain`. Once prompt delivery may have occurred, local admission failures never overwrite the remote Job lifecycle. Submission errors such as `ADMISSION_TIMEOUT`, `ADMISSION_CANCELLED`, `SUBMISSION_FAILED`, and `SUBMISSION_UNCERTAIN` are not Job lifecycle states and are not a submission history.
+
+The caller-facing submission errors have distinct meanings:
+
+* `SUBMISSION_FAILED`: the prompt was confirmed not sent. The Invocation was cleaned up, so a new submit attempt is safe.
+* `ADMISSION_TIMEOUT`: UI evidence confirmed delivery, but Notion acceptance was not observed within the budget. The Invocation is retained; do not retry automatically.
+* `SUBMISSION_UNCERTAIN`: acceptance was not observed and delivery could not be determined, including when the deadline expires with a Notion read still in flight. The Invocation is retained; do not retry automatically.
+* `NOTION_UNAVAILABLE` / `NOTION_RATE_LIMITED`: Notion observation failed and was not recovered within the admission window. The original Notion category is preserved.
+* `ADMISSION_CANCELLED`: the caller or Service cancelled before acceptance was confirmed. Cancellation alone does not prove non-delivery.
+* `BROWSER_CONTEXT_CLOSE_FAILED`: remote acceptance was observed, but the tab could not be confirmed closed. The accepted Job remains active; use `chatgpt-shot attempts` to find its local UUID and do not submit it again.
 
 ## Local execution telemetry
 
@@ -83,7 +92,14 @@ $XDG_CACHE_HOME/chatgpt-shot/jobs.jsonl
 
 When `XDG_CACHE_HOME` is unset, the path is `~/.cache/chatgpt-shot/jobs.jsonl`.
 
-Each JSONL record is correlated by Job UUID and includes the local observation timestamp. The records cover admission, Invocation creation, prompt preparation, submission, remote acceptance, terminal observation, and actual diagnostic paths such as submission inspection, cleanup, cancellation, and observer failure. Timestamps describe when this local process observed an event; they are not remote state-transition timestamps.
+Each JSONL record is correlated by Job UUID and includes local event time, elapsed time, and stage. The records cover database validation, admission Notion requests and state observations, browser readiness, tab creation/close, prompt filling, Send readiness, submit RPC outcomes, UI evidence, deadline, cleanup, cancellation, and terminal observer failure. Once remote acceptance is confirmed, repeated terminal polling is not copied into the attempt log; only the final terminal State is recorded. Prompt and Result contents, tokens, headers, and arbitrary page text are excluded. The owner-only file keeps the latest 100 submission attempts; older attempts are pruned as new submissions arrive. Timestamps describe when this local process observed an event; they are not remote state-transition timestamps.
+
+Read the available trails without a Notion request:
+
+```sh
+chatgpt-shot attempts
+chatgpt-shot attempts <uuid>
+```
 
 This is local-only diagnostic data, not a public Job surface or an additional Job lifecycle. It is not written to the Notion Invocation and does not change `submit`, `jobs`, acknowledgement, cleanup, or remote State behavior. Delete the XDG cache file to remove its telemetry.
 
@@ -122,7 +138,7 @@ The successful response is only:
 {"id":"<Service-generated UUID>"}
 ```
 
-The response is sent after remote acceptance, even when the first observed state is `completed` or `failed`. Caller-supplied Job IDs are not accepted.
+The response is sent after remote acceptance and confirmed tab closure, even when the first observed state is `completed` or `failed`. Caller-supplied Job IDs are not accepted. If tab closure cannot be confirmed, the request fails with `BROWSER_CONTEXT_CLOSE_FAILED`; the remote Job remains owned by the agent and its ID can be found in the local `attempts` trail.
 
 ```http
 GET /jobs
@@ -135,6 +151,8 @@ Authorization: Bearer <credential>
 `GET /jobs/<uuid>` returns the current durable State, Result, and Error. `GET /jobs` returns recent Job summaries. All Job HTTP surfaces require bearer authentication; knowing a UUID is not enough to read or create a Job.
 
 Service failures return JSON `{ "code", "message" }` with a non-200 status. `in_progress`, `completed`, and `failed` are remote acceptance evidence, while `pending` is only the pre-acceptance Notion record state. Terminal Result and Error are read from the Job surface after submission.
+
+Submissions are admitted in parallel; the Service does not use a FIFO submission queue. Each request has a separate Notion Invocation and browser tab/session. Shared browser authentication recovery is single-flight, and the Service spaces Notion API request starts per integration token while respecting rate-limit retry delays. The Broker's shared control tab stays open while that Broker remains available; per-Job submission tabs are closed and removed after acceptance. This coordination applies to requests made by this Service process.
 
 For diagnostics or orderly shutdown:
 

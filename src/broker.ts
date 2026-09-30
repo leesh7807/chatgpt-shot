@@ -11,7 +11,7 @@ type Response = { ok: true; value?: unknown } | { ok: false; code: string; messa
 type Message = { id?: number; sessionId?: string; result?: any; error?: { message: string } };
 export type SubmissionEvidence = { seen: boolean; composerValue: string };
 export type SubmissionInspection = 'submitted' | 'not_submitted' | 'uncertain';
-export const classifySubmissionEvidence = (submissionMarker: string, evidence: SubmissionEvidence): SubmissionInspection => !submissionMarker ? 'uncertain' : evidence.seen && !evidence.composerValue.includes(submissionMarker) ? 'submitted' : !evidence.seen && evidence.composerValue.includes(submissionMarker) ? 'not_submitted' : 'uncertain';
+export const classifySubmissionEvidence = (submissionMarker: string, evidence: SubmissionEvidence): SubmissionInspection => !submissionMarker ? 'uncertain' : evidence.seen ? 'submitted' : evidence.composerValue.includes(submissionMarker) ? 'not_submitted' : 'uncertain';
 export const SEND_BUTTON_LABEL_PATTERN = /^(?:send|send message|send prompt)$/i;
 const SEND_BUTTON_READY_TIMEOUT_MS = 10_000;
 const SUBMIT_ACTION_TIMEOUT_MS = SEND_BUTTON_READY_TIMEOUT_MS + 2_000;
@@ -129,7 +129,32 @@ class Page {
     }
     fail('BROWSER_UNAVAILABLE', 'ChatGPT navigation did not commit before its deadline.');
   }
-  async close() { await this.cdp.send('Target.closeTarget', { targetId: this.targetId }, undefined, 5_000); }
+  async close() { return await this.cdp.send('Target.closeTarget', { targetId: this.targetId }, undefined, 5_000) as { success?: boolean }; }
+}
+
+export async function closeTargetAndVerify(
+  closeTarget: () => Promise<{ success?: boolean }>,
+  targetIsPresent: () => Promise<boolean>,
+  closeAttempts = 3,
+  pollsPerAttempt = 20,
+  pollIntervalMs = 50,
+): Promise<void> {
+  let closeError: unknown;
+  for (let closeAttempt = 0; closeAttempt < closeAttempts; closeAttempt++) {
+    try {
+      const result = await closeTarget();
+      if (result?.success === false) closeError = new Error('Target.closeTarget returned success=false.');
+    } catch (error) { closeError = error; }
+    for (let poll = 0; poll < pollsPerAttempt; poll++) {
+      try { if (!(await targetIsPresent())) return; }
+      catch (error) { closeError ??= error; break; }
+      if (poll + 1 < pollsPerAttempt) await delay(pollIntervalMs);
+    }
+  }
+  const error: any = new Error('Browser target is still present after close was requested.');
+  error.code = 'BROWSER_CONTEXT_CLOSE_FAILED';
+  error.cause = closeError;
+  throw error;
 }
 
 const visibility = `const visible=e=>{const s=getComputedStyle(e),b=e.getBoundingClientRect();return s.visibility!=='hidden'&&s.display!=='none'&&b.width>0&&b.height>0};`;
@@ -140,6 +165,8 @@ const sendControlProbe = `(marker)=>{${visibility}const labelPattern=new RegExp(
 
 class Broker {
   private process?: ChildProcess; private display?: VirtualDisplay; private cdp?: PipeCdp; private control?: Page; private starting?: Promise<void>; private startingChild?: ChildProcess; private startingDisplay?: VirtualDisplay; private startingCdp?: PipeCdp; private stopping = false;
+  private controlAuth?: Promise<{ loginVisible: boolean; accountVisible: boolean; authenticated: boolean }>;
+  private controlRecovery?: Promise<void>;
   private readonly pages = new Map<string, Page>();
   private readonly diagnosticPrompts = new Map<string, string>();
   private readonly diagnosticPaths = new Map<string, string>();
@@ -186,6 +213,18 @@ class Broker {
     } finally { if (this.startingChild === child) this.startingChild = undefined; if (this.startingDisplay === virtual) this.startingDisplay = undefined; if (this.startingCdp === cdp) this.startingCdp = undefined; }
   }
   private async createPage(cdp = this.cdp!, deadline = Date.now() + 30_000) { const remaining = () => { const ms = deadline - Date.now(); if (ms <= 0) fail('BROWSER_UNAVAILABLE', 'ChatGPT target creation exceeded its broker deadline.'); return Math.min(30_000, ms); }; const created = await cdp.send('Target.createTarget', { url: 'about:blank' }, undefined, remaining()); const attached = await cdp.send('Target.attachToTarget', { targetId: created.targetId, flatten: true }, undefined, remaining()); return new Page(created.targetId, attached.sessionId, cdp); }
+  private async closePage(sessionId: string, page: Page): Promise<void> {
+    await closeTargetAndVerify(
+      () => page.close(),
+      async () => {
+        const targets = await this.cdp!.send('Target.getTargets', {}, undefined, 5_000);
+        return (targets.targetInfos ?? []).some((target: any) => target.targetId === page.targetId);
+      },
+    );
+    this.pages.delete(sessionId);
+    this.diagnosticPrompts.delete(sessionId);
+    this.diagnosticPaths.delete(sessionId);
+  }
   private async ready(page: Page) {
     for (let i = 0; i < 30; i++) { const state = await page.evaluate<boolean>('()=>document.readyState!=="loading"'); if (state) { if (await page.evaluate<boolean>('()=>/just a moment|checking your browser/i.test(document.body.innerText)')) fail('USER_INTERVENTION_REQUIRED', 'ChatGPT Web requires user intervention before automation can continue.'); return; } await delay(500); }
     fail('BROWSER_UNAVAILABLE', 'ChatGPT did not become ready before its deadline.');
@@ -213,20 +252,41 @@ class Broker {
       await previous?.close().catch(() => {});
     } catch (error) { await replacement.close().catch(() => {}); throw error; }
   }
+  private async recoverControl() {
+    if (!this.controlRecovery) {
+      const recovery = this.recreateControl();
+      this.controlRecovery = recovery;
+      try { await recovery; } finally { if (this.controlRecovery === recovery) this.controlRecovery = undefined; }
+      return;
+    }
+    await this.controlRecovery;
+  }
+  private async authenticateControl() {
+    if (!this.controlAuth) {
+      const authentication = (async () => {
+        try { return await this.auth(this.control!); }
+        catch (error) {
+          if (!isStaleBrowserSessionError(error)) throw error;
+          await this.recoverControl();
+          return this.auth(this.control!);
+        }
+      })();
+      this.controlAuth = authentication;
+      try { return await authentication; } finally { if (this.controlAuth === authentication) this.controlAuth = undefined; }
+    }
+    return this.controlAuth;
+  }
   async handle(request: Request): Promise<unknown> {
     await this.runtime();
     try {
       if (request.operation === 'ensure') return;
       if (request.operation === 'auth') {
-        try { return await this.auth(this.control!); }
-        catch (error) {
-          if (!isStaleBrowserSessionError(error)) throw error;
-          await this.recreateControl();
-          return this.auth(this.control!);
-        }
+        return this.authenticateControl();
       }
-      if (request.operation === 'open') { const deadline = Date.now() + 75_000; const page = await this.createPage(this.cdp!, deadline); try { await page.within(deadline, async () => { await page.navigate(); const auth = await this.auth(page); if (!auth.authenticated) fail('CHATGPT_AUTH_REQUIRED', 'ChatGPT authentication is required. Run `chatgpt-shot open`.'); await this.composer(page); }); const id = randomUUID(); this.pages.set(id, page); return id; } catch (error) { await page.close().catch(() => {}); throw error; } }
-      const page = request.sessionId ? this.pages.get(request.sessionId) : undefined; if (!page) return fail('BROWSER_UNAVAILABLE', 'Browser invocation page is unavailable.');
+      if (request.operation === 'open') { const deadline = Date.now() + 75_000; const page = await this.createPage(this.cdp!, deadline); const id = randomUUID(); this.pages.set(id, page); try { await page.within(deadline, async () => { await page.navigate(); const auth = await this.auth(page); if (!auth.authenticated) fail('CHATGPT_AUTH_REQUIRED', 'ChatGPT authentication is required. Run `chatgpt-shot open`.'); await this.composer(page); }); return id; } catch (error) { try { await this.closePage(id, page); } catch (closeError) { const failure: any = new Error('Browser context could not be closed after open failed.'); failure.code = 'BROWSER_CONTEXT_CLOSE_FAILED'; failure.cause = closeError; throw failure; } throw error; } }
+      const page = request.sessionId ? this.pages.get(request.sessionId) : undefined;
+      if (request.operation === 'close' && !page) return { closed: true, verified: true };
+      if (!page) return fail('BROWSER_UNAVAILABLE', 'Browser invocation page is unavailable.');
       if (request.operation === 'fill') {
         const deadline = Date.now() + 45_000;
         await page.within(deadline, async () => {
@@ -254,20 +314,27 @@ class Broker {
       if (request.operation === 'snapshot' && request.diagnostics) return this.diagnosticSnapshot(page, request.sessionId!, request.submissionMarker, 'snapshot');
       if (request.operation === 'inspect') {
         const marker = request.submissionMarker ?? '';
-        if (!marker) return 'uncertain';
-        const value = await page.evaluate<{ seen: boolean; value: string }>(`marker=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let seen=false,node;while(node=walker.nextNode()){const parent=node.parentElement;if(!parent?.closest('textarea,[contenteditable="true"]')&&node.textContent?.includes(marker)){seen=true;break}}return {seen,value:e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'')}}`, [marker]);
-        const inspection = classifySubmissionEvidence(marker, { seen: value.seen, composerValue: value.value });
-        if (!request.diagnostics) return inspection;
-        return { inspection, snapshot: await this.diagnosticSnapshot(page, request.sessionId!, marker, 'acceptance_deadline') };
+        if (!marker) return { inspection: 'uncertain', reason: 'marker_missing', sampleCount: 1, messageMarkerSeen: false, composerMarkerPresent: false, composerPresent: false };
+        const value = await page.within(Date.now() + 1_000, () => page.evaluate<{ seen: boolean; composerPresent: boolean; composerHasMarker: boolean; composerValue: string }>(`marker=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);const text=e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'');const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let seen=false,node;while(node=walker.nextNode()){const parent=node.parentElement;if(!parent?.closest('textarea,[contenteditable="true"]')&&node.textContent?.includes(marker)){seen=true;break}}return {seen,composerPresent:!!e,composerHasMarker:text.includes(marker),composerValue:text}}`, [marker]));
+        const inspection = classifySubmissionEvidence(marker, { seen: value.seen, composerValue: value.composerValue });
+        const result = {
+          inspection,
+          messageMarkerSeen: value.seen,
+          composerMarkerPresent: value.composerHasMarker,
+          composerPresent: value.composerPresent,
+          sampleCount: 1,
+          reason: inspection === 'submitted' ? 'marker_in_message' : inspection === 'not_submitted' ? 'marker_in_composer' : !value.composerPresent ? 'composer_missing' : value.seen && value.composerHasMarker ? 'marker_seen_in_both' : 'marker_seen_in_neither',
+        };
+        if (!request.diagnostics) return result;
+        return { ...result, snapshot: await this.diagnosticSnapshot(page, request.sessionId!, marker, 'acceptance_deadline') };
       }
-      if (request.operation === 'close') { await page.close().catch(() => {}); this.pages.delete(request.sessionId!); this.diagnosticPrompts.delete(request.sessionId!); this.diagnosticPaths.delete(request.sessionId!); return; }
+      if (request.operation === 'close') { await this.closePage(request.sessionId!, page); return { closed: true, verified: true }; }
       fail('INTERNAL_ERROR', `Unsupported broker operation ${request.operation}.`);
     } catch (error) {
-      if (request.sessionId && isStaleBrowserSessionError(error)) { this.pages.delete(request.sessionId); this.diagnosticPrompts.delete(request.sessionId); this.diagnosticPaths.delete(request.sessionId); }
       throw error;
     }
   }
-  async discard(sessionId: string) { const page = this.pages.get(sessionId); this.pages.delete(sessionId); this.diagnosticPrompts.delete(sessionId); this.diagnosticPaths.delete(sessionId); if (!page) return; await page.close().catch(() => {}); }
+  async discard(sessionId: string) { const page = this.pages.get(sessionId); if (!page) return; await this.closePage(sessionId, page); }
   async close() {
     this.stopping = true;
     // A startup has not published ownership yet, but it still owns the profile.

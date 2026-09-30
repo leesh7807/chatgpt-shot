@@ -2,11 +2,13 @@ import { createServer, request as httpRequest } from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, openSync, closeSync, linkSync, readFileSync, renameSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
 import { loadConfig, type Config } from './config.js';
 import { databaseIdFromUrl, NotionStore } from './notion.js';
 import { ChatGPTBrowser, openProfileBrowser, shutdownBroker } from './browser.js';
 import { startJob } from './service.js';
 import { isErrorCode, ShotError, fail } from './errors.js';
+import { JobTelemetrySession, type JobTelemetryInput } from './job-telemetry.js';
 
 export type Discovery = { pid: number; host: '127.0.0.1'; port: number; protocolVersion: 1; credential: string };
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -169,7 +171,22 @@ export async function runService(): Promise<void> {
       if (error.retryAfterSeconds !== undefined) res.setHeader('retry-after', String(error.retryAfterSeconds));
       return json(res, 429, responseError(error));
     }
-    return json(res, 500, responseError(error));
+    const status = error instanceof ShotError ? error.httpStatus ?? ({
+      ADMISSION_TIMEOUT: 504,
+      ADMISSION_CANCELLED: 503,
+      SUBMISSION_FAILED: 422,
+      SUBMISSION_UNCERTAIN: 502,
+      BROWSER_CONTEXT_CLOSE_FAILED: 502,
+      NOTION_UNAVAILABLE: 503,
+      CHATGPT_AUTH_REQUIRED: 424,
+      USER_INTERVENTION_REQUIRED: 424,
+      SERVICE_BUSY: 503,
+      SERVICE_STOPPING: 503,
+      CONFIG_INVALID: 400,
+      NOTION_SCHEMA_INVALID: 422,
+      INVOCATION_CREATE_FAILED: 502,
+    } as Record<string, number>)[error.code] ?? 500 : 500;
+    return json(res, status, responseError(error));
   };
   const durable = async (store: NotionStore, databaseId: string, id: string) => {
     const invocation = await store.findInvocation(databaseId, id);
@@ -212,26 +229,62 @@ export async function runService(): Promise<void> {
     }
     if (req.url !== '/jobs' || req.method !== 'POST') { req.resume(); return json(res, 404, { code: 'NOT_FOUND', message: 'Service is not accepting this request.' }); }
     if (stopping || openingBrowser || existsSync(config.manualOpenLockPath)) { if (existsSync(config.manualOpenLockPath)) reclaimStaleManualOpen(config); const manualOpen = existsSync(config.manualOpenLockPath); req.resume(); return json(res, 503, stopping ? { code: 'SERVICE_STOPPING', message: 'Service is not accepting this request.' } : { code: 'SERVICE_BUSY', message: manualOpen ? 'The browser profile is open for manual use. Retry after the browser window closes.' : 'Service is preparing the browser profile.' }); }
-    let body = ''; const bodyDeadline = setTimeout(() => req.destroy(), REQUEST_BODY_TIMEOUT_MS); bodyDeadline.unref();
+    let body = ''; let responseDisconnected = false; let requestAdmission: AbortController | undefined; let telemetry: JobTelemetrySession | undefined; let telemetryDelegated = false; let stage = 'request_body';
+    res.once('close', () => { if (!res.writableEnded) { responseDisconnected = true; requestAdmission?.abort(); } });
+    const bodyDeadline = setTimeout(() => req.destroy(), REQUEST_BODY_TIMEOUT_MS); bodyDeadline.unref();
     const clearBodyDeadline = () => clearTimeout(bodyDeadline);
     req.once('aborted', clearBodyDeadline); req.once('close', clearBodyDeadline); req.setEncoding('utf8'); req.on('data', chunk => body += chunk); req.on('end', async () => {
       clearBodyDeadline();
       try {
         const input = JSON.parse(body); const prompt = input?.prompt; const diagnostics = input?.diagnostics === true; const fields = input && typeof input === 'object' && !Array.isArray(input) ? Object.keys(input) : [];
         if (!input || typeof input !== 'object' || Array.isArray(input) || typeof prompt !== 'string' || !prompt.trim() || fields.some(field => field !== 'prompt' && field !== 'diagnostics') || (input.diagnostics !== undefined && typeof input.diagnostics !== 'boolean')) fail('CONFIG_INVALID', 'jobs requires a non-empty prompt and an optional diagnostics boolean.');
-        const current = loadConfig(); const store = new NotionStore(current.notionToken); const databaseId = databaseIdFromUrl(current.databaseUrl); store.validateSchema(await store.database(databaseId));
-        if (stopping || openingBrowser || existsSync(config.manualOpenLockPath)) { if (existsSync(config.manualOpenLockPath)) reclaimStaleManualOpen(config); const manualOpen = existsSync(config.manualOpenLockPath); return json(res, 503, stopping ? { code: 'SERVICE_STOPPING', message: 'Service is not accepting this request.' } : { code: 'SERVICE_BUSY', message: manualOpen ? 'The browser profile is open for manual use. Retry after the browser window closes.' : 'Service is preparing the browser profile.' }); }
         const id = randomUUID();
-        const admission = new AbortController(); admissions.add(admission);
-        try { const run = await startJob(store, databaseId, new ChatGPTBrowser(current.browserProfilePath, undefined, diagnostics), prompt, id, { acknowledgementMs: current.acknowledgementMs, signal: admission.signal, diagnostics }); active++; void run.completion.catch(() => {}).finally(() => { active--; }); return json(res, 200, { id }); }
-        finally { admissions.delete(admission); }
+        telemetry = new JobTelemetrySession(id);
+        const event = (name: JobTelemetryInput['event'], fields: Omit<JobTelemetryInput, 'event'> = {}) => telemetry!.record({ event: name, ...fields });
+        event('admission_started', { stage: 'service_request' });
+        requestAdmission = new AbortController(); admissions.add(requestAdmission);
+        if (responseDisconnected) requestAdmission.abort();
+        const notionObserver = (request: import('./notion.js').NotionRequestTelemetry) => event('notion_request', {
+          stage: request.operation === 'databases.retrieve' ? 'notion_schema_validation' : request.operation === 'pages.create' ? 'invocation_creation' : request.operation === 'pages.retrieve' ? 'invocation_observation' : 'notion_observation',
+          operation: request.operation,
+          outcome: request.outcome,
+          duration_ms: request.duration_ms,
+          ...(request.error ? { error: request.error } : {}),
+          ...(request.details ? { details: request.details } : {}),
+        });
+        stage = 'notion_schema_validation';
+        const schemaStarted = performance.now();
+        event('notion_schema_validation', { stage, outcome: 'started' });
+        let current: Config; let store: NotionStore; let databaseId: string;
+        try {
+          current = loadConfig(); store = new NotionStore(current.notionToken, notionObserver); databaseId = databaseIdFromUrl(current.databaseUrl);
+          store.setRequestSignal(requestAdmission.signal);
+          store.validateSchema(await store.database(databaseId));
+        }
+        catch (error) {
+          event('notion_schema_validation', { stage, outcome: 'failed', duration_ms: performance.now() - schemaStarted, error: error instanceof ShotError ? { code: error.code } : { category: error instanceof Error ? error.name : 'unknown' } });
+          throw error;
+        }
+        event('notion_schema_validation', { stage, outcome: 'succeeded', duration_ms: performance.now() - schemaStarted });
+        if (stopping || openingBrowser || existsSync(config.manualOpenLockPath)) { if (existsSync(config.manualOpenLockPath)) reclaimStaleManualOpen(config); const manualOpen = existsSync(config.manualOpenLockPath); const error = new ShotError(stopping ? 'SERVICE_STOPPING' : 'SERVICE_BUSY', stopping ? 'Service is not accepting this request.' : manualOpen ? 'The browser profile is open for manual use. Retry after the browser window closes.' : 'Service is preparing the browser profile.'); event('admission_failed', { stage: 'service_admission', error: { code: error.code } }); return json(res, 503, responseError(error)); }
+        if (requestAdmission.signal.aborted) fail('ADMISSION_CANCELLED', 'The caller disconnected before Job admission began.');
+        stage = 'browser_admission';
+        telemetryDelegated = true;
+        const run = await startJob(store, databaseId, new ChatGPTBrowser(current.browserProfilePath, undefined, diagnostics), prompt, id, { acknowledgementMs: current.acknowledgementMs, signal: requestAdmission.signal, diagnostics, telemetrySession: telemetry });
+        active++; void run.completion.catch(() => {}).finally(() => { active--; });
+        return json(res, 200, { id });
       } catch (error) {
+        if (telemetry && !telemetryDelegated) {
+          const details = error instanceof ShotError ? { code: error.code } : { category: error instanceof Error ? error.name : 'unknown' };
+          if (error instanceof ShotError && error.code === 'ADMISSION_CANCELLED') telemetry.record({ event: 'caller_cancelled', stage });
+          telemetry.record({ event: 'admission_failed', stage, error: details });
+        }
         const manualOpen = existsSync(config.manualOpenLockPath);
         if (manualOpen) reclaimStaleManualOpen(config);
         if (stopping) return json(res, 503, { code: 'SERVICE_STOPPING', message: 'Service is not accepting this request.' });
         if (openingBrowser || manualOpen) return json(res, 503, { code: 'SERVICE_BUSY', message: 'The browser profile is reserved for manual use. Retry after the browser window closes.' });
         return jsonError(res, error);
-      }
+      } finally { if (requestAdmission) admissions.delete(requestAdmission); }
     });
   });
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => resolve()); }); const address = server.address(); if (!address || typeof address === 'string') return fail('INTERNAL_ERROR', 'Service did not obtain a TCP port.') as never; publish(config, { pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential }); process.once('SIGTERM', () => void stop()); process.once('SIGINT', () => void stop());

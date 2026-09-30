@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { ShotError } from '../src/errors.js';
 import { parseCli } from '../src/cli.js';
 
-const cli = (args: string[], configHome: string) => spawnSync(process.execPath, ['--import', 'tsx', resolve('src/cli.ts'), ...args], { encoding: 'utf8', env: { ...process.env, XDG_CONFIG_HOME: configHome } });
+const cli = (args: string[], configHome: string, extraEnv: NodeJS.ProcessEnv = {}) => spawnSync(process.execPath, ['--import', 'tsx', resolve('src/cli.ts'), ...args], { encoding: 'utf8', env: { ...process.env, XDG_CONFIG_HOME: configHome, ...extraEnv } });
 
 test('global help works before configuration is loaded', () => {
   const directory = mkdtempSync(join(tmpdir(), 'chatgpt-shot-cli-'));
@@ -31,6 +31,7 @@ test('every public command has local help on both supported flags', () => {
     ['port', /Usage: chatgpt-shot port\n\nPrint the port/],
     ['submit', /Usage: chatgpt-shot submit \[--diagnostics\] "<prompt>"\n\nSubmit exactly one non-empty prompt and print its accepted Job UUID/],
     ['jobs', /Usage:\n  chatgpt-shot jobs[\s\S]*current State, Result, or Error/],
+    ['attempts', /Usage:\n  chatgpt-shot attempts[\s\S]*latest 100 local submission diagnostic trails/],
     ['stop', /Usage: chatgpt-shot stop\n\nStop the local Service/]
   ]);
   try {
@@ -50,7 +51,7 @@ test('every public command has local help on both supported flags', () => {
 
 test('help tokens resolve to their scope and are not submit prompts', () => {
   assert.deepEqual(parseCli(['--help']), { kind: 'help', scope: 'global' });
-  for (const command of ['config', 'init', 'open', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'stop'] as const) {
+  for (const command of ['config', 'init', 'open', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'attempts', 'stop'] as const) {
     for (const flag of ['--help', '-h']) assert.deepEqual(parseCli([command, flag]), { kind: 'help', scope: command });
   }
   assert.deepEqual(parseCli(['submit', '--help']), { kind: 'help', scope: 'submit' });
@@ -63,6 +64,24 @@ test('submit accepts one positional prompt exactly and preserves it', () => {
   for (const args of [['submit'], ['submit', 'review', 'this'], ['submit', ''], ['submit', '--wait'], ['submit', '--diagnostics']]) {
     assert.throws(() => parseCli(args), (error: unknown) => error instanceof ShotError && error.code === 'CONFIG_INVALID' && error.message === 'Usage: chatgpt-shot submit [--diagnostics] "<prompt>"');
   }
+});
+
+test('attempts accepts an optional version 4 Job UUID only', () => {
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  assert.deepEqual(parseCli(['attempts']), { kind: 'command', command: 'attempts', rest: [] });
+  assert.deepEqual(parseCli(['attempts', id]), { kind: 'command', command: 'attempts', rest: [id] });
+  assert.throws(() => parseCli(['attempts', 'not-a-uuid']), (error: any) => error.code === 'CONFIG_INVALID');
+});
+
+test('attempts reads local diagnostics without requiring a Notion configuration', () => {
+  const configHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-attempts-config-'));
+  const cacheHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-attempts-cache-'));
+  try {
+    const result = cli(['attempts'], configHome, { XDG_CACHE_HOME: cacheHome });
+    assert.equal(result.status, 0);
+    assert.deepEqual(JSON.parse(result.stdout), { attempts: [] });
+    assert.equal(result.stderr, '');
+  } finally { rmSync(configHome, { recursive: true, force: true }); rmSync(cacheHome, { recursive: true, force: true }); }
 });
 
 test('submit rejects missing or multiple positional prompts before configuration is loaded', () => {
