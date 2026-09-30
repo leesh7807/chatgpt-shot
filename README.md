@@ -12,7 +12,7 @@ npm link
 
 On Linux, normal operation requires `Xvfb` (for example, `sudo apt install xvfb` on Debian/Ubuntu). The browser runtime uses a private headful Chrome on a broker-owned X11 display. `chatgpt-shot open` opens the retained profile in visible system Chrome for manual sign-in or browser checks such as a Cloudflare challenge. It does not automate authentication or verify that the external page accepted the interaction.
 
-When the Service is running, `open` keeps its HTTP process and discovery record alive. If work is already in progress, `open` returns `SERVICE_BUSY` without cancelling it. While the retained profile is open, new submissions receive `SERVICE_BUSY`. Close Chrome to resume submissions; the Service starts its private browser broker again when needed. If the Service is absent, `open` opens the profile without starting it. Use `start` separately when you want the Service running.
+When the Service is running, `open` keeps its HTTP process and discovery record alive. It returns `SERVICE_BUSY` while a submission admission may still be using the browser. Accepted Jobs have already had their submission tabs closed, so Notion completion polling can continue while the profile is open. New submissions receive `SERVICE_BUSY` until Chrome closes; the Service starts its private browser broker again when needed. If the Service is absent, `open` opens the profile without starting it. Use `start` separately when you want the Service running.
 
 Configure the Notion token and Invocation database:
 
@@ -122,7 +122,7 @@ Content-Type: application/json
 {"token":"<current profile reservation token>"}
 ```
 
-As part of `chatgpt-shot open`, the CLI acquires a profile lock and calls `POST /prepare-open` to ask a running Service to release its private browser broker. The CLI then opens visible Chrome locally and holds the lock until that browser process exits. This keeps the Service and `runtime.json` available, rejects submissions with `SERVICE_BUSY`, and lets `stop` shut down the Service while Chrome remains open. `/prepare-open` returns `SERVICE_BUSY` if an admitted Job or another manual browser session is active. Closing Chrome does not verify sign-in or a browser challenge.
+As part of `chatgpt-shot open`, the CLI acquires a profile lock and calls `POST /prepare-open` to ask a running Service to release its private browser broker. The CLI then opens visible Chrome locally and holds the lock until that browser process exits. This keeps the Service and `runtime.json` available, rejects submissions with `SERVICE_BUSY`, and lets `stop` shut down the Service while Chrome remains open. `/prepare-open` returns `SERVICE_BUSY` if a submission admission may still use the browser or another manual browser session is active. Accepted Jobs can continue their Notion completion polling while Chrome is open. Closing Chrome does not verify sign-in or a browser challenge.
 
 ```http
 POST /jobs

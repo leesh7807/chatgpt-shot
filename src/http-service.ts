@@ -51,6 +51,14 @@ export async function serviceStatus(config: Pick<Config, 'discoveryPath'> = load
 }
 export async function healthy(config: Pick<Config, 'discoveryPath'> = loadConfig()): Promise<Discovery | undefined> { return (await serviceStatus(config))?.record; }
 function processAlive(pid: number) { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; } }
+export function browserProfileBusyForOpen(openingBrowser: boolean, browserAdmissions: number): boolean { return openingBrowser || browserAdmissions > 0; }
+export function discardDeadServiceDiscovery(config: Pick<Config, 'discoveryPath'>): boolean {
+  const record = readDiscovery(config);
+  if (!record) return true;
+  if (processAlive(record.pid)) return false;
+  removeDiscovery(config, record.credential);
+  return readDiscovery(config) === undefined;
+}
 type StartupRecord = { pid: number; token: string };
 type StartupLock = StartupRecord & { fd: number };
 type ManualOpenRecord = { pid: number; token: string; browserPid?: number };
@@ -135,7 +143,7 @@ export async function ensureService(config = loadConfig()): Promise<Discovery> {
 }
 export async function openBrowser(config = loadConfig()): Promise<void> {
   let record = await healthy(config);
-  if (!record && readDiscovery(config)) return fail('BROWSER_UNAVAILABLE', 'Service health could not be confirmed; discovery was preserved and the browser profile was not opened.') as never;
+  if (!record && !discardDeadServiceDiscovery(config)) return fail('BROWSER_UNAVAILABLE', 'Service health could not be confirmed for a live Service process; discovery was preserved and the browser profile was not opened.') as never;
   if (!record && existsSync(config.lockPath) && !reclaimStaleStartup(config)) return fail('SERVICE_BUSY', 'Service startup or shutdown is in progress. Retry opening the profile shortly.') as never;
   if (existsSync(config.manualOpenLockPath) && !reclaimStaleManualOpen(config)) return fail('SERVICE_BUSY', 'The retained browser profile is already open for manual use.') as never;
   const owner = lockManualOpen(config);
@@ -163,7 +171,7 @@ export async function stopService(config: Pick<Config, 'discoveryPath'> = loadCo
 export async function runService(): Promise<void> {
   const config = loadConfig(); const startupToken = process.env.CHATGPT_SHOT_STARTUP_TOKEN;
   if (!startupToken || !claimStartup(config, startupToken)) return fail('BROWSER_UNAVAILABLE', 'Service startup ownership was superseded.') as never;
-  const credential = randomBytes(32).toString('base64url'); let stopping = false; let openingBrowser = false; let active = 0; let server: ReturnType<typeof createServer>;
+  const credential = randomBytes(32).toString('base64url'); let stopping = false; let openingBrowser = false; let active = 0; let browserAdmissions = 0; let server: ReturnType<typeof createServer>;
   const admissions = new Set<AbortController>();
   const json = (res: any, status: number, body: unknown) => { if (!res.destroyed) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); } };
   const jsonError = (res: any, error: unknown) => {
@@ -214,7 +222,10 @@ export async function runService(): Promise<void> {
       if (existsSync(config.manualOpenLockPath)) reclaimStaleManualOpen(config);
       const owner = readManualOpen(config);
       if (!owner || owner.token !== token || owner.browserPid !== undefined || !processAlive(owner.pid)) return json(res, 409, { code: 'SERVICE_BUSY', message: 'The browser profile reservation is missing, stale, or already open; retry opening the profile.' });
-      if (openingBrowser || active || admissions.size) return json(res, 409, { code: 'SERVICE_BUSY', message: 'The browser profile is busy with admitted work or another manual browser session. Retry when it is idle.' });
+      // Accepted Jobs wait for Notion's terminal state only after their browser
+      // context has been verified closed. Schema validation also does not use
+      // the profile, so only count the part of admission that may use it.
+      if (browserProfileBusyForOpen(openingBrowser, browserAdmissions)) return json(res, 409, { code: 'SERVICE_BUSY', message: 'The browser profile is busy with an active browser admission or another manual browser session. Retry when it is idle.' });
       openingBrowser = true;
       try { await shutdownBroker(config.browserProfilePath); return json(res, 200, { ready: true }); }
       catch (error) { return json(res, 500, responseError(error)); }
@@ -270,7 +281,10 @@ export async function runService(): Promise<void> {
         if (requestAdmission.signal.aborted) fail('ADMISSION_CANCELLED', 'The caller disconnected before Job admission began.');
         stage = 'browser_admission';
         telemetryDelegated = true;
-        const run = await startJob(store, databaseId, new ChatGPTBrowser(current.browserProfilePath, undefined, diagnostics), prompt, id, { acknowledgementMs: current.acknowledgementMs, signal: requestAdmission.signal, diagnostics, telemetrySession: telemetry });
+        browserAdmissions++;
+        let run: Awaited<ReturnType<typeof startJob>>;
+        try { run = await startJob(store, databaseId, new ChatGPTBrowser(current.browserProfilePath, undefined, diagnostics), prompt, id, { acknowledgementMs: current.acknowledgementMs, signal: requestAdmission.signal, diagnostics, telemetrySession: telemetry }); }
+        finally { browserAdmissions--; }
         active++; void run.completion.catch(() => {}).finally(() => { active--; });
         return json(res, 200, { id });
       } catch (error) {

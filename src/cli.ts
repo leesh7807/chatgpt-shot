@@ -58,7 +58,7 @@ Arguments: none.`,
 
 Open the retained Chrome profile for manual sign-in or browser checks.
 When the Service is running, it stays available but rejects new submissions until Chrome closes.
-Existing work is never cancelled; retry open after it becomes idle.
+An admission still using the browser must finish first. Accepted Jobs can continue while the browser is open because their submission tabs are already closed.
 Closing Chrome does not verify authentication or browser-check results.
 
 Arguments: none.`,

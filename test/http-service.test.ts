@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { call, JOB_TRANSPORT_TIMEOUT_MS, readDiscovery, removeDiscovery, REQUEST_BODY_TIMEOUT_MS, stopService } from '../src/http-service.js';
+import { browserProfileBusyForOpen, call, discardDeadServiceDiscovery, JOB_TRANSPORT_TIMEOUT_MS, readDiscovery, removeDiscovery, REQUEST_BODY_TIMEOUT_MS, stopService } from '../src/http-service.js';
 import { ShotError } from '../src/errors.js';
 
 test('Job admission has no shorter client-side transport timeout', () => {
@@ -14,6 +14,12 @@ test('Job admission has no shorter client-side transport timeout', () => {
 
 test('bounds incomplete request bodies independently of accepted Job draining', () => {
   assert.equal(REQUEST_BODY_TIMEOUT_MS, 30_000);
+});
+
+test('manual open waits for browser admission, not accepted remote work', () => {
+  assert.equal(browserProfileBusyForOpen(false, 0), false);
+  assert.equal(browserProfileBusyForOpen(false, 1), true);
+  assert.equal(browserProfileBusyForOpen(true, 0), true);
 });
 
 test('restores a defined Service submission failure code at the HTTP client boundary', async () => {
@@ -55,6 +61,20 @@ test('discovery cleanup preserves a replacement owned by another Service generat
     assert.equal(readDiscovery(config)?.credential, 'generation-b');
     removeDiscovery(config, 'generation-b');
     assert.equal(existsSync(config.discoveryPath), false);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('manual open can reclaim discovery only after the Service process is dead', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'chatgpt-shot-open-stale-'));
+  const config = { discoveryPath: join(directory, 'runtime.json') };
+  try {
+    writeFileSync(config.discoveryPath, JSON.stringify({ pid: process.pid, host: '127.0.0.1', port: 12345, protocolVersion: 1, credential: 'live-generation' }));
+    assert.equal(discardDeadServiceDiscovery(config), false);
+    assert.equal(readDiscovery(config)?.credential, 'live-generation');
+
+    writeFileSync(config.discoveryPath, JSON.stringify({ pid: 2_147_483_647, host: '127.0.0.1', port: 12345, protocolVersion: 1, credential: 'dead-generation' }));
+    assert.equal(discardDeadServiceDiscovery(config), true);
+    assert.equal(readDiscovery(config), undefined);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
