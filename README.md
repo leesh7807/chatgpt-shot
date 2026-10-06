@@ -26,6 +26,16 @@ chatgpt-shot doctor
 
 The configuration file is user-owned with mode `0600` at `~/.config/chatgpt-shot/.env`, or `$XDG_CONFIG_HOME/chatgpt-shot/.env`. The retained browser profile is at `~/.local/share/chatgpt-shot/chrome-profile`, and Service discovery is at `~/.cache/chatgpt-shot/runtime.json`; XDG overrides apply. `config show` never prints the token.
 
+## Sandbox smoke
+
+When the repository root contains its ignored `.env`, run the complete production-path smoke with one command:
+
+```sh
+npm run smoke
+```
+
+The smoke copies that configuration into the ignored `.smoke/` runtime with owner-only permissions and sets all three XDG locations there for the production CLI and its detached children. It builds and invokes the existing CLI, submits a fixed probe, then reads the returned Job UUID through `chatgpt-shot jobs`. If the retained smoke browser profile needs authentication, the smoke opens it for manual sign-in; it never automates login. The smoke Service is stopped through the existing CLI after accepted work drains. A missing or invalid `.env`, browser or external readiness failure, unsuccessful submission, or unreadable Job exits with failure. The ordinary CLI continues to use the user's XDG locations.
+
 The optional acknowledgement budget starts immediately before the Service attempts to fill the prompt. It includes prompt filling, waiting for the Send control, the browser submit call, and observing remote acceptance in Notion. It defaults to 3 minutes:
 
 ```sh

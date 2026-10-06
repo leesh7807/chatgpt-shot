@@ -28,7 +28,15 @@ const runtimeBase = () => {
   return cache;
 };
 const runtimeDirectory = () => join(runtimeBase(), 'chatgpt-shot');
-export const brokerSocket = (_profile: string) => join(runtimeDirectory(), 'broker.sock');
+export const brokerSocket = (_profile: string) => {
+  const primary = join(runtimeDirectory(), 'broker.sock');
+  // Unix-domain socket path limits vary by platform. Keep the established path for ordinary
+  // XDG locations, but shorten it for deeply nested workspaces such as the sandbox smoke.
+  if (Buffer.byteLength(primary) < 104) return primary;
+  const compact = join(runtimeBase(), '.chatgpt.sock');
+  if (Buffer.byteLength(compact) >= 104) fail('BROWSER_UNAVAILABLE', 'The XDG cache path is too long for the browser broker socket.');
+  return compact;
+};
 const profile = (path: string) => path;
 const chrome = () => [process.env.CHATGPT_SHOT_BROWSER, '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome'].find((path): path is string => Boolean(path && existsSync(path)));
 const xvfb = () => 'Xvfb';
