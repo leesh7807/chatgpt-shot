@@ -132,13 +132,17 @@ async function main() {
   requireRegularFile(sourceEnv, 'Project root .env');
   const sourceBytes = readFileSync(sourceEnv);
   secrets = Object.values(dotenv.parse(sourceBytes)).filter(Boolean);
+  process.stdout.write('Building production CLI.\n');
   await buildProductionCli();
+  process.stdout.write('Preparing isolated smoke runtime.\n');
   prepareRuntime(sourceBytes);
 
   let id;
   let failure;
   try {
+    process.stdout.write('Submitting smoke probe and waiting for remote acceptance.\n');
     id = await submitProbe();
+    process.stdout.write('Remote acceptance confirmed; reading durable Job.\n');
     await readJob(id);
   } catch (error) {
     failure = error;
