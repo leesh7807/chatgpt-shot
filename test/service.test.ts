@@ -42,6 +42,7 @@ class Browser {
   fillError?: Error;
   fillDelayMs = 0;
   submitError?: Error;
+  notAttemptedReason?: string;
   inspectError?: Error;
   closeError?: Error;
   async withBrowser<T>(operation: () => Promise<T>): Promise<T> {
@@ -66,6 +67,7 @@ class Browser {
   async submitPrompt(submissionMarker: string) {
     this.submissionMarkers.push(submissionMarker); this.attempts++; this.order.push('submit');
     if (this.submitError) throw this.submitError;
+    if (this.notAttemptedReason) return { outcome: 'not_attempted' as const, reason: this.notAttemptedReason };
     return { outcome: 'clicked' as const, method: 'click' };
   }
   async inspectSubmission(submissionMarker: string) {
@@ -102,6 +104,16 @@ test('an uncertain browser result still waits for Notion acceptance', async () =
   assert.equal(store.deleted.length, 0);
   assert.ok(browser.inspections >= 1);
   await result.completion;
+});
+
+test('a confirmed non-attempted Send action fails immediately and cleans up the Invocation', async () => {
+  const browser = new Browser(); browser.notAttemptedReason = 'composer_marker_missing';
+  const store = new Store(['pending']); const telemetry = new Telemetry();
+  await assert.rejects(() => startJob(store as any, 'db', browser as any, 'task', 'job-1', { ...options, telemetry }), (error: any) => error.code === 'SUBMISSION_FAILED');
+  assert.equal(browser.inspections, 0);
+  assert.equal(store.reads, 0);
+  assert.equal(store.deleted.length, 1);
+  assert.equal(telemetry.events.find(event => event.event === 'admission_failed')?.error?.code, 'SUBMISSION_FAILED');
 });
 
 test('pending remains pending through the configured window and is not cleaned up when delivery is uncertain', async () => {

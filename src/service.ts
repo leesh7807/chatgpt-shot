@@ -186,17 +186,18 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
       stage = 'submission';
       delivery = 'uncertain';
       event('submission_attempted', { stage, details: { deadline_ms: acknowledgementMs } });
+      let submitResult: SubmitAttempt | undefined;
       try {
-        const result = await raceAdmission(browser.submitPrompt(invocation.pageId.replace(/-/g, '')), acknowledgementDeadline, options.signal);
-        if (result.outcome === 'not_attempted') {
-          delivery = 'not_submitted';
-          event('submit_action_returned', { stage, outcome: result.outcome, details: { reason: result.reason } });
-          return await failUndelivered(result.reason);
-        }
-        event('submit_action_returned', { stage, outcome: result.outcome, details: { method: result.method ?? 'click' } });
+        submitResult = await raceAdmission(browser.submitPrompt(invocation.pageId.replace(/-/g, '')), acknowledgementDeadline, options.signal);
       } catch (error) {
         event('submit_action_failed', { stage, error: telemetryError(error) });
       }
+      if (submitResult?.outcome === 'not_attempted') {
+        delivery = 'not_submitted';
+        event('submit_action_returned', { stage, outcome: submitResult.outcome, details: { reason: submitResult.reason } });
+        return await failUndelivered(submitResult.reason);
+      }
+      if (submitResult) event('submit_action_returned', { stage, outcome: submitResult.outcome, details: { method: submitResult.method ?? 'click' } });
 
       // UI evidence is diagnostic. Remote Notion state owns admission and is polled
       // even when the browser call or its evidence probe is uncertain.

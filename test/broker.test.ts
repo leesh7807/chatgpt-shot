@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { brokerSocket, chromeArguments, chromeEnvironment, classifySubmissionEvidence, closeTargetAndVerify, privateDisplayArguments, privateDisplayFromOutput, privateXAuthority, SEND_BUTTON_LABEL_PATTERN } from '../src/broker.js';
 
 test('uses a short hashed owner-runtime socket path for deep repositories', () => {
@@ -20,6 +23,38 @@ test('uses the same broker identity regardless of XDG_RUNTIME_DIR', () => {
   } finally {
     if (prior === undefined) delete process.env.XDG_RUNTIME_DIR;
     else process.env.XDG_RUNTIME_DIR = prior;
+  }
+});
+
+test('keeps the established socket path under short XDG cache locations', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'cgs-'));
+  const previous = process.env.XDG_CACHE_HOME;
+  try {
+    process.env.XDG_CACHE_HOME = parent;
+    assert.equal(brokerSocket('profile'), join(parent, 'chatgpt-shot', 'broker.sock'));
+  } finally {
+    if (previous === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = previous;
+    rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('shortens the broker socket path for deeply nested XDG cache locations', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'cgs-'));
+  const cache = join(parent, 'x'.repeat(70));
+  mkdirSync(cache);
+  const previous = process.env.XDG_CACHE_HOME;
+  try {
+    process.env.XDG_CACHE_HOME = cache;
+    const primary = join(cache, 'chatgpt-shot', 'broker.sock');
+    const compact = join(cache, '.chatgpt.sock');
+    assert.ok(Buffer.byteLength(primary) >= 104);
+    assert.ok(Buffer.byteLength(compact) < 104);
+    assert.equal(brokerSocket('profile'), compact);
+  } finally {
+    if (previous === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = previous;
+    rmSync(parent, { recursive: true, force: true });
   }
 });
 
