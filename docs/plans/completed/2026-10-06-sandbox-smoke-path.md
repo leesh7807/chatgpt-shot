@@ -82,3 +82,14 @@
 - **실제 Notion Invocation**: remote acceptance와 durable Job의 authoritative outcome을 제공한다.
 - **filesystem/Git 관찰**: smoke runtime 격리와 비밀값 비추적 경계를 확인한다.
 - **기존 automated test suite**: 일반 실행 계약의 회귀를 확인한다.
+
+## 2026-10-08 Follow-up decision: 전달용 smoke 상태 정리
+
+- 정상적으로 smoke 실행이 끝난 뒤 `.smoke/`는 다른 실행 시스템에 전달할 수 있는 상태로 정리한다.
+- 전달 시 보존하는 persistent state는 `.smoke/config/chatgpt-shot/.env`와 `.smoke/data/chatgpt-shot/chrome-profile`이다. Chrome 프로필의 인증 데이터는 유지하고, 프로필 자체를 새로 만들거나 인증 자동화를 추가하지 않는다.
+- 기존 production CLI가 accepted work를 drain하고 smoke Service를 중지한 뒤에만 `.smoke/cache`, telemetry 및 discovery/lock/socket, 프로필 내부의 재생성 가능한 Chrome cache directory, Chrome `Singleton*` 항목을 정리한다. 추가 XDG config/data 부산물도 보존 대상 경로 밖이면 제거한다.
+- Service 또는 browser 종료를 확인할 수 없으면 프로필이나 runtime을 정리하지 않고 smoke를 실패로 처리한다. 정상 완료 전에 profile cleanup을 실행하지 않는다.
+- 정리 완료 시 `.smoke/` 내부 symlink와 알려진 Chrome cache directory가 없음을 검사하고, `.env`와 Chrome 프로필만 보존됐는지 확인한다.
+- 이 후속 결정은 저장소 smoke orchestration 및 문서에 한정한다. 일반 CLI의 XDG 동작, production CLI/Service 경로, Notion Invocation lifecycle, browser 인증 및 수동 로그인 동작은 변경하지 않는다.
+- 강제 프로세스 종료나 시스템 중단은 종료 정리를 실행할 수 없다. 따라서 transfer-ready 상태는 정상 smoke 완료 후 보장하며, 비정상 종료 뒤에는 전달 전에 파일 상태를 다시 검사한다.
+- 구현 근거 실험: 현재 Chrome 환경에서 `Singleton*` symlink 3개를 삭제한 뒤 smoke가 수동 로그인 없이 성공했다. `.smoke/cache`와 Chrome 프로필의 cache directory를 제거한 뒤에도 smoke가 성공했고 인증 데이터 파일은 유지됐다. 두 실험 모두 Chrome이 다음 실행에서 symlink와 일부 cache directory를 재생성했으므로, 매 실행 마무리 정리가 필요하다.
