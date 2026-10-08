@@ -45,7 +45,7 @@ const telemetryError = (error: unknown) => {
 };
 const inspectionResult = (value: Inspection | SubmissionInspection): SubmissionInspection => typeof value === 'string' ? { inspection: value } : value;
 
-export const wrapPrompt = (prompt: string, pageId: string) => `<task>\n${prompt}\n</task>\n\n<chatgpt-shot>\nThis block is supplied by chatgpt-shot and defines how to return the result.\n\nInvocation record:\nhttps://www.notion.so/${pageId.replace(/-/g, '')}\n\n1. Before starting the task, set State to \`in_progress\`.\n2. Complete the task in <task>.\n3. Write the complete result to the invocation page body.\n4. As the final action:\n   - success → set State to \`completed\`\n   - failure → write the reason to Error and set State to \`failed\`\n</chatgpt-shot>`;
+export const wrapPrompt = (prompt: string, pageId: string) => `<task>\n${prompt}\n</task>\n\n<chatgpt-shot>\nThis block is supplied by chatgpt-shot and defines how to return the result.\n\nInvocation record:\nhttps://www.notion.so/${pageId.replace(/-/g, '')}\n\nThe user authorizes the Notion updates required for this Invocation only: set its State to \`in_progress\`, write this task's result to its page, and set the final State as specified below. Do not modify other pages or settings.\n\n1. Before starting the task, set State to \`in_progress\`.\n2. Complete the task in <task>.\n3. Write the complete result to the invocation page body.\n4. As the final action:\n   - success → set State to \`completed\`\n   - failure → write the reason to Error and set State to \`failed\`\n</chatgpt-shot>`;
 
 /**
  * Admit one Job and resolve only after the remote writer has recorded acceptance.
