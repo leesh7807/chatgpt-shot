@@ -12,8 +12,17 @@ function element(tagName: string, text = '', children: any[] = [], options: { ro
     getAttribute(name: string) { return name === 'role' ? options.role ?? null : null; },
     closest(selector: string) {
       let current: any = this;
-      while (current) { if (selector === 'form' && current.tagName === 'FORM') return current; current = current.parentElement; }
+      while (current) {
+        if (selector === 'form' && current.tagName === 'FORM') return current;
+        if (selector.includes('button') && (current.tagName === 'BUTTON' || current.getAttribute('role') === 'button')) return current;
+        current = current.parentElement;
+      }
       return null;
+    },
+    contains(target: any) {
+      let current = target;
+      while (current) { if (current === this) return true; current = current.parentElement; }
+      return false;
     },
     getBoundingClientRect() { return options.rect ?? { left: 0, top: 0, width: 100, height: 20 }; },
     querySelectorAll(selector: string) {
@@ -49,7 +58,16 @@ function withDom<T>(root: any, run: () => T): T {
   const originalDocument = global.document;
   const originalWindow = global.window;
   const originalGetComputedStyle = global.getComputedStyle;
-  global.document = { body: root, querySelectorAll: (selector: string) => root.querySelectorAll(selector) };
+  global.document = {
+    body: root,
+    querySelectorAll: (selector: string) => root.querySelectorAll(selector),
+    elementFromPoint(x: number, y: number) {
+      return root.querySelectorAll('button,[role="button"]').find((action: any) => {
+        const rect = action.getBoundingClientRect();
+        return x >= rect.left && y >= rect.top && x < rect.left + rect.width && y < rect.top + rect.height;
+      }) ?? null;
+    },
+  };
   global.window = { innerWidth: 1280, innerHeight: 800 };
   global.getComputedStyle = () => ({ visibility: 'visible', display: 'block' });
   try { return run(); }
