@@ -3,6 +3,7 @@ import { fail, ShotError } from './errors.js';
 import type { BrowserTransport, Inspection, SubmissionInspection, SubmitAttempt } from './browser.js';
 import type { Invocation, NotionStore } from './notion.js';
 import { JobTelemetrySession, LocalJobTelemetryWriter, type JobTelemetryInput, type JobTelemetryWriter } from './job-telemetry.js';
+import { recoverNotionWriteAccess } from './notion-approval-assist.js';
 
 export type SubmitOptions = { acknowledgementMs?: number; pollMs?: number; telemetry?: JobTelemetryWriter; telemetrySession?: JobTelemetrySession; signal?: AbortSignal; diagnostics?: boolean };
 export type JobExecution = { job: Invocation; completion: Promise<void> };
@@ -273,6 +274,26 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
         }
         if (accepted(current.state) || !observedInTime) break;
         if (current.state !== 'pending') fail('INVALID_INVOCATION_STATE', `Invocation ${id} has invalid State ${current.state}.`);
+        const recoveryStartedAt = performance.now();
+        const recovery = await recoverNotionWriteAccess(browser);
+        if (recovery && 'permissionChoice' in recovery) {
+          event('notion_write_access_recovery', {
+            stage,
+            outcome: 'approval_button_disappeared',
+            duration_ms: performance.now() - recoveryStartedAt,
+            ...(recovery.permissionChoice ? { details: { permission_choice: recovery.permissionChoice } } : {}),
+          });
+        } else if (recovery && recovery.status !== 'not_present') {
+          event('notion_write_access_recovery', {
+            stage,
+            outcome: recovery.status === 'click_unconfirmed' ? 'approval_prompt_click_unconfirmed' : 'approval_prompt_not_actionable',
+            duration_ms: performance.now() - recoveryStartedAt,
+            details: {
+              reason: recovery.reason ?? recovery.status,
+              ...(recovery.attemptedChoice ? { attempted_choice: recovery.attemptedChoice } : {}),
+            },
+          });
+        }
         const afterReadMs = acknowledgementDeadline - performance.now();
         if (afterReadMs <= 0) break;
         await sleep(Math.min(pollMs, afterReadMs));

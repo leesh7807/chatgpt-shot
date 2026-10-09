@@ -3,13 +3,14 @@ import { spawn } from 'node:child_process';
 import { brokerRequest, brokerSocket } from './broker.js';
 import { paths } from './config.js';
 import { fail, isStaleBrowserSessionError } from './errors.js';
+import type { NotionApprovalCheck } from './notion-approval-assist.js';
 
 export type Inspection = 'submitted' | 'not_submitted' | 'uncertain';
 export type SubmitAttempt = { outcome: 'clicked'; method?: string } | { outcome: 'not_attempted'; reason: string };
 export type SubmissionInspection = { inspection: Inspection; messageMarkerSeen?: boolean; composerMarkerPresent?: boolean; composerPresent?: boolean; sampleCount?: number; reason?: string };
 export type InspectionOptions = { settleMs?: number };
 export type BrowserDiagnosticEntry = { offset_ms: number; stage: string; [key: string]: unknown };
-export interface BrowserTransport { withBrowser<T>(operation: () => Promise<T>): Promise<T>; ensureAvailable(): Promise<void>; ensureAuthenticated(): Promise<void>; openFreshContext(): Promise<void>; fillPrompt(prompt: string, submissionMarker: string): Promise<void>; submitPrompt(submissionMarker: string): Promise<SubmitAttempt>; inspectSubmission(submissionMarker: string, options?: InspectionOptions): Promise<SubmissionInspection | Inspection>; close(): Promise<void>; diagnosticReport?(): BrowserDiagnosticEntry[]; }
+export interface BrowserTransport { withBrowser<T>(operation: () => Promise<T>): Promise<T>; ensureAvailable(): Promise<void>; ensureAuthenticated(): Promise<void>; openFreshContext(): Promise<void>; fillPrompt(prompt: string, submissionMarker: string): Promise<void>; submitPrompt(submissionMarker: string): Promise<SubmitAttempt>; inspectSubmission(submissionMarker: string, options?: InspectionOptions): Promise<SubmissionInspection | Inspection>; checkPendingNotionApproval?(): Promise<NotionApprovalCheck | undefined>; close(): Promise<void>; diagnosticReport?(): BrowserDiagnosticEntry[]; }
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const pendingBrokerStarts = new Map<string, Promise<void>>();
@@ -221,6 +222,17 @@ export class ChatGPTBrowser implements BrowserTransport {
       if (!successfulSamples && lastError) throw lastError;
       return { ...last, inspection: last.inspection === 'not_submitted' && allNotSubmitted ? 'not_submitted' : 'uncertain', sampleCount: successfulSamples };
     } catch (error) { if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); return { inspection: 'uncertain', reason: 'stale_browser_session' }; } throw error; }
+  }
+  async checkPendingNotionApproval(): Promise<NotionApprovalCheck> {
+    if (!this.sessionId) return { status: 'unavailable', reason: 'broker_unavailable' };
+    try {
+      const result = await this.rpc('notion-approval-assist', this.sessionId) as NotionApprovalCheck | undefined;
+      if (result && 'permissionChoice' in result && result.permissionChoice === 'always_allow') return result;
+      if (result && 'status' in result && ['not_present', 'click_unconfirmed', 'unavailable'].includes(result.status)) return result;
+      return { status: 'unavailable', reason: 'invalid_result' };
+    } catch {
+      return { status: 'unavailable', reason: 'broker_unavailable' };
+    }
   }
   diagnosticReport() { return this.diagnostics.map(entry => ({ ...entry })); }
   async close() {

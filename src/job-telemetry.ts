@@ -21,6 +21,7 @@ export type JobTelemetryEventName =
   | 'submit_action_returned'
   | 'submit_action_failed'
   | 'submission_inspected'
+  | 'notion_write_access_recovery'
   | 'notion_observation'
   | 'notion_request'
   | 'accepted'
@@ -65,14 +66,14 @@ export interface JobTelemetryWriter {
 
 const allowedEvents = new Set<JobTelemetryEventName>([
   'admission_started', 'notion_schema_validation', 'browser_stage', 'browser_context_opened', 'invocation_created', 'prompt_fill_started', 'prompt_filled', 'prompt_fill_failed',
-  'submission_attempted', 'submit_action_returned', 'submit_action_failed', 'submission_inspected',
+  'submission_attempted', 'submit_action_returned', 'submit_action_failed', 'submission_inspected', 'notion_write_access_recovery',
   'notion_observation', 'notion_request', 'accepted', 'browser_context_closed', 'terminal_observed',
   'admission_deadline_reached', 'admission_failed', 'observer_failed', 'cleanup', 'caller_cancelled',
 ]);
 const allowedDetails = new Set([
   'reason', 'method', 'message_marker_seen', 'composer_marker_present', 'sample_count', 'retry_after_seconds',
   'retry_count', 'queue_wait_ms', 'status', 'target_open', 'browser_context_closed', 'concurrency',
-  'delivery', 'deadline_ms', 'remaining_ms', 'http_status', 'rate_limit_reason', 'admission_elapsed_ms', 'composer_present',
+  'delivery', 'deadline_ms', 'remaining_ms', 'http_status', 'rate_limit_reason', 'admission_elapsed_ms', 'composer_present', 'permission_choice', 'attempted_choice',
 ]);
 const safeToken = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,96}$/.test(value) ? value : undefined;
 const safeNumber = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;

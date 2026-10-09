@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { fail, isStaleBrowserSessionError } from './errors.js';
+import { checkAndAllowNotionUpdate } from './notion-approval-assist.js';
 
 type Request = { operation: string; sessionId?: string; prompt?: string; submissionMarker?: string; diagnostics?: boolean };
 type Response = { ok: true; value?: unknown } | { ok: false; code: string; message: string };
@@ -12,6 +13,58 @@ type Message = { id?: number; sessionId?: string; result?: any; error?: { messag
 export type SubmissionEvidence = { seen: boolean; composerValue: string };
 export type SubmissionInspection = 'submitted' | 'not_submitted' | 'uncertain';
 export const classifySubmissionEvidence = (submissionMarker: string, evidence: SubmissionEvidence): SubmissionInspection => !submissionMarker ? 'uncertain' : evidence.seen ? 'submitted' : evidence.composerValue.includes(submissionMarker) ? 'not_submitted' : 'uncertain';
+export type TrustedMouseEvent = { type: 'mouseMoved' | 'mousePressed' | 'mouseReleased'; x: number; y: number; button: 'none' | 'left'; buttons: number; clickCount: number };
+export type TrustedClickExpectation = { label: string; context: string[] };
+export type TrustedClickResult = { status: 'clicked' | 'target_mismatch' | 'target_obscured' | 'click_not_received' };
+export async function dispatchTrustedClick(dispatch: (event: TrustedMouseEvent) => Promise<unknown>, x: number, y: number): Promise<void> {
+  await dispatch({ type: 'mouseMoved', x, y, button: 'none', buttons: 0, clickCount: 0 });
+  try { await dispatch({ type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 }); }
+  finally { await dispatch({ type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 }); }
+}
+const prepareTrustedClick = `(x,y,expectation,key)=>{
+  const normalize=value=>String(value||'').replace(/\\s+/g,' ').trim().toLocaleLowerCase().replace(/\\s*(?:esc|enter|return|↵|⏎|▼)$/i,'').trim();
+  const matches=value=>{const label=normalize(value);const expected=normalize(expectation.label);return label===expected||label.startsWith(expected+' ')};
+  const target=document.elementFromPoint(x,y);
+  const button=target instanceof Element?target.closest('button,[role="button"]'):null;
+  if(!button)return {status:'target_mismatch'};
+  const labels=[button.getAttribute('aria-label'),button.getAttribute('title'),button.innerText,button.textContent].filter(Boolean);
+  if(!labels.some(matches))return {status:'target_mismatch'};
+  if(button.disabled||button.getAttribute('aria-disabled')==='true')return {status:'target_mismatch'};
+  const rect=button.getBoundingClientRect();
+  if(rect.width<=0||rect.height<=0||x<rect.left||x>rect.right||y<rect.top||y>rect.bottom)return {status:'target_obscured'};
+  let contextFound=false;
+  for(let current=button,depth=0;current&&depth<3;current=current.parentElement,depth++){
+    const style=getComputedStyle(current);
+    if(style.display==='none'||style.visibility==='hidden'||Number(style.opacity)===0)return {status:'target_obscured'};
+    const text=(current.innerText||current.textContent||'').replace(/\\s+/g,' ').toLocaleLowerCase();
+    if(expectation.context.every(value=>text.includes(normalize(value)))){contextFound=true;break;}
+  }
+  if(!contextFound)return {status:'target_mismatch'};
+  const state={button,eventSeen:false,targetMatched:false,listener:undefined};
+  state.listener=event=>{
+    if(!event.isTrusted)return;
+    const clicked=event.target instanceof Element?event.target.closest('button,[role="button"]'):null;
+    state.eventSeen=true;
+    state.targetMatched=clicked===button;
+    document.removeEventListener('click',state.listener,true);
+  };
+  window[key]=state;
+  document.addEventListener('click',state.listener,true);
+  return {status:'ready'};
+}`;
+const consumeTrustedClick = `(key)=>{
+  const state=window[key];
+  if(!state)return 'click_not_received';
+  document.removeEventListener('click',state.listener,true);
+  delete window[key];
+  if(state.eventSeen&&state.targetMatched)return 'clicked';
+  return state.eventSeen?'target_mismatch':'click_not_received';
+}`;
+const cleanupTrustedClick = `(key)=>{
+  const state=window[key];
+  if(state)document.removeEventListener('click',state.listener,true);
+  delete window[key];
+}`;
 export const SEND_BUTTON_LABEL_PATTERN = /^(?:send|send message|send prompt)$/i;
 const SEND_BUTTON_READY_TIMEOUT_MS = 10_000;
 const SUBMIT_ACTION_TIMEOUT_MS = SEND_BUTTON_READY_TIMEOUT_MS + 2_000;
@@ -126,6 +179,19 @@ class Page {
   async within<T>(deadline: number, operation: () => Promise<T>): Promise<T> { const previous = this.deadline; this.deadline = Math.min(previous, deadline); try { return await operation(); } finally { this.deadline = previous; } }
   private remaining() { const ms = this.deadline - Date.now(); if (ms <= 0) fail('BROWSER_UNAVAILABLE', 'ChatGPT browser operation exceeded its broker deadline.'); return Math.min(30_000, ms); }
   async evaluate<T>(expression: string, args: unknown[] = []): Promise<T> { const result = await this.cdp.send('Runtime.evaluate', { expression: `(${expression})(...${JSON.stringify(args)})`, awaitPromise: true, returnByValue: true }, this.sessionId, this.remaining()); if (result.exceptionDetails) { const detail = result.exceptionDetails.exception?.description ?? result.exceptionDetails.exception?.value ?? result.exceptionDetails.text ?? 'Page evaluation failed.'; throw new Error(String(detail).split('\n', 1)[0].slice(0, 500)); } return result.result.value as T; }
+  async clickAt(x: number, y: number, expectation: TrustedClickExpectation): Promise<TrustedClickResult> {
+    const key = `__chatgptShotTrustedClick_${randomUUID().replace(/-/g, '')}`;
+    const prepared = await this.evaluate<{ status: 'ready' | 'target_mismatch' | 'target_obscured' }>(prepareTrustedClick, [x, y, expectation, key]);
+    if (prepared.status !== 'ready') return { status: prepared.status };
+    try {
+      await dispatchTrustedClick(event => this.cdp.send('Input.dispatchMouseEvent', event, this.sessionId, this.remaining()), x, y);
+      const result = await this.evaluate<'clicked' | 'target_mismatch' | 'click_not_received'>(consumeTrustedClick, [key]);
+      return { status: result };
+    } catch {
+      await this.evaluate(cleanupTrustedClick, [key]).catch(() => {});
+      return { status: 'click_not_received' };
+    }
+  }
   async navigate(url = 'https://chatgpt.com/') {
     await this.cdp.send('Page.enable', {}, this.sessionId, this.remaining());
     const result = await this.cdp.send('Page.navigate', { url }, this.sessionId, this.remaining());
@@ -295,6 +361,7 @@ class Broker {
       const page = request.sessionId ? this.pages.get(request.sessionId) : undefined;
       if (request.operation === 'close' && !page) return { closed: true, verified: true };
       if (!page) return fail('BROWSER_UNAVAILABLE', 'Browser invocation page is unavailable.');
+      if (request.operation === 'notion-approval-assist') return checkAndAllowNotionUpdate(page);
       if (request.operation === 'fill') {
         const deadline = Date.now() + 45_000;
         await page.within(deadline, async () => {
@@ -388,7 +455,7 @@ export const brokerRequest = async (root: string, request: Request): Promise<any
   // never time out while the broker can still perform that side effect.
   // ensure may cold-start Chrome, create/attach a target, navigate, and wait for readiness.
   // Its caller must outlive every bounded private-CDP operation in that startup path.
-  const timeoutMs = request.operation === 'ensure' ? 180_000 : request.operation === 'submit' ? 95_000 : request.operation === 'open' || request.operation === 'shutdown' ? 90_000 : request.operation === 'fill' || request.operation === 'auth' ? 60_000 : 15_000;
+  const timeoutMs = request.operation === 'ensure' ? 180_000 : request.operation === 'submit' ? 95_000 : request.operation === 'open' || request.operation === 'shutdown' ? 90_000 : request.operation === 'fill' || request.operation === 'auth' ? 60_000 : request.operation === 'notion-approval-assist' ? 8_000 : 15_000;
   const timeout = setTimeout(() => finish(new Error('Broker RPC timed out.')), timeoutMs);
   socket.setEncoding('utf8'); socket.once('error', (error) => finish(error)); socket.on('data', chunk => { body += chunk; }); socket.on('end', () => { try { const response = JSON.parse(body) as Response; if (!response.ok) { const error: any = new Error(response.message); error.code = response.code; finish(error); } else finish(undefined, response.value); } catch (error: any) { finish(error); } }); socket.end(JSON.stringify(request));
 });

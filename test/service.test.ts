@@ -45,6 +45,9 @@ class Browser {
   notAttemptedReason?: string;
   inspectError?: Error;
   closeError?: Error;
+  approvalChecks = 0;
+  approvalError?: Error;
+  async checkPendingNotionApproval() { this.approvalChecks++; if (this.approvalChecks === 1 && this.approvalError) throw this.approvalError; return { permissionChoice: 'always_allow' as const }; }
   async withBrowser<T>(operation: () => Promise<T>): Promise<T> {
     let value!: T; let operationError: unknown;
     try { value = await operation(); } catch (error) { operationError = error; }
@@ -122,6 +125,28 @@ test('pending remains pending through the configured window and is not cleaned u
   await assert.rejects(() => startJob(store as any, 'db', browser as any, 'task', 'job-1', { ...options, acknowledgementMs: 80 }), (error: any) => error.code === 'SUBMISSION_UNCERTAIN');
   assert.ok(store.reads > 1);
   assert.equal(store.deleted.length, 0);
+});
+
+test('pending approval assist runs only while Notion remains pending and never controls acceptance', async () => {
+  const browser = new Browser(); browser.approvalError = new Error('temporary broker failure');
+  const store = new Store(['pending', 'pending', 'in_progress', 'completed']);
+  const telemetry = new Telemetry();
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-approval', { ...options, telemetry });
+  assert.equal(result.job.state, 'in_progress');
+  assert.equal(browser.approvalChecks, 2);
+  const recoveries = telemetry.events.filter(item => item.event === 'notion_write_access_recovery');
+  assert.equal(recoveries.length, 1);
+  assert.equal(recoveries[0].outcome, 'approval_button_disappeared');
+  assert.deepEqual(recoveries[0].details, { permission_choice: 'always_allow' });
+  await result.completion;
+
+  const noRecoveryBrowser = new Browser();
+  noRecoveryBrowser.checkPendingNotionApproval = async () => { noRecoveryBrowser.approvalChecks++; return undefined; };
+  const noRecoveryTelemetry = new Telemetry();
+  const noRecovery = await startJob(new Store(['pending', 'in_progress', 'completed']) as any, 'db', noRecoveryBrowser as any, 'task', 'job-no-recovery', { ...options, telemetry: noRecoveryTelemetry });
+  assert.equal(noRecoveryBrowser.approvalChecks, 1);
+  assert.equal(noRecoveryTelemetry.events.some(item => item.event === 'notion_write_access_recovery'), false);
+  await noRecovery.completion;
 });
 
 test('only confirmed non-delivery permits Invocation cleanup', async () => {
