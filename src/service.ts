@@ -3,6 +3,7 @@ import { fail, ShotError } from './errors.js';
 import type { BrowserTransport, Inspection, SubmissionInspection, SubmitAttempt } from './browser.js';
 import type { Invocation, NotionStore } from './notion.js';
 import { JobTelemetrySession, LocalJobTelemetryWriter, type JobTelemetryInput, type JobTelemetryWriter } from './job-telemetry.js';
+import { recoverNotionWriteAccess } from './notion-approval-assist.js';
 
 export type SubmitOptions = { acknowledgementMs?: number; pollMs?: number; telemetry?: JobTelemetryWriter; telemetrySession?: JobTelemetrySession; signal?: AbortSignal; diagnostics?: boolean };
 export type JobExecution = { job: Invocation; completion: Promise<void> };
@@ -51,6 +52,9 @@ export const wrapPrompt = (prompt: string, pageId: string) => `<task>\n${prompt}
  * Admit one Job and resolve only after the remote writer has recorded acceptance.
  * The acknowledgement clock begins immediately before prompt filling. A returned
  * Job has had its submission tab closed; terminal observation is Notion-only.
+ *
+ * Control flow: browser admission and submission → Notion acceptance polling
+ * (approval recovery while pending) → accepted-job terminal observation.
  */
 export async function startJob(store: NotionStore, databaseId: string, browser: BrowserTransport, prompt: string, id: string, options: SubmitOptions = {}): Promise<JobExecution> {
   const acknowledgementMs = options.acknowledgementMs ?? DEFAULT_ACKNOWLEDGEMENT_MS;
@@ -131,6 +135,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
   let rejectAcceptance!: (error: unknown) => void;
   const acceptance = new Promise<Invocation>((resolve, reject) => { resolveAcceptance = resolve; rejectAcceptance = reject; });
 
+  // Admission starts: prepare the browser, create the Invocation, and submit the prompt.
   const admission = browser.withBrowser(async () => {
     try {
       cancelled();
@@ -199,6 +204,8 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
       }
       if (submitResult) event('submit_action_returned', { stage, outcome: submitResult.outcome, details: { method: submitResult.method ?? 'click' } });
 
+      // Acceptance polling starts: Notion state is authoritative; approval recovery
+      // is attempted only while the Invocation remains pending.
       // UI evidence is diagnostic. Remote Notion state owns admission and is polled
       // even when the browser call or its evidence probe is uncertain.
       void inspect('post_submit', acknowledgementDeadline);
@@ -273,6 +280,32 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
         }
         if (accepted(current.state) || !observedInTime) break;
         if (current.state !== 'pending') fail('INVALID_INVOCATION_STATE', `Invocation ${id} has invalid State ${current.state}.`);
+        const recoveryStartedAt = performance.now();
+        // Retry approval on each pending read; absent prompts are silent, and clicks never end this loop.
+        const recovery = await recoverNotionWriteAccess(browser);
+        if (recovery && recovery.status !== 'not_present') {
+          const buttonFound = recovery.status === 'click_reported'
+            || recovery.status === 'click_unconfirmed'
+            || recovery.attemptedChoice === 'always_allow';
+          const clickAttempted = recovery.status === 'click_reported'
+            || recovery.status === 'click_unconfirmed'
+            || recovery.attemptedChoice === 'always_allow';
+          event('notion_write_access_recovery', {
+            stage,
+            outcome: recovery.status === 'click_reported'
+              ? 'approval_button_click_reported'
+              : recovery.status === 'click_unconfirmed'
+                ? 'approval_button_click_unconfirmed'
+                : 'approval_assist_unavailable',
+            duration_ms: performance.now() - recoveryStartedAt,
+            details: {
+              ...(buttonFound ? { button_found: true } : {}),
+              ...(clickAttempted ? { click_attempted: true } : {}),
+              ...('reason' in recovery ? { reason: recovery.reason } : {}),
+              ...(recovery.attemptedChoice ? { attempted_choice: recovery.attemptedChoice } : {}),
+            },
+          });
+        }
         const afterReadMs = acknowledgementDeadline - performance.now();
         if (afterReadMs <= 0) break;
         await sleep(Math.min(pollMs, afterReadMs));
@@ -296,6 +329,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
     }
   });
 
+  // Accepted-job completion starts: release the caller after acceptance, then observe terminal state.
   const completion = admission.then(async (firstAcceptedState) => {
     if (!firstAcceptedState) fail('INTERNAL_ERROR', 'Job admission finished without an accepted Invocation.');
     const acceptedState = firstAcceptedState as Invocation;
@@ -347,6 +381,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
   });
 
   void completion.catch(() => {});
+  // Return boundary: wait for confirmed remote acceptance; completion remains asynchronous.
   try {
     const job = await acceptance;
     return { job, completion: completion.then(() => undefined) };
