@@ -62,7 +62,8 @@ export function notionApprovalPageProbe(): Probe {
 
 /** Build a self-contained expression for the browser page. */
 export function serializedNotionApprovalPageProbe(): string {
-  return `() => (${notionApprovalPageProbe.toString()})()`;
+  const nameHelper = '(target, value) => Object.defineProperty(target, "name", { value, configurable: true })';
+  return `() => ((__name) => (${notionApprovalPageProbe.toString()})())(${nameHelper})`;
 }
 
 export interface NotionApprovalPage {

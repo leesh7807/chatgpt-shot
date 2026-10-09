@@ -164,6 +164,221 @@ test('confirmed prompt delivery without acceptance returns ADMISSION_TIMEOUT and
   assert.equal(store.deleted.length, 0);
 });
 
+test('pending acceptance at 90 seconds triggers one same-Job retry and records it in the same trail', async () => {
+  let currentTime = 0;
+  const browser = new Browser();
+  const sentMarkers: string[] = [];
+  browser.submitPrompt = async (submissionMarker: string) => {
+    sentMarkers.push(submissionMarker); browser.attempts++; browser.order.push('submit');
+    await Promise.resolve();
+    if (browser.attempts === 1) currentTime = 90_000;
+    return { outcome: 'clicked' as const, method: 'click' };
+  };
+  const store = new Store(['pending', 'pending', 'in_progress', 'completed']);
+  const telemetry = new Telemetry();
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-retry', { acknowledgementMs: 180_000, pollMs: 1, now: () => currentTime, telemetry });
+
+  assert.equal(result.job.id, 'job-retry');
+  assert.equal(result.job.pageId, 'page-job-retry');
+  assert.equal(browser.attempts, 2);
+  assert.equal(store.created.length, 1);
+  assert.equal(browser.opens, 1);
+  assert.deepEqual(sentMarkers, ['pagejobretry', 'pagejobretry']);
+  const submissions = telemetry.events.filter(event => event.event === 'submission_attempted');
+  assert.equal(submissions.length, 2);
+  assert.equal(submissions[1].stage, 'submission_retry');
+  assert.deepEqual(submissions[1].details, { deadline_ms: 180_000, retry_count: 1, reason: 'no_acceptance_after_90s' });
+  assert.equal(telemetry.events.some(event => event.event === 'accepted' && event.state === 'in_progress'), true);
+  await result.completion;
+});
+
+test('retry preflight acceptance wins and prevents a second Send action', async () => {
+  let currentTime = 0;
+  const browser = new Browser();
+  browser.submitPrompt = async (submissionMarker: string) => {
+    browser.submissionMarkers.push(submissionMarker); browser.attempts++; browser.order.push('submit');
+    await Promise.resolve();
+    currentTime = 90_000;
+    return { outcome: 'clicked' as const, method: 'click' };
+  };
+  const store = new Store(['completed']);
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-accepted-before-retry', { acknowledgementMs: 180_000, now: () => currentTime, telemetry: silentTelemetry });
+  assert.equal(result.job.state, 'completed');
+  assert.equal(browser.attempts, 1);
+  assert.equal(store.created.length, 1);
+});
+
+test('acceptance observed while refilling cancels the retry Send action', async () => {
+  let currentTime = 0;
+  let releasePreflight!: (snapshot: Snapshot) => void;
+  const browser = new Browser();
+  browser.submitPrompt = async (submissionMarker: string) => {
+    browser.submissionMarkers.push(submissionMarker); browser.attempts++; browser.order.push('submit');
+    await Promise.resolve();
+    currentTime = 90_000;
+    return { outcome: 'clicked' as const, method: 'click' };
+  };
+  const originalFill = browser.fillPrompt.bind(browser);
+  browser.fillPrompt = async (prompt: string, marker: string) => {
+    await originalFill(prompt, marker);
+    if (browser.order.filter(item => item === 'fill_started').length === 2) {
+      releasePreflight({ id: 'job-accept-during-refill', pageId: 'page-job-accept-during-refill', state: 'in_progress', error: '' });
+      await Promise.resolve();
+    }
+  };
+  class DelayedPreflightStore extends Store {
+    reads = 0;
+    override async readInvocation(pageId: string, id: string): Promise<Snapshot> {
+      this.reads++;
+      if (this.reads === 1) return await new Promise(resolve => { releasePreflight = resolve; });
+      return { id, pageId, state: 'completed', error: '' };
+    }
+  }
+  const store = new DelayedPreflightStore();
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-accept-during-refill', { acknowledgementMs: 180_000, pollMs: 1, now: () => currentTime, telemetry: silentTelemetry });
+  assert.equal(result.job.state, 'in_progress');
+  assert.equal(browser.attempts, 1);
+  assert.equal(store.created.length, 1);
+  await result.completion;
+});
+
+test('Notion read failure does not prevent the eligible retry', async () => {
+  let currentTime = 0;
+  const browser = new Browser();
+  browser.submitPrompt = async (submissionMarker: string) => {
+    browser.submissionMarkers.push(submissionMarker); browser.attempts++; browser.order.push('submit');
+    await Promise.resolve();
+    if (browser.attempts === 1) currentTime = 90_000;
+    return { outcome: 'clicked' as const, method: 'click' };
+  };
+  class FailingReadStore extends Store {
+    attempts = 0;
+    override async readInvocation(pageId: string, id: string) {
+      this.attempts++;
+      if (this.attempts === 1) throw new ShotError('NOTION_UNAVAILABLE', 'read interrupted');
+      return super.readInvocation(pageId, id);
+    }
+  }
+  const store = new FailingReadStore(['pending', 'in_progress', 'completed']);
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-read-error', { acknowledgementMs: 180_000, pollMs: 1, now: () => currentTime, telemetry: silentTelemetry });
+  assert.equal(browser.attempts, 2);
+  assert.equal(result.job.id, 'job-read-error');
+  assert.equal(store.created.length, 1);
+  await result.completion;
+});
+
+test('uncertain delivery gets one retry, and a failed retry keeps polling for first-attempt acceptance', async () => {
+  let currentTime = 0;
+  const browser = new Browser(); browser.inspected = 'uncertain';
+  const telemetry = new Telemetry();
+  browser.submitPrompt = async (submissionMarker: string) => {
+    browser.submissionMarkers.push(submissionMarker); browser.attempts++; browser.order.push('submit');
+    await Promise.resolve();
+    if (browser.attempts === 1) { currentTime = 90_000; return { outcome: 'clicked' as const, method: 'click' }; }
+    throw new Error('retry transport interrupted');
+  };
+  const store = new Store(['pending', 'pending', 'in_progress', 'completed']);
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-retry-failed', { acknowledgementMs: 180_000, pollMs: 1, now: () => currentTime, telemetry });
+  assert.equal(browser.attempts, 2);
+  assert.equal(store.created.length, 1);
+  assert.equal(store.deleted.length, 0);
+  assert.equal(result.job.id, 'job-retry-failed');
+  assert.equal(telemetry.events.some(event => event.event === 'submit_action_failed' && event.stage === 'submission_retry'), true);
+  await result.completion;
+});
+
+test('a retry waits for an unfinished first browser Send call instead of overlapping it', async (context) => {
+  context.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  let finishFirst!: (result: { outcome: 'clicked'; method: 'click' }) => void;
+  const firstAction = new Promise<{ outcome: 'clicked'; method: 'click' }>(resolve => { finishFirst = resolve; });
+  const sentMarkers: string[] = [];
+  const browser = new Browser();
+  browser.submitPrompt = async (submissionMarker: string) => {
+    sentMarkers.push(submissionMarker); browser.attempts++; browser.order.push('submit');
+    if (browser.attempts === 1) return await firstAction;
+    return { outcome: 'clicked' as const, method: 'click' };
+  };
+  const store = new Store(['pending', 'pending', 'pending', 'in_progress', 'completed']);
+  const submission = startJob(store as any, 'db', browser as any, 'task', 'job-send-race', { acknowledgementMs: 180_000, pollMs: 1, now: () => Date.now(), telemetry: silentTelemetry });
+
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(browser.attempts, 1);
+  context.mock.timers.tick(90_000);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(browser.attempts, 1, 'the retry must wait while the first browser transmission is still running');
+
+  finishFirst({ outcome: 'clicked', method: 'click' });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  context.mock.timers.tick(0);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  const result = await submission;
+  assert.equal(browser.attempts, 2);
+  assert.deepEqual(sentMarkers, ['pagejobsendrace', 'pagejobsendrace']);
+  assert.equal(store.created.length, 1);
+  context.mock.timers.tick(1);
+  await result.completion;
+});
+
+test('a 90-second acknowledgement budget does not start an internal retry', async () => {
+  let currentTime = 0;
+  const browser = new Browser();
+  browser.submitPrompt = async (submissionMarker: string) => {
+    browser.submissionMarkers.push(submissionMarker); browser.attempts++; browser.order.push('submit');
+    await Promise.resolve();
+    currentTime = 90_000;
+    return { outcome: 'clicked' as const, method: 'click' };
+  };
+  await assert.rejects(
+    () => startJob(new Store(['pending']) as any, 'db', browser as any, 'task', 'job-short-budget', { acknowledgementMs: 90_000, now: () => currentTime, telemetry: silentTelemetry }),
+    (error: any) => error.code === 'SUBMISSION_UNCERTAIN',
+  );
+  assert.equal(browser.attempts, 1);
+});
+
+test('the retry does not reset the original 180-second acknowledgement deadline', async () => {
+  let currentTime = 0;
+  const browser = new Browser();
+  browser.submitPrompt = async (submissionMarker: string) => {
+    browser.submissionMarkers.push(submissionMarker); browser.attempts++; browser.order.push('submit');
+    if (browser.attempts === 1) {
+      await Promise.resolve();
+      currentTime = 90_000;
+    } else currentTime = 180_000;
+    return { outcome: 'clicked' as const, method: 'click' };
+  };
+  const store = new Store(['pending', 'pending']);
+  await assert.rejects(
+    () => startJob(store as any, 'db', browser as any, 'task', 'job-original-deadline', { acknowledgementMs: 180_000, now: () => currentTime, telemetry: silentTelemetry }),
+    (error: any) => error.code === 'ADMISSION_TIMEOUT',
+  );
+  assert.equal(browser.attempts, 2);
+  assert.equal(store.deleted.length, 0);
+});
+
+test('cancellation during retry preparation prevents the second Send and preserves a possibly delivered Invocation', async () => {
+  let currentTime = 0;
+  const controller = new AbortController();
+  const browser = new Browser();
+  const originalFill = browser.fillPrompt.bind(browser);
+  browser.fillPrompt = async (prompt: string, marker: string) => {
+    await originalFill(prompt, marker);
+    if (browser.order.filter(item => item === 'fill_started').length === 2) controller.abort();
+  };
+  browser.submitPrompt = async (submissionMarker: string) => {
+    browser.submissionMarkers.push(submissionMarker); browser.attempts++; browser.order.push('submit');
+    await Promise.resolve();
+    currentTime = 90_000;
+    return { outcome: 'clicked' as const, method: 'click' };
+  };
+  const store = new Store(['pending']);
+  await assert.rejects(
+    () => startJob(store as any, 'db', browser as any, 'task', 'job-cancel-retry', { acknowledgementMs: 180_000, now: () => currentTime, signal: controller.signal, telemetry: silentTelemetry }),
+    (error: any) => error.code === 'ADMISSION_CANCELLED',
+  );
+  assert.equal(browser.attempts, 1);
+  assert.equal(store.deleted.length, 0);
+});
+
 test('the deadline includes a stalled prompt fill and no Send action starts afterward', async () => {
   const browser = new Browser(); browser.fillDelayMs = 80;
   const store = new Store(['in_progress']);
