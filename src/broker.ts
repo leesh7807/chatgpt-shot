@@ -17,6 +17,14 @@ export const classifySubmissionEvidence = (submissionMarker: string, evidence: S
 export type TrustedMouseEvent = { type: 'mouseMoved' | 'mousePressed' | 'mouseReleased'; x: number; y: number; button: 'none' | 'left'; buttons: number; clickCount: number };
 export type TrustedClickExpectation = { label: string; context: string[] };
 export type TrustedClickResult = { status: 'clicked' | 'target_mismatch' | 'target_obscured' | 'click_not_received' };
+export type XScreenMetrics = { screenX: number; screenY: number; outerHeight: number; innerHeight: number; devicePixelRatio: number };
+export function viewportPointToXScreen(x: number, y: number, metrics: XScreenMetrics) {
+  const scale = metrics.devicePixelRatio;
+  return {
+    x: Math.round((metrics.screenX + x) * scale),
+    y: Math.round((metrics.screenY + Math.max(0, metrics.outerHeight - metrics.innerHeight) + y) * scale),
+  };
+}
 export async function dispatchTrustedClick(dispatch: (event: TrustedMouseEvent) => Promise<unknown>, x: number, y: number): Promise<void> {
   await dispatch({ type: 'mouseMoved', x, y, button: 'none', buttons: 0, clickCount: 0 });
   try { await dispatch({ type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 }); }
@@ -61,11 +69,63 @@ const consumeTrustedClick = `(key)=>{
   if(state.eventSeen&&state.targetMatched)return 'clicked';
   return state.eventSeen?'target_mismatch':'click_not_received';
 }`;
+const trustedClickTargetHovered = `(key)=>{
+  const state=window[key];
+  return !!state&&[...document.querySelectorAll(':hover')].reverse().some(element=>element.closest('button,[role="button"]')===state.button);
+}`;
 const cleanupTrustedClick = `(key)=>{
   const state=window[key];
   if(state)document.removeEventListener('click',state.listener,true);
   delete window[key];
 }`;
+const xTestInputScript = `import ctypes,sys,time
+x11=ctypes.CDLL('libX11.so.6')
+xtst=ctypes.CDLL('libXtst.so.6')
+x11.XOpenDisplay.argtypes=[ctypes.c_char_p]
+x11.XOpenDisplay.restype=ctypes.c_void_p
+x11.XFlush.argtypes=[ctypes.c_void_p]
+x11.XSync.argtypes=[ctypes.c_void_p,ctypes.c_int]
+x11.XCloseDisplay.argtypes=[ctypes.c_void_p]
+xtst.XTestFakeMotionEvent.argtypes=[ctypes.c_void_p,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_ulong]
+xtst.XTestFakeButtonEvent.argtypes=[ctypes.c_void_p,ctypes.c_uint,ctypes.c_int,ctypes.c_ulong]
+d=x11.XOpenDisplay(None)
+if not d: sys.exit(2)
+try:
+  action=sys.argv[1]
+  x=int(sys.argv[2]); y=int(sys.argv[3])
+  if action=='move':
+    if not xtst.XTestFakeMotionEvent(d,-1,x,y,0): sys.exit(3)
+    x11.XSync(d,0)
+  elif action=='click':
+    if not xtst.XTestFakeButtonEvent(d,1,1,0): sys.exit(4)
+    try:
+      x11.XFlush(d)
+      time.sleep(0.08)
+    finally:
+      released=xtst.XTestFakeButtonEvent(d,1,0,0)
+      x11.XSync(d,0)
+      if not released: sys.exit(5)
+  else: sys.exit(6)
+finally:
+  x11.XCloseDisplay(d)`;
+
+async function dispatchXTestInput(display: VirtualDisplay, action: 'move' | 'click', x: number, y: number): Promise<void> {
+  const environment = chromeEnvironment(display.display, display.authorizationPath);
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn('python3', ['-c', xTestInputScript, action, String(x), String(y)], {
+      env: environment ?? process.env,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-500); });
+    child.once('error', reject);
+    child.once('close', code => code === 0
+      ? resolve()
+      : reject(new Error(`XTEST ${action} input failed${stderr.trim() ? `: ${stderr.trim()}` : ` (exit ${code ?? 'null'})`}.`)));
+  });
+}
+
 export const SEND_BUTTON_LABEL_PATTERN = /^(?:send|send message|send prompt)$/i;
 const SEND_BUTTON_READY_TIMEOUT_MS = 10_000;
 const SUBMIT_ACTION_TIMEOUT_MS = SEND_BUTTON_READY_TIMEOUT_MS + 2_000;
@@ -176,7 +236,7 @@ class PipeCdp {
 
 class Page {
   private deadline = Number.POSITIVE_INFINITY;
-  constructor(readonly targetId: string, readonly sessionId: string, private readonly cdp: PipeCdp) {}
+  constructor(readonly targetId: string, readonly sessionId: string, private readonly cdp: PipeCdp, private readonly display?: VirtualDisplay) {}
   async within<T>(deadline: number, operation: () => Promise<T>): Promise<T> { const previous = this.deadline; this.deadline = Math.min(previous, deadline); try { return await operation(); } finally { this.deadline = previous; } }
   private remaining() { const ms = this.deadline - Date.now(); if (ms <= 0) fail('BROWSER_UNAVAILABLE', 'ChatGPT browser operation exceeded its broker deadline.'); return Math.min(30_000, ms); }
   async evaluate<T>(expression: string, args: unknown[] = []): Promise<T> { const result = await this.cdp.send('Runtime.evaluate', { expression: `(${expression})(...${JSON.stringify(args)})`, awaitPromise: true, returnByValue: true }, this.sessionId, this.remaining()); if (result.exceptionDetails) { const detail = result.exceptionDetails.exception?.description ?? result.exceptionDetails.exception?.value ?? result.exceptionDetails.text ?? 'Page evaluation failed.'; throw new Error(String(detail).split('\n', 1)[0].slice(0, 500)); } return result.result.value as T; }
@@ -185,7 +245,25 @@ class Page {
     const prepared = await this.evaluate<{ status: 'ready' | 'target_mismatch' | 'target_obscured' }>(prepareTrustedClick, [x, y, expectation, key]);
     if (prepared.status !== 'ready') return { status: prepared.status };
     try {
-      await dispatchTrustedClick(event => this.cdp.send('Input.dispatchMouseEvent', event, this.sessionId, this.remaining()), x, y);
+      // The broker owns Xvfb credentials; keep the experimental source switch here.
+      if (process.env.CHATGPT_SHOT_NOTION_CLICK_DRIVER === 'xtest') {
+        if (!this.display) {
+          await this.evaluate(cleanupTrustedClick, [key]).catch(() => {});
+          return { status: 'click_not_received' };
+        }
+        const metrics = await this.evaluate<XScreenMetrics>('()=>({screenX,screenY,outerHeight,innerHeight,devicePixelRatio})');
+        const point = viewportPointToXScreen(x, y, metrics);
+        await dispatchXTestInput(this.display, 'move', point.x, point.y);
+        await delay(100);
+        const targetHovered = await this.evaluate<boolean>(trustedClickTargetHovered, [key]);
+        if (!targetHovered) {
+          await this.evaluate(cleanupTrustedClick, [key]).catch(() => {});
+          return { status: 'target_mismatch' };
+        }
+        await dispatchXTestInput(this.display, 'click', point.x, point.y);
+      } else {
+        await dispatchTrustedClick(event => this.cdp.send('Input.dispatchMouseEvent', event, this.sessionId, this.remaining()), x, y);
+      }
       const result = await this.evaluate<'clicked' | 'target_mismatch' | 'click_not_received'>(consumeTrustedClick, [key]);
       return { status: result };
     } catch {
@@ -300,7 +378,7 @@ class Broker {
       fail('BROWSER_UNAVAILABLE', `Could not launch the private ChatGPT browser runtime: ${error instanceof Error ? error.message : String(error)}`, error);
     } finally { if (this.startingChild === child) this.startingChild = undefined; if (this.startingDisplay === virtual) this.startingDisplay = undefined; if (this.startingCdp === cdp) this.startingCdp = undefined; }
   }
-  private async createPage(cdp = this.cdp!, deadline = Date.now() + 30_000) { const remaining = () => { const ms = deadline - Date.now(); if (ms <= 0) fail('BROWSER_UNAVAILABLE', 'ChatGPT target creation exceeded its broker deadline.'); return Math.min(30_000, ms); }; const created = await cdp.send('Target.createTarget', { url: 'about:blank' }, undefined, remaining()); const attached = await cdp.send('Target.attachToTarget', { targetId: created.targetId, flatten: true }, undefined, remaining()); return new Page(created.targetId, attached.sessionId, cdp); }
+  private async createPage(cdp = this.cdp!, deadline = Date.now() + 30_000) { const remaining = () => { const ms = deadline - Date.now(); if (ms <= 0) fail('BROWSER_UNAVAILABLE', 'ChatGPT target creation exceeded its broker deadline.'); return Math.min(30_000, ms); }; const created = await cdp.send('Target.createTarget', { url: 'about:blank' }, undefined, remaining()); const attached = await cdp.send('Target.attachToTarget', { targetId: created.targetId, flatten: true }, undefined, remaining()); return new Page(created.targetId, attached.sessionId, cdp, this.display ?? this.startingDisplay); }
   private async closePage(sessionId: string, page: Page): Promise<void> {
     await closeTargetAndVerify(
       () => page.close(),

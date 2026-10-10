@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { brokerSocket, chromeArguments, chromeEnvironment, classifySubmissionEvidence, closeTargetAndVerify, privateDisplayArguments, privateDisplayFromOutput, privateXAuthority, SEND_BUTTON_LABEL_PATTERN } from '../src/broker.js';
+import { brokerSocket, chromeArguments, chromeEnvironment, classifySubmissionEvidence, closeTargetAndVerify, privateDisplayArguments, privateDisplayFromOutput, privateXAuthority, SEND_BUTTON_LABEL_PATTERN, viewportPointToXScreen } from '../src/broker.js';
 
 test('uses a short hashed owner-runtime socket path for deep repositories', () => {
   const root = `/tmp/${'deep/'.repeat(80)}repository`;
@@ -89,6 +89,12 @@ test('keeps Linux Chrome headful and selects the private X11 display', () => {
 
 test('does not select the X11 backend for non-Linux Chrome', () => {
   assert.ok(!chromeArguments('/tmp/chatgpt-shot-profile', 'darwin').includes('--ozone-platform=x11'));
+});
+
+test('maps browser viewport coordinates to the private X11 screen including Chrome chrome and scale', () => {
+  assert.deepEqual(viewportPointToXScreen(30, 40, {
+    screenX: 10, screenY: 20, outerHeight: 900, innerHeight: 800, devicePixelRatio: 1.5,
+  }), { x: 60, y: 240 });
 });
 
 test('classifies browser delivery from observable prompt evidence and prioritizes a visible message marker', () => {
