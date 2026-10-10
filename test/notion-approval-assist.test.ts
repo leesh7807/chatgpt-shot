@@ -158,6 +158,87 @@ test('opt-in approval observation captures the target before and after click and
   assert.deepEqual(targets, [{ x: 100, y: 80 }, { x: 100, y: 80 }]);
 });
 
+test('approval retries move through fresh copies of the same conversation and stop after three tabs', async () => {
+  const page = (label: string, probes: Array<{ status: 'ready'; target: { x: number; y: number } } | { status: 'not_present' }>) => {
+    const clicks: string[] = [];
+    return {
+      clicks,
+      async within<T>(_deadline: number, operation: () => Promise<T>) { return operation(); },
+      async evaluate<T>() { return (probes.shift() ?? { status: 'not_present' }) as T; },
+      async clickAt() { clicks.push(label); return { status: 'clicked' as const }; },
+    };
+  };
+  const ready = { status: 'ready' as const, target: { x: 100, y: 80 } };
+  const primary = page('tab-1', [ready, { status: 'not_present' }]);
+  const second = page('tab-2', [ready]);
+  const third = page('tab-3', [ready]);
+  const freshPages = [second, third];
+  const opened: string[] = [];
+  const tabs = {
+    async currentUrl() { return 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb'; },
+    async openConversationTab(url: string) { opened.push(url); return freshPages.shift()!; },
+  };
+
+  assert.deepEqual(await checkAndAllowNotionUpdate(primary, undefined, tabs), {
+    status: 'click_reported', attemptedChoice: 'always_allow', tabIndex: 1,
+  });
+  assert.deepEqual(await checkAndAllowNotionUpdate(primary, undefined, tabs), {
+    status: 'click_reported', attemptedChoice: 'always_allow', tabIndex: 2, openedFreshTab: true,
+  });
+  assert.deepEqual(await checkAndAllowNotionUpdate(primary, undefined, tabs), {
+    status: 'click_reported', attemptedChoice: 'always_allow', tabIndex: 3, openedFreshTab: true,
+  });
+  assert.deepEqual(await checkAndAllowNotionUpdate(primary, undefined, tabs), { status: 'not_present' });
+  assert.deepEqual(primary.clicks, ['tab-1']);
+  assert.deepEqual(second.clicks, ['tab-2']);
+  assert.deepEqual(third.clicks, ['tab-3']);
+  assert.deepEqual(opened, [
+    'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb',
+    'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb',
+  ]);
+});
+
+test('a missing card in a fresh tab returns to the original tab for later approvals', async () => {
+  const makePage = (probes: Array<{ status: 'ready'; target: { x: number; y: number } } | { status: 'not_present' }>) => {
+    const clicks: number[] = [];
+    return {
+      clicks,
+      async within<T>(_deadline: number, operation: () => Promise<T>) { return operation(); },
+      async evaluate<T>() { return (probes.shift() ?? { status: 'not_present' }) as T; },
+      async clickAt(x: number) { clicks.push(x); return { status: 'clicked' as const }; },
+    };
+  };
+  const primary = makePage([
+    { status: 'ready', target: { x: 100, y: 80 } },
+    { status: 'not_present' },
+    { status: 'ready', target: { x: 100, y: 80 } },
+  ]);
+  const second = makePage([{ status: 'not_present' }]);
+  const third = makePage([{ status: 'ready', target: { x: 120, y: 90 } }]);
+  const freshPages = [second, third];
+  let opened = 0;
+  const tabs = {
+    async currentUrl() { return 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb'; },
+    async openConversationTab() { opened++; return freshPages.shift()!; },
+  };
+  await checkAndAllowNotionUpdate(primary, undefined, tabs);
+  assert.deepEqual(await checkAndAllowNotionUpdate(primary, undefined, tabs), {
+    status: 'not_present', tabIndex: 2, openedFreshTab: true,
+  });
+  assert.deepEqual(await checkAndAllowNotionUpdate(primary, undefined, tabs), { status: 'not_present' });
+  assert.deepEqual(await checkAndAllowNotionUpdate(primary, undefined, tabs), {
+    status: 'click_reported', attemptedChoice: 'always_allow', tabIndex: 1,
+  });
+  assert.deepEqual(await checkAndAllowNotionUpdate(primary, undefined, tabs), {
+    status: 'click_reported', attemptedChoice: 'always_allow', tabIndex: 3, openedFreshTab: true,
+  });
+  assert.deepEqual(await checkAndAllowNotionUpdate(primary, undefined, tabs), { status: 'not_present' });
+  assert.equal(opened, 2);
+  assert.deepEqual(primary.clicks, [100, 100]);
+  assert.deepEqual(second.clicks, []);
+  assert.deepEqual(third.clicks, [120]);
+});
+
 test('service-facing assist adapter keeps browser failures best-effort', async () => {
   assert.deepEqual(await recoverNotionWriteAccess({ async requestNotionApprovalAssist() { throw new Error('broker unavailable'); } }), { status: 'unavailable', reason: 'broker_unavailable' });
 });

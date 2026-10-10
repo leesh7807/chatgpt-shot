@@ -111,13 +111,15 @@ chatgpt-shot attempts
 chatgpt-shot attempts <uuid>
 ```
 
-For an opt-in approval UI investigation, add `--observe-approval` to `submit`. When the broker finds and clicks a Notion approval button, it saves a small screenshot region before and after the click, then adds the filenames and follow-up probe result to that click's existing `attempts` record. Screenshots are stored owner-only at `$XDG_CACHE_HOME/chatgpt-shot/observations/<job-uuid>/` (or `~/.cache/chatgpt-shot/observations/<job-uuid>/`). No screenshot or log entry is produced when the button is absent. These screenshots can contain nearby ChatGPT page content, so use this opt-in only when local image artifacts are appropriate.
+If a click is followed by another `pending` Notion read, the broker opens the same conversation in a fresh tab and checks for the card there. It clicks only when the card is visible and uses at most three submission tabs per Job. If a fresh tab has no card, that tab branch stops and the original tab remains under observation for later approvals. Notion State remains authoritative. The broker closes all submission and approval tabs before handing an accepted Job back to the caller.
+
+For an opt-in approval UI investigation, add `--observe-approval` to `submit`. When the broker finds and clicks a Notion approval button, it saves a small screenshot region before and after the click, then adds the filenames, tab index, and follow-up probe result to that click's existing `attempts` record. A fresh tab with no approval card is recorded in the attempt trail without a screenshot. Screenshots are stored owner-only at `$XDG_CACHE_HOME/chatgpt-shot/observations/<job-uuid>/` (or `~/.cache/chatgpt-shot/observations/<job-uuid>/`). These screenshots can contain nearby ChatGPT page content, so use this opt-in only when local image artifacts are appropriate.
 
 ```sh
 chatgpt-shot submit --observe-approval "Search Notion for the page named Example and report whether it exists. Do not create or edit anything."
 ```
 
-This is local-only diagnostic data, not a public Job surface or an additional Job lifecycle. It is not written to the Notion Invocation and does not change `submit`, `jobs`, acknowledgement, cleanup, or remote State behavior. Delete `$XDG_CACHE_HOME/chatgpt-shot/jobs.jsonl` and `$XDG_CACHE_HOME/chatgpt-shot/observations/` to remove the local diagnostics and approval screenshots.
+This is local-only diagnostic data, not a public Job surface or an additional Job lifecycle. It is not written to the Notion Invocation and does not change the `submit` or `jobs` contract, acknowledgement, or remote State behavior. Delete `$XDG_CACHE_HOME/chatgpt-shot/jobs.jsonl` and `$XDG_CACHE_HOME/chatgpt-shot/observations/` to remove the local diagnostics and approval screenshots.
 
 ## Local HTTP contract
 

@@ -281,28 +281,33 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
         if (accepted(current.state) || !observedInTime) break;
         if (current.state !== 'pending') fail('INVALID_INVOCATION_STATE', `Invocation ${id} has invalid State ${current.state}.`);
         const recoveryStartedAt = performance.now();
-        // Retry approval on each pending read; absent prompts are silent, and clicks never end this loop.
+        // Retry while pending; fresh-tab absence is logged, and clicks never end this loop.
         const recovery = await recoverNotionWriteAccess(browser);
-        if (recovery && recovery.status !== 'not_present') {
+        if (recovery && (recovery.status !== 'not_present' || recovery.openedFreshTab === true)) {
+          const attemptedChoice = 'attemptedChoice' in recovery ? recovery.attemptedChoice : undefined;
           const buttonFound = recovery.status === 'click_reported'
             || recovery.status === 'click_unconfirmed'
-            || recovery.attemptedChoice === 'always_allow';
+            || attemptedChoice === 'always_allow';
           const clickAttempted = recovery.status === 'click_reported'
             || recovery.status === 'click_unconfirmed'
-            || recovery.attemptedChoice === 'always_allow';
+            || attemptedChoice === 'always_allow';
           event('notion_write_access_recovery', {
             stage,
             outcome: recovery.status === 'click_reported'
               ? 'approval_button_click_reported'
               : recovery.status === 'click_unconfirmed'
                 ? 'approval_button_click_unconfirmed'
-                : 'approval_assist_unavailable',
+                : recovery.status === 'not_present'
+                  ? 'approval_card_not_present_in_fresh_tab'
+                  : 'approval_assist_unavailable',
             duration_ms: performance.now() - recoveryStartedAt,
             details: {
               ...(buttonFound ? { button_found: true } : {}),
               ...(clickAttempted ? { click_attempted: true } : {}),
               ...('reason' in recovery ? { reason: recovery.reason } : {}),
-              ...(recovery.attemptedChoice ? { attempted_choice: recovery.attemptedChoice } : {}),
+              ...(attemptedChoice ? { attempted_choice: attemptedChoice } : {}),
+              ...(recovery.tabIndex !== undefined ? { tab_index: recovery.tabIndex } : {}),
+              ...(recovery.openedFreshTab !== undefined ? { opened_fresh_tab: recovery.openedFreshTab } : {}),
               ...(recovery.beforeArtifact ? { before_artifact: recovery.beforeArtifact } : {}),
               ...(recovery.afterArtifact ? { after_artifact: recovery.afterArtifact } : {}),
               ...(recovery.postClickProbe ? { post_click_probe: recovery.postClickProbe } : {}),

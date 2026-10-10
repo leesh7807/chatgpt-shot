@@ -7,7 +7,13 @@ export type NotionApprovalReason =
   | 'invalid_result';
 
 export type ApprovalScreenshot = { frame: 'before_click' | 'after_click'; png: string };
-type ApprovalObservation = { beforeArtifact?: string; afterArtifact?: string; postClickProbe?: 'not_present' | 'ready' | 'probe_failed' };
+type ApprovalObservation = {
+  beforeArtifact?: string;
+  afterArtifact?: string;
+  postClickProbe?: 'not_present' | 'ready' | 'probe_failed';
+  tabIndex?: number;
+  openedFreshTab?: boolean;
+};
 
 export type NotionApprovalCheck =
   | ({ status: 'not_present' } & Partial<ApprovalObservation>)
@@ -91,23 +97,110 @@ export interface NotionApprovalPage {
   captureAround?(x: number, y: number): Promise<string>;
 }
 
-/** Find the Notion prompt and report the trusted click result; the caller retries while pending. */
+export interface NotionApprovalTabControl {
+  currentUrl(): Promise<string>;
+  openConversationTab(url: string): Promise<NotionApprovalPage>;
+}
+
+type ApprovalTabState = {
+  tabCount: number;
+  activeTabIndex: number;
+  activePage: NotionApprovalPage;
+  openNextTab: boolean;
+};
+
+const MAX_APPROVAL_TABS = 3;
+const approvalTabStates = new WeakMap<NotionApprovalPage, ApprovalTabState>();
+const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+function isChatGptConversationUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname === 'chatgpt.com' && /^\/c\/[A-Za-z0-9_-]+\/?$/.test(url.pathname);
+  } catch { return false; }
+}
+
+async function inspectFreshTab(page: NotionApprovalPage): Promise<Probe | 'probe_failed'> {
+  const deadline = Date.now() + 5_000;
+  let probeSucceeded = false;
+  while (Date.now() < deadline) {
+    try {
+      const result = await page.within(Math.min(deadline, Date.now() + 1_200), () => page.evaluate<Probe>(serializedNotionApprovalPageProbe()));
+      probeSucceeded = true;
+      if (result.status === 'ready') return result;
+    } catch { /* A newly opened conversation can still be hydrating. */ }
+    await delay(250);
+  }
+  return probeSucceeded ? { status: 'not_present' } : 'probe_failed';
+}
+
+/** Check the active conversation tab, then advance to a fresh tab after each pending read and click. */
 export async function checkAndAllowNotionUpdate(
   page: NotionApprovalPage,
   writeScreenshot?: (screenshot: ApprovalScreenshot) => string | undefined,
+  tabControl?: NotionApprovalTabControl,
 ): Promise<NotionApprovalCheck> {
+  let state = approvalTabStates.get(page);
+
+  let activePage = state?.activePage ?? page;
+  let tabIndex = state?.activeTabIndex ?? 1;
+  let openedFreshTab = false;
+  if (state?.openNextTab && tabControl) {
+    const nextTabIndex = state.tabCount + 1;
+    if (nextTabIndex > MAX_APPROVAL_TABS) {
+      state.openNextTab = false;
+      activePage = page;
+      tabIndex = 1;
+    } else {
+      try {
+        const url = await tabControl.currentUrl();
+        if (!isChatGptConversationUrl(url)) {
+          state.openNextTab = false;
+          state.activePage = page;
+          state.activeTabIndex = 1;
+          activePage = page;
+          tabIndex = 1;
+          return { status: 'unavailable', reason: 'target_mismatch', tabIndex: nextTabIndex };
+        }
+        activePage = await tabControl.openConversationTab(url);
+        tabIndex = nextTabIndex;
+        state = { tabCount: nextTabIndex, activeTabIndex: tabIndex, activePage, openNextTab: false };
+        approvalTabStates.set(page, state);
+        openedFreshTab = true;
+      } catch {
+        return { status: 'unavailable', reason: 'broker_unavailable', tabIndex: nextTabIndex };
+      }
+    }
+  }
+
   const expression = serializedNotionApprovalPageProbe();
-  const inspect = () => page.within(Date.now() + 1_200, () => page.evaluate<Probe>(expression));
+  const inspect = () => activePage.within(Date.now() + 1_200, () => activePage.evaluate<Probe>(expression));
   let before: Probe;
-  try { before = await inspect(); }
-  catch { return { status: 'unavailable', reason: 'probe_failed' }; }
-  if (before.status === 'not_present') return { status: 'not_present' };
+  if (openedFreshTab) {
+    const result = await inspectFreshTab(activePage);
+    if (result === 'probe_failed') {
+      state!.activePage = page;
+      state!.activeTabIndex = 1;
+      return { status: 'unavailable', reason: 'probe_failed', tabIndex, openedFreshTab: true };
+    }
+    before = result;
+  } else {
+    try { before = await inspect(); }
+    catch { return { status: 'unavailable', reason: 'probe_failed', ...(state ? { tabIndex } : {}) }; }
+  }
+  if (before.status === 'not_present') {
+    if (openedFreshTab && state) {
+      state.activePage = page;
+      state.activeTabIndex = 1;
+    }
+    return { status: 'not_present', ...(openedFreshTab ? { tabIndex, openedFreshTab: true } : {}) };
+  }
 
   const artifacts: Pick<ApprovalObservation, 'beforeArtifact' | 'afterArtifact'> = {};
   const capture = async (frame: ApprovalScreenshot['frame']) => {
-    if (!writeScreenshot || !page.captureAround) return;
+    if (!writeScreenshot || !activePage.captureAround) return;
     try {
-      const png = await page.within(Date.now() + 1_500, () => page.captureAround!(before.target.x, before.target.y));
+      const png = await activePage.within(Date.now() + 1_500, () => activePage.captureAround!(before.target.x, before.target.y));
       const artifact = writeScreenshot({ frame, png });
       if (artifact) artifacts[frame === 'before_click' ? 'beforeArtifact' : 'afterArtifact'] = artifact;
     }
@@ -117,11 +210,20 @@ export async function checkAndAllowNotionUpdate(
 
   let click: Awaited<ReturnType<NotionApprovalPage['clickAt']>>;
   try {
-    click = await page.within(Date.now() + 1_500, () => page.clickAt(before.target.x, before.target.y, {
+    click = await activePage.within(Date.now() + 1_500, () => activePage.clickAt(before.target.x, before.target.y, {
       label: 'Always allow',
       context: ['Notion'],
     }));
-  } catch { return { status: 'unavailable', reason: 'broker_unavailable', attemptedChoice: 'always_allow' }; }
+  } catch {
+    if (tabControl) {
+      state ??= { tabCount: 1, activeTabIndex: 1, activePage: page, openNextTab: false };
+      state.activeTabIndex = tabIndex;
+      state.activePage = activePage;
+      state.openNextTab = state.tabCount < MAX_APPROVAL_TABS;
+      approvalTabStates.set(page, state);
+    }
+    return { status: 'unavailable', reason: 'broker_unavailable', attemptedChoice: 'always_allow', ...(tabControl ? { tabIndex, ...(openedFreshTab ? { openedFreshTab: true } : {}) } : {}) };
+  }
   if (writeScreenshot) await new Promise(resolve => setTimeout(resolve, 500));
   let postClickProbe: ApprovalObservation['postClickProbe'];
   if (writeScreenshot) {
@@ -129,7 +231,21 @@ export async function checkAndAllowNotionUpdate(
     catch { postClickProbe = 'probe_failed'; }
     await capture('after_click');
   }
-  const observation = writeScreenshot ? { ...artifacts, postClickProbe } : {};
+  const observation = {
+    ...(writeScreenshot ? { ...artifacts, postClickProbe } : {}),
+    ...(tabControl ? { tabIndex, ...(openedFreshTab ? { openedFreshTab: true } : {}) } : {}),
+  };
+  if (tabControl) {
+    state ??= { tabCount: 1, activeTabIndex: 1, activePage: page, openNextTab: false };
+    state.activeTabIndex = tabIndex;
+    state.activePage = activePage;
+    state.openNextTab = state.tabCount < MAX_APPROVAL_TABS;
+    if (state.tabCount >= MAX_APPROVAL_TABS) {
+      state.activePage = page;
+      state.activeTabIndex = 1;
+    }
+    approvalTabStates.set(page, state);
+  }
   if (click.status !== 'clicked') return { status: 'click_unconfirmed', reason: click.status, attemptedChoice: 'always_allow', ...observation };
   return { status: 'click_reported', attemptedChoice: 'always_allow', ...observation };
 }

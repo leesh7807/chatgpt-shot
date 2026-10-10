@@ -47,7 +47,7 @@ class Browser {
   closeError?: Error;
   approvalChecks = 0;
   approvalError?: Error;
-  async requestNotionApprovalAssist() { this.approvalChecks++; if (this.approvalChecks === 1 && this.approvalError) throw this.approvalError; return { status: 'click_reported' as const, attemptedChoice: 'always_allow' as const }; }
+  async requestNotionApprovalAssist(): Promise<any> { this.approvalChecks++; if (this.approvalChecks === 1 && this.approvalError) throw this.approvalError; return { status: 'click_reported' as const, attemptedChoice: 'always_allow' as const }; }
   async withBrowser<T>(operation: () => Promise<T>): Promise<T> {
     let value!: T; let operationError: unknown;
     try { value = await operation(); } catch (error) { operationError = error; }
@@ -188,6 +188,25 @@ test('pending approval assist runs only while Notion remains pending and never c
     'approval_button_click_reported',
   ]);
   await repeating.completion;
+});
+
+test('records when a fresh conversation tab no longer shows the approval card', async () => {
+  const browser = new Browser();
+  browser.requestNotionApprovalAssist = async () => {
+    browser.approvalChecks++;
+    return browser.approvalChecks === 1
+      ? { status: 'click_reported' as const, attemptedChoice: 'always_allow' as const, tabIndex: 1 }
+      : { status: 'not_present' as const, tabIndex: 2, openedFreshTab: true };
+  };
+  const telemetry = new Telemetry();
+  const result = await startJob(new Store(['pending', 'pending', 'in_progress', 'completed']) as any, 'db', browser as any, 'task', 'job-fresh-tab-observation', { ...options, telemetry });
+  const recoveries = telemetry.events.filter(item => item.event === 'notion_write_access_recovery');
+  assert.deepEqual(recoveries.map(item => item.outcome), [
+    'approval_button_click_reported',
+    'approval_card_not_present_in_fresh_tab',
+  ]);
+  assert.deepEqual(recoveries[1].details, { tab_index: 2, opened_fresh_tab: true });
+  await result.completion;
 });
 
 test('only confirmed non-delivery permits Invocation cleanup', async () => {

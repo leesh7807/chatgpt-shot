@@ -334,6 +334,7 @@ class Broker {
   private controlAuth?: Promise<{ loginVisible: boolean; accountVisible: boolean; authenticated: boolean }>;
   private controlRecovery?: Promise<void>;
   private readonly pages = new Map<string, Page>();
+  private readonly approvalTabs = new Map<string, Page[]>();
   private readonly diagnosticPrompts = new Map<string, string>();
   private readonly diagnosticPaths = new Map<string, string>();
   constructor(private readonly root: string) {}
@@ -367,7 +368,7 @@ class Broker {
       const input = child.stdio[3], output = child.stdio[4]; if (!input || !output) fail('BROWSER_UNAVAILABLE', 'Chrome did not create its private debugging pipe.');
       cdp = new PipeCdp(input as NodeJS.WritableStream, output as NodeJS.ReadableStream); this.startingChild = child; this.startingCdp = cdp;
       child.once('exit', () => {
-        if (this.process === child) { this.process = undefined; this.cdp = undefined; this.control = undefined; this.pages.clear(); }
+        if (this.process === child) { this.process = undefined; this.cdp = undefined; this.control = undefined; this.pages.clear(); this.approvalTabs.clear(); }
         if (virtual && virtual === this.display) { this.display = undefined; void this.terminateDisplay(virtual); }
       });
       const deadline = Date.now() + 150_000; const control = await this.createPage(cdp, deadline); await control.within(deadline, async () => { await control.navigate(); await this.ready(control); }); if (this.stopping) throw new Error('Broker shutdown began during startup.');
@@ -380,13 +381,24 @@ class Broker {
   }
   private async createPage(cdp = this.cdp!, deadline = Date.now() + 30_000) { const remaining = () => { const ms = deadline - Date.now(); if (ms <= 0) fail('BROWSER_UNAVAILABLE', 'ChatGPT target creation exceeded its broker deadline.'); return Math.min(30_000, ms); }; const created = await cdp.send('Target.createTarget', { url: 'about:blank' }, undefined, remaining()); const attached = await cdp.send('Target.attachToTarget', { targetId: created.targetId, flatten: true }, undefined, remaining()); return new Page(created.targetId, attached.sessionId, cdp, this.display ?? this.startingDisplay); }
   private async closePage(sessionId: string, page: Page): Promise<void> {
-    await closeTargetAndVerify(
-      () => page.close(),
+    const closeTarget = async (target: Page) => closeTargetAndVerify(
+      () => target.close(),
       async () => {
         const targets = await this.cdp!.send('Target.getTargets', {}, undefined, 5_000);
-        return (targets.targetInfos ?? []).some((target: any) => target.targetId === page.targetId);
+        return (targets.targetInfos ?? []).some((item: any) => item.targetId === target.targetId);
       },
     );
+    let closeError: unknown;
+    const related = this.approvalTabs.get(sessionId) ?? [];
+    for (let index = related.length - 1; index >= 0; index--) {
+      try { await closeTarget(related[index]); related.splice(index, 1); }
+      catch (error) { closeError ??= error; }
+    }
+    if (related.length) this.approvalTabs.set(sessionId, related);
+    else this.approvalTabs.delete(sessionId);
+    try { await closeTarget(page); }
+    catch (error) { closeError ??= error; }
+    if (closeError) throw closeError;
     this.pages.delete(sessionId);
     this.diagnosticPrompts.delete(sessionId);
     this.diagnosticPaths.delete(sessionId);
@@ -456,7 +468,42 @@ class Broker {
       if (request.operation === 'notion-approval-assist') {
         if (request.observeApproval && !request.jobId) fail('INTERNAL_ERROR', 'Approval observation requires a Job ID.');
         const observations = request.observeApproval ? new LocalApprovalObservationWriter(request.jobId!) : undefined;
-        return checkAndAllowNotionUpdate(page, observations ? screenshot => observations.write(screenshot) : undefined);
+        const tabControl = {
+          currentUrl: () => page.evaluate<string>('()=>location.href'),
+          openConversationTab: async (url: string) => {
+            let conversation: URL;
+            try { conversation = new URL(url); }
+            catch { return fail('BROWSER_UNAVAILABLE', 'The current ChatGPT conversation URL is invalid.'); }
+            if (conversation.protocol !== 'https:' || conversation.hostname !== 'chatgpt.com' || !/^\/c\/[A-Za-z0-9_-]+\/?$/.test(conversation.pathname)) {
+              return fail('BROWSER_UNAVAILABLE', 'A fresh approval tab requires the submitted ChatGPT conversation.');
+            }
+            const deadline = Date.now() + 20_000;
+            const tab = await this.createPage(this.cdp!, deadline);
+            try {
+              await tab.within(deadline, async () => {
+                await tab.navigate(conversation.href);
+                await this.ready(tab);
+                const currentUrl = await tab.evaluate<string>('()=>location.href');
+                if (new URL(currentUrl).pathname !== conversation.pathname) fail('BROWSER_UNAVAILABLE', 'The fresh tab did not load the submitted ChatGPT conversation.');
+              });
+              const tabs = this.approvalTabs.get(request.sessionId!) ?? [];
+              if (tabs.length >= 2) fail('BROWSER_UNAVAILABLE', 'The approval tab limit for this Job has been reached.');
+              tabs.push(tab);
+              this.approvalTabs.set(request.sessionId!, tabs);
+              return tab;
+            } catch (error) {
+              await closeTargetAndVerify(
+                () => tab.close(),
+                async () => {
+                  const targets = await this.cdp!.send('Target.getTargets', {}, undefined, 5_000);
+                  return (targets.targetInfos ?? []).some((item: any) => item.targetId === tab.targetId);
+                },
+              ).catch(() => {});
+              throw error;
+            }
+          },
+        };
+        return checkAndAllowNotionUpdate(page, observations ? screenshot => observations.write(screenshot) : undefined, tabControl);
       }
       if (request.operation === 'fill') {
         const deadline = Date.now() + 45_000;
@@ -551,7 +598,7 @@ export const brokerRequest = async (root: string, request: Request): Promise<any
   // never time out while the broker can still perform that side effect.
   // ensure may cold-start Chrome, create/attach a target, navigate, and wait for readiness.
   // Its caller must outlive every bounded private-CDP operation in that startup path.
-  const timeoutMs = request.operation === 'ensure' ? 180_000 : request.operation === 'submit' ? 95_000 : request.operation === 'open' || request.operation === 'shutdown' ? 90_000 : request.operation === 'fill' || request.operation === 'auth' ? 60_000 : request.operation === 'notion-approval-assist' ? request.observeApproval ? 15_000 : 8_000 : 15_000;
+  const timeoutMs = request.operation === 'ensure' ? 180_000 : request.operation === 'submit' ? 95_000 : request.operation === 'open' || request.operation === 'shutdown' ? 90_000 : request.operation === 'fill' || request.operation === 'auth' ? 60_000 : request.operation === 'notion-approval-assist' ? 30_000 : 15_000;
   const timeout = setTimeout(() => finish(new Error('Broker RPC timed out.')), timeoutMs);
   socket.setEncoding('utf8'); socket.once('error', (error) => finish(error)); socket.on('data', chunk => { body += chunk; }); socket.on('end', () => { try { const response = JSON.parse(body) as Response; if (!response.ok) { const error: any = new Error(response.message); error.code = response.code; finish(error); } else finish(undefined, response.value); } catch (error: any) { finish(error); } }); socket.end(JSON.stringify(request));
 });
