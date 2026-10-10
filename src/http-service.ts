@@ -247,8 +247,8 @@ export async function runService(): Promise<void> {
     req.once('aborted', clearBodyDeadline); req.once('close', clearBodyDeadline); req.setEncoding('utf8'); req.on('data', chunk => body += chunk); req.on('end', async () => {
       clearBodyDeadline();
       try {
-        const input = JSON.parse(body); const prompt = input?.prompt; const diagnostics = input?.diagnostics === true; const fields = input && typeof input === 'object' && !Array.isArray(input) ? Object.keys(input) : [];
-        if (!input || typeof input !== 'object' || Array.isArray(input) || typeof prompt !== 'string' || !prompt.trim() || fields.some(field => field !== 'prompt' && field !== 'diagnostics') || (input.diagnostics !== undefined && typeof input.diagnostics !== 'boolean')) fail('CONFIG_INVALID', 'jobs requires a non-empty prompt and an optional diagnostics boolean.');
+        const input = JSON.parse(body); const prompt = input?.prompt; const diagnostics = input?.diagnostics === true; const observeApproval = input?.observeApproval === true; const fields = input && typeof input === 'object' && !Array.isArray(input) ? Object.keys(input) : [];
+        if (!input || typeof input !== 'object' || Array.isArray(input) || typeof prompt !== 'string' || !prompt.trim() || fields.some(field => field !== 'prompt' && field !== 'diagnostics' && field !== 'observeApproval') || (input.diagnostics !== undefined && typeof input.diagnostics !== 'boolean') || (input.observeApproval !== undefined && typeof input.observeApproval !== 'boolean')) fail('CONFIG_INVALID', 'jobs requires a non-empty prompt and optional diagnostics and observeApproval booleans.');
         const id = randomUUID();
         telemetry = new JobTelemetrySession(id);
         const event = (name: JobTelemetryInput['event'], fields: Omit<JobTelemetryInput, 'event'> = {}) => telemetry!.record({ event: name, ...fields });
@@ -283,7 +283,7 @@ export async function runService(): Promise<void> {
         telemetryDelegated = true;
         browserAdmissions++;
         let run: Awaited<ReturnType<typeof startJob>>;
-        try { run = await startJob(store, databaseId, new ChatGPTBrowser(current.browserProfilePath, undefined, diagnostics), prompt, id, { acknowledgementMs: current.acknowledgementMs, signal: requestAdmission.signal, diagnostics, telemetrySession: telemetry }); }
+        try { run = await startJob(store, databaseId, new ChatGPTBrowser(current.browserProfilePath, undefined, diagnostics, observeApproval, id), prompt, id, { acknowledgementMs: current.acknowledgementMs, signal: requestAdmission.signal, diagnostics, telemetrySession: telemetry }); }
         finally { browserAdmissions--; }
         active++; void run.completion.catch(() => {}).finally(() => { active--; });
         return json(res, 200, { id });

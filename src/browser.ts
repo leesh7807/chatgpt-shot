@@ -15,7 +15,7 @@ const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const pendingBrokerStarts = new Map<string, Promise<void>>();
 const profilePath = (profile: string) => profile;
 const systemChrome = () => [process.env.CHATGPT_SHOT_BROWSER, '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome'].find((path): path is string => Boolean(path && existsSync(path)));
-async function request(root: string, operation: string, sessionId?: string, prompt?: string, submissionMarker?: string, send: typeof brokerRequest = brokerRequest, diagnostics = false) { try { return await send(root, { operation, sessionId, prompt, submissionMarker, ...(diagnostics ? { diagnostics: true } : {}) }); } catch (error: any) { if (error.code) return fail(error.code, error.message, error); throw error; } }
+async function request(root: string, operation: string, sessionId?: string, prompt?: string, submissionMarker?: string, send: typeof brokerRequest = brokerRequest, diagnostics = false, observeApproval = false, jobId?: string) { try { return await send(root, { operation, sessionId, prompt, submissionMarker, ...(diagnostics ? { diagnostics: true } : {}), ...(observeApproval && operation === 'notion-approval-assist' ? { observeApproval: true, jobId } : {}) }); } catch (error: any) { if (error.code) return fail(error.code, error.message, error); throw error; } }
 export async function ensureBroker(profile: string) {
   const assertProfileAvailable = () => { if (existsSync(paths().manualOpenLockPath)) fail('SERVICE_BUSY', 'The retained browser profile is open for manual use.'); };
   const absent = (error: any) => error?.code === 'ENOENT' || error?.code === 'ECONNREFUSED';
@@ -71,8 +71,8 @@ export class ChatGPTBrowser implements BrowserTransport {
   private readonly diagnostics: BrowserDiagnosticEntry[] = [];
   private diagnosticStartedAt?: number;
   private observationTask?: Promise<void>;
-  constructor(private readonly profile: string, private readonly send: typeof brokerRequest = brokerRequest, private readonly diagnosticsEnabled = false) {}
-  private async rpc(operation: string, sessionId?: string, prompt?: string, submissionMarker?: string) { return request(this.profile, operation, sessionId, prompt, submissionMarker, this.send, this.diagnosticsEnabled); }
+  constructor(private readonly profile: string, private readonly send: typeof brokerRequest = brokerRequest, private readonly diagnosticsEnabled = false, private readonly observeApproval = false, private readonly jobId?: string) {}
+  private async rpc(operation: string, sessionId?: string, prompt?: string, submissionMarker?: string) { return request(this.profile, operation, sessionId, prompt, submissionMarker, this.send, this.diagnosticsEnabled, this.observeApproval, this.jobId); }
   private recordDiagnostic(stage: string, value: Record<string, unknown>) {
     if (!this.diagnosticsEnabled) return;
     this.diagnosticStartedAt ??= Date.now();

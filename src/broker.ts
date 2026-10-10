@@ -6,8 +6,9 @@ import { homedir } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { fail, isStaleBrowserSessionError } from './errors.js';
 import { checkAndAllowNotionUpdate } from './notion-approval-assist.js';
+import { LocalApprovalObservationWriter } from './approval-observation.js';
 
-type Request = { operation: string; sessionId?: string; prompt?: string; submissionMarker?: string; diagnostics?: boolean };
+type Request = { operation: string; sessionId?: string; prompt?: string; submissionMarker?: string; diagnostics?: boolean; observeApproval?: boolean; jobId?: string };
 type Response = { ok: true; value?: unknown } | { ok: false; code: string; message: string };
 type Message = { id?: number; sessionId?: string; result?: any; error?: { message: string } };
 export type SubmissionEvidence = { seen: boolean; composerValue: string };
@@ -192,6 +193,19 @@ class Page {
       return { status: 'click_not_received' };
     }
   }
+  async captureAround(x: number, y: number): Promise<string> {
+    const viewport = await this.evaluate<{ width: number; height: number }>('()=>({width:innerWidth,height:innerHeight})');
+    const width = Math.max(1, Math.min(760, viewport.width));
+    const height = Math.max(1, Math.min(520, viewport.height));
+    const left = Math.max(0, Math.min(viewport.width - width, x - width / 2));
+    const top = Math.max(0, Math.min(viewport.height - height, y - height / 2));
+    const result = await this.cdp.send('Page.captureScreenshot', {
+      format: 'png', fromSurface: true,
+      clip: { x: left, y: top, width, height, scale: 1 },
+    }, this.sessionId, this.remaining());
+    if (typeof result?.data !== 'string') throw new Error('Approval screenshot was not returned.');
+    return result.data;
+  }
   async navigate(url = 'https://chatgpt.com/') {
     await this.cdp.send('Page.enable', {}, this.sessionId, this.remaining());
     const result = await this.cdp.send('Page.navigate', { url }, this.sessionId, this.remaining());
@@ -361,7 +375,11 @@ class Broker {
       const page = request.sessionId ? this.pages.get(request.sessionId) : undefined;
       if (request.operation === 'close' && !page) return { closed: true, verified: true };
       if (!page) return fail('BROWSER_UNAVAILABLE', 'Browser invocation page is unavailable.');
-      if (request.operation === 'notion-approval-assist') return checkAndAllowNotionUpdate(page);
+      if (request.operation === 'notion-approval-assist') {
+        if (request.observeApproval && !request.jobId) fail('INTERNAL_ERROR', 'Approval observation requires a Job ID.');
+        const observations = request.observeApproval ? new LocalApprovalObservationWriter(request.jobId!) : undefined;
+        return checkAndAllowNotionUpdate(page, observations ? screenshot => observations.write(screenshot) : undefined);
+      }
       if (request.operation === 'fill') {
         const deadline = Date.now() + 45_000;
         await page.within(deadline, async () => {
@@ -455,7 +473,7 @@ export const brokerRequest = async (root: string, request: Request): Promise<any
   // never time out while the broker can still perform that side effect.
   // ensure may cold-start Chrome, create/attach a target, navigate, and wait for readiness.
   // Its caller must outlive every bounded private-CDP operation in that startup path.
-  const timeoutMs = request.operation === 'ensure' ? 180_000 : request.operation === 'submit' ? 95_000 : request.operation === 'open' || request.operation === 'shutdown' ? 90_000 : request.operation === 'fill' || request.operation === 'auth' ? 60_000 : request.operation === 'notion-approval-assist' ? 8_000 : 15_000;
+  const timeoutMs = request.operation === 'ensure' ? 180_000 : request.operation === 'submit' ? 95_000 : request.operation === 'open' || request.operation === 'shutdown' ? 90_000 : request.operation === 'fill' || request.operation === 'auth' ? 60_000 : request.operation === 'notion-approval-assist' ? request.observeApproval ? 15_000 : 8_000 : 15_000;
   const timeout = setTimeout(() => finish(new Error('Broker RPC timed out.')), timeoutMs);
   socket.setEncoding('utf8'); socket.once('error', (error) => finish(error)); socket.on('data', chunk => { body += chunk; }); socket.on('end', () => { try { const response = JSON.parse(body) as Response; if (!response.ok) { const error: any = new Error(response.message); error.code = response.code; finish(error); } else finish(undefined, response.value); } catch (error: any) { finish(error); } }); socket.end(JSON.stringify(request));
 });

@@ -6,11 +6,14 @@ export type NotionApprovalReason =
   | 'broker_unavailable'
   | 'invalid_result';
 
+export type ApprovalScreenshot = { frame: 'before_click' | 'after_click'; png: string };
+type ApprovalObservation = { beforeArtifact?: string; afterArtifact?: string; postClickProbe?: 'not_present' | 'ready' | 'probe_failed' };
+
 export type NotionApprovalCheck =
-  | { status: 'not_present' }
-  | { status: 'click_reported'; attemptedChoice: 'always_allow' }
-  | { status: 'click_unconfirmed'; reason: NotionApprovalReason; attemptedChoice: 'always_allow' }
-  | { status: 'unavailable'; reason: NotionApprovalReason; attemptedChoice?: 'always_allow' };
+  | ({ status: 'not_present' } & Partial<ApprovalObservation>)
+  | ({ status: 'click_reported'; attemptedChoice: 'always_allow' } & Partial<ApprovalObservation>)
+  | ({ status: 'click_unconfirmed'; reason: NotionApprovalReason; attemptedChoice: 'always_allow' } & Partial<ApprovalObservation>)
+  | ({ status: 'unavailable'; reason: NotionApprovalReason; attemptedChoice?: 'always_allow' } & Partial<ApprovalObservation>);
 
 export interface NotionApprovalBrowser {
   requestNotionApprovalAssist?(): Promise<unknown>;
@@ -85,16 +88,32 @@ export interface NotionApprovalPage {
   clickAt(x: number, y: number, expectation: { label: string; context: string[] }): Promise<{
     status: 'clicked' | 'target_mismatch' | 'target_obscured' | 'click_not_received';
   }>;
+  captureAround?(x: number, y: number): Promise<string>;
 }
 
 /** Find the Notion prompt and report the trusted click result; the caller retries while pending. */
-export async function checkAndAllowNotionUpdate(page: NotionApprovalPage): Promise<NotionApprovalCheck> {
+export async function checkAndAllowNotionUpdate(
+  page: NotionApprovalPage,
+  writeScreenshot?: (screenshot: ApprovalScreenshot) => string | undefined,
+): Promise<NotionApprovalCheck> {
   const expression = serializedNotionApprovalPageProbe();
   const inspect = () => page.within(Date.now() + 1_200, () => page.evaluate<Probe>(expression));
   let before: Probe;
   try { before = await inspect(); }
   catch { return { status: 'unavailable', reason: 'probe_failed' }; }
   if (before.status === 'not_present') return { status: 'not_present' };
+
+  const artifacts: Pick<ApprovalObservation, 'beforeArtifact' | 'afterArtifact'> = {};
+  const capture = async (frame: ApprovalScreenshot['frame']) => {
+    if (!writeScreenshot || !page.captureAround) return;
+    try {
+      const png = await page.within(Date.now() + 1_500, () => page.captureAround!(before.target.x, before.target.y));
+      const artifact = writeScreenshot({ frame, png });
+      if (artifact) artifacts[frame === 'before_click' ? 'beforeArtifact' : 'afterArtifact'] = artifact;
+    }
+    catch { /* Screenshot evidence must never change the approval click outcome. */ }
+  };
+  await capture('before_click');
 
   let click: Awaited<ReturnType<NotionApprovalPage['clickAt']>>;
   try {
@@ -103,6 +122,14 @@ export async function checkAndAllowNotionUpdate(page: NotionApprovalPage): Promi
       context: ['Notion'],
     }));
   } catch { return { status: 'unavailable', reason: 'broker_unavailable', attemptedChoice: 'always_allow' }; }
-  if (click.status !== 'clicked') return { status: 'click_unconfirmed', reason: click.status, attemptedChoice: 'always_allow' };
-  return { status: 'click_reported', attemptedChoice: 'always_allow' };
+  if (writeScreenshot) await new Promise(resolve => setTimeout(resolve, 500));
+  let postClickProbe: ApprovalObservation['postClickProbe'];
+  if (writeScreenshot) {
+    try { postClickProbe = (await inspect()).status; }
+    catch { postClickProbe = 'probe_failed'; }
+    await capture('after_click');
+  }
+  const observation = writeScreenshot ? { ...artifacts, postClickProbe } : {};
+  if (click.status !== 'clicked') return { status: 'click_unconfirmed', reason: click.status, attemptedChoice: 'always_allow', ...observation };
+  return { status: 'click_reported', attemptedChoice: 'always_allow', ...observation };
 }

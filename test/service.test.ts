@@ -150,6 +150,32 @@ test('pending approval assist runs only while Notion remains pending and never c
   assert.equal(noRecoveryTelemetry.events.some(item => item.event === 'notion_write_access_recovery'), false);
   await noRecovery.completion;
 
+  const artifactBrowser = new Browser();
+  artifactBrowser.requestNotionApprovalAssist = async () => {
+    artifactBrowser.approvalChecks++;
+    return {
+      status: 'click_reported' as const,
+      attemptedChoice: 'always_allow' as const,
+      postClickProbe: 'not_present' as const,
+      beforeArtifact: 'approval-001-before-click.png',
+      afterArtifact: 'approval-002-after-click.png',
+    };
+  };
+  const artifactTelemetry = new Telemetry();
+  const artifactResult = await startJob(new Store(['pending', 'in_progress', 'completed']) as any, 'db', artifactBrowser as any, 'task', 'job-observed-click', {
+    ...options,
+    telemetry: artifactTelemetry,
+  });
+  assert.deepEqual(artifactTelemetry.events.find(item => item.event === 'notion_write_access_recovery')?.details, {
+    button_found: true,
+    click_attempted: true,
+    attempted_choice: 'always_allow',
+    before_artifact: 'approval-001-before-click.png',
+    after_artifact: 'approval-002-after-click.png',
+    post_click_probe: 'not_present',
+  });
+  await artifactResult.completion;
+
   const repeatingBrowser = new Browser();
   const repeatingTelemetry = new Telemetry();
   const repeating = await startJob(new Store(['pending', 'pending', 'pending', 'in_progress', 'completed']) as any, 'db', repeatingBrowser as any, 'task', 'job-repeated-approval', { ...options, telemetry: repeatingTelemetry });

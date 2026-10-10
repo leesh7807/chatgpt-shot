@@ -127,6 +127,37 @@ test('assist reports the trusted click and leaves retry timing to the pending se
   assert.equal(probes, 1);
 });
 
+test('opt-in approval observation captures the target before and after click and reports the post-click probe', async () => {
+  const results = [
+    { status: 'ready', target: { x: 100, y: 80 } },
+    { status: 'not_present' },
+  ];
+  const screenshots: Array<{ frame: string; png: string }> = [];
+  const targets: Array<{ x: number; y: number }> = [];
+  const page = {
+    async within<T>(_deadline: number, operation: () => Promise<T>) { return operation(); },
+    async evaluate<T>(_expression: string) { return results.shift() as T; },
+    async clickAt() { return { status: 'clicked' as const }; },
+    async captureAround(x: number, y: number) { targets.push({ x, y }); return 'cG5n'; },
+  };
+  const result = await checkAndAllowNotionUpdate(page, screenshot => {
+    screenshots.push(screenshot);
+    return `approval-${screenshot.frame}.png`;
+  });
+  assert.deepEqual(result, {
+    status: 'click_reported',
+    attemptedChoice: 'always_allow',
+    beforeArtifact: 'approval-before_click.png',
+    afterArtifact: 'approval-after_click.png',
+    postClickProbe: 'not_present',
+  });
+  assert.deepEqual(screenshots, [
+    { frame: 'before_click', png: 'cG5n' },
+    { frame: 'after_click', png: 'cG5n' },
+  ]);
+  assert.deepEqual(targets, [{ x: 100, y: 80 }, { x: 100, y: 80 }]);
+});
+
 test('service-facing assist adapter keeps browser failures best-effort', async () => {
   assert.deepEqual(await recoverNotionWriteAccess({ async requestNotionApprovalAssist() { throw new Error('broker unavailable'); } }), { status: 'unavailable', reason: 'broker_unavailable' });
 });

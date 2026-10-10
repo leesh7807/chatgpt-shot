@@ -74,7 +74,7 @@ const allowedDetails = new Set([
   'reason', 'method', 'message_marker_seen', 'composer_marker_present', 'sample_count', 'retry_after_seconds',
   'retry_count', 'queue_wait_ms', 'status', 'target_open', 'browser_context_closed', 'concurrency',
   'delivery', 'deadline_ms', 'remaining_ms', 'http_status', 'rate_limit_reason', 'admission_elapsed_ms', 'composer_present', 'permission_choice', 'attempted_choice',
-  'button_found', 'click_attempted',
+  'button_found', 'click_attempted', 'before_artifact', 'after_artifact', 'post_click_probe',
 ]);
 const safeToken = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,96}$/.test(value) ? value : undefined;
 const safeNumber = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;

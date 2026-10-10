@@ -303,6 +303,9 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
               ...(clickAttempted ? { click_attempted: true } : {}),
               ...('reason' in recovery ? { reason: recovery.reason } : {}),
               ...(recovery.attemptedChoice ? { attempted_choice: recovery.attemptedChoice } : {}),
+              ...(recovery.beforeArtifact ? { before_artifact: recovery.beforeArtifact } : {}),
+              ...(recovery.afterArtifact ? { after_artifact: recovery.afterArtifact } : {}),
+              ...(recovery.postClickProbe ? { post_click_probe: recovery.postClickProbe } : {}),
             },
           });
         }
