@@ -98,6 +98,9 @@ test('default doctor reports passive capabilities without creating a Service or 
     assert.equal(result.stderr, '');
     const report = JSON.parse(result.stdout);
     assert.equal(report.mode, 'passive');
+    assert.equal(report.checks.configuration.status, 'failed');
+    assert.equal(report.checks.configuration.code, 'CONFIG_INVALID');
+    assert.equal(report.checks.configuration.reason, `Missing user configuration at ${join(configHome, 'chatgpt-shot', '.env')}.`);
     assert.equal(report.checks.service.status, 'absent');
     assert.equal(report.checks.private_browser.status, 'not_checked');
     assert.equal(report.checks.visible_browser.status, 'not_requested');

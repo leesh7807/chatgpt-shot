@@ -235,7 +235,7 @@ export async function doctor(browser: boolean): Promise<Record<string, unknown>>
     checks.configuration = { status: 'passed', source: config.envPath };
   } catch (error) {
     const code = error instanceof ShotError ? error.code : 'INTERNAL_ERROR';
-    checks.configuration = { status: 'failed', code };
+    checks.configuration = { status: 'failed', code, reason: error instanceof Error ? error.message : 'Configuration could not be loaded.' };
     failed = true;
   }
   try { state = paths(); checks.local_state = { status: 'checked' }; }
