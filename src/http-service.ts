@@ -26,6 +26,7 @@ export async function call<T>(record: Discovery, path: string, body?: unknown, s
   return await new Promise<T>((resolve, reject) => {
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const timeout = (path === '/jobs' && body !== undefined) || path === '/prepare-open' ? 0 : 10_000;
+    let attemptId: string | undefined;
     const req = httpRequest({ host: record.host, port: record.port, path, method: body === undefined ? 'GET' : 'POST', headers: { authorization: `Bearer ${record.credential}`, ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}) }, ...(timeout ? { timeout } : {}) }, res => {
       let text = ''; res.setEncoding('utf8'); res.on('data', c => text += c); res.on('end', () => {
         try {
@@ -37,9 +38,20 @@ export async function call<T>(record: Discovery, path: string, body?: unknown, s
         } catch (error) { reject(error); }
       });
     });
-    const abort = () => req.destroy(new ShotError('ADMISSION_CANCELLED', 'The caller cancelled Job admission.'));
+    req.on('information', info => {
+      const hinted = info.headers['x-chatgpt-shot-attempt-id'];
+      if (typeof hinted === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(hinted)) attemptId = hinted.toLowerCase();
+    });
+    const abort = () => {
+      const error = new ShotError('ADMISSION_CANCELLED', 'The caller cancelled Job admission.');
+      if (attemptId) error.attemptId = attemptId;
+      req.destroy(error);
+    };
     if (signal?.aborted) return abort();
-    signal?.addEventListener('abort', abort, { once: true }); req.once('error', reject);
+    signal?.addEventListener('abort', abort, { once: true }); req.once('error', error => {
+      if (attemptId && error instanceof ShotError && !error.attemptId) error.attemptId = attemptId;
+      reject(error);
+    });
     if (timeout) req.once('timeout', () => req.destroy(new Error('Service request timed out.')));
     if (payload) req.write(payload); req.end();
   });
@@ -275,6 +287,7 @@ export async function runService(): Promise<void> {
         if (!input || typeof input !== 'object' || Array.isArray(input) || typeof prompt !== 'string' || !prompt.trim() || fields.some(field => field !== 'prompt' && field !== 'diagnostics' && field !== 'observeApproval') || (input.diagnostics !== undefined && typeof input.diagnostics !== 'boolean') || (input.observeApproval !== undefined && typeof input.observeApproval !== 'boolean')) fail('CONFIG_INVALID', 'jobs requires a non-empty prompt and optional diagnostics and observeApproval booleans.');
         const id = randomUUID();
         telemetry = new JobTelemetrySession(id);
+        if (!responseDisconnected && !res.destroyed) res.writeEarlyHints({ link: `</attempts/${id}>; rel=related`, 'x-chatgpt-shot-attempt-id': id });
         const event = (name: JobTelemetryInput['event'], fields: Omit<JobTelemetryInput, 'event'> = {}) => telemetry!.record({ event: name, ...fields });
         event('admission_started', { stage: 'service_request' });
         requestAdmission = new AbortController(); admissions.add(requestAdmission);

@@ -49,6 +49,22 @@ test('restores Attempt correlation from structured HTTP submission failures', as
   } finally { server.close(); await once(server, 'close'); }
 });
 
+test('caller cancellation retains Attempt correlation from an early HTTP hint', async () => {
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const server = createServer((_, response) => {
+    response.writeEarlyHints({ link: `</attempts/${id}>; rel=related`, 'x-chatgpt-shot-attempt-id': id });
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const controller = new AbortController();
+  try {
+    const pending = call({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'test' }, '/jobs', { prompt: 'x' }, controller.signal);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    controller.abort();
+    await assert.rejects(pending, (error: unknown) => error instanceof ShotError && error.code === 'ADMISSION_CANCELLED' && error.attemptId === id);
+  } finally { server.close(); await once(server, 'close'); }
+});
+
 test('authenticated HTTP Attempt inspection returns the same read-only recovery report', async () => {
   const root = mkdtempSync(join(tmpdir(), 'chatgpt-shot-http-inspect-'));
   const previousEnv = {

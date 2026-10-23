@@ -118,6 +118,8 @@ Content-Type: application/json
 
 `POST /jobs` accepts `{"prompt":"<non-empty prompt>"}` and optional boolean `diagnostics` and `observeApproval` fields. It does not accept caller-supplied Job IDs. Success responds only with `{"id":"<Service-generated UUID>"}` after remote acceptance and confirmed tab closure, even when the first observed State is `completed` or `failed`. If tab closure cannot be confirmed, the request fails with `BROWSER_CONTEXT_CLOSE_FAILED`; when an Attempt exists, errors include `attempt_id` and `recovery: { inspect, automatic_retry: false }` while preserving `code` and `message`.
 
+After creating its local Attempt, the Service sends an HTTP `103 Early Hints` response with `x-chatgpt-shot-attempt-id` and a `Link` relation to `/attempts/<uuid>`. An authenticated local client can retain that ID if it cancels before the final response arrives. The final successful response contract remains `{"id":"<Service-generated UUID>"}`.
+
 ```http
 POST /jobs
 Authorization: Bearer <credential>
