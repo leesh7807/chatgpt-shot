@@ -166,29 +166,48 @@ export async function inspectAttempt(attemptId: string): Promise<Record<string, 
   try { attempt = readRecentJobTelemetry(undefined, normalizedId)[0]; }
   catch (error) { localErrorCode = error instanceof ShotError ? error.code : 'LOCAL_DIAGNOSTICS_UNAVAILABLE'; }
   let remote: RemoteJobObservation;
+  let serviceReadError: unknown;
+  // An existing authenticated Service is independent of caller-side Notion
+  // configuration, so try its read-only recovery route first.
+  let running: Awaited<ReturnType<typeof serviceStatus>>;
+  try {
+    const state = paths();
+    running = await serviceStatus({ discoveryPath: state.discoveryPath });
+  } catch {
+    running = undefined;
+  }
+  if (running) {
+    try {
+      const report = await call<Record<string, unknown>>(running.record, `/attempts/${normalizedId}`);
+      if (localErrorCode) report.local_attempt = { found: false, status: 'unavailable', code: localErrorCode, source: 'local_attempt_telemetry', authority: 'local_evidence' };
+      return report;
+    } catch (error) {
+      // The Service may become unreachable after its health check. Keep the
+      // independent read-only Notion reconciliation available in that race.
+      serviceReadError = error;
+    }
+  }
+  const serviceRead = serviceReadError
+    ? { status: 'failed' as const, code: serviceReadError instanceof ShotError ? serviceReadError.code : 'SERVICE_READ_FAILED' }
+    : undefined;
   try {
     const config = loadConfig();
-    const running = await serviceStatus(config);
-    if (running) {
-      try {
-        const report = await call<Record<string, unknown>>(running.record, `/attempts/${normalizedId}`);
-        if (localErrorCode) report.local_attempt = { found: false, status: 'unavailable', code: localErrorCode, source: 'local_attempt_telemetry', authority: 'local_evidence' };
-        return report;
-      } catch {
-        // The Service may become unreachable after its health check. Keep the
-        // independent read-only Notion reconciliation available in that race.
-      }
-    }
     // Inspect is read-only. When an existing Service cannot be reached, keep
     // reconciliation available through the same configured Notion read used
     // when no Service is present; do not start or repair that Service here.
     const invocation = await new NotionStore(config.notionToken).findInvocation(databaseIdFromUrl(config.databaseUrl), normalizedId);
     remote = invocation
-      ? { status: invocation.state === 'pending' ? 'pending' : 'accepted', source: 'notion', job: { id: invocation.id, state: invocation.state, ...(invocation.error ? { error: invocation.error } : {}) } }
-      : { status: 'not_found', source: 'notion' };
+      ? { status: invocation.state === 'pending' ? 'pending' : 'accepted', source: 'notion', job: { id: invocation.id, state: invocation.state, ...(invocation.error ? { error: invocation.error } : {}) }, ...(serviceRead ? { service_read: serviceRead } : {}) }
+      : { status: 'not_found', source: 'notion', ...(serviceRead ? { service_read: serviceRead } : {}) };
   } catch (error) {
     const code = error instanceof ShotError ? error.code : 'INTERNAL_ERROR';
-    remote = { status: 'unavailable', source: 'notion', code, reason: code === 'CONFIG_INVALID' ? 'configuration_unavailable' : 'notion_lookup_failed' };
+    remote = {
+      status: 'unavailable',
+      source: 'notion',
+      code,
+      reason: code === 'CONFIG_INVALID' ? 'configuration_unavailable' : 'notion_lookup_failed',
+      ...(serviceRead ? { service_read: serviceRead } : {}),
+    };
   }
   return buildAttemptRecoveryReport(normalizedId, attempt, remote, localErrorCode);
 }
@@ -239,37 +258,36 @@ export async function doctor(browser: boolean): Promise<Record<string, unknown>>
     checks.service = { status: 'unavailable', code, started_by_doctor: false };
     failed = true;
   }
-  if (config) {
+  let serviceReadFailed = false;
+  if (existingService) {
     try {
-      if (existingService) {
-        try {
-          const jobs = await call<{ jobs?: unknown[] }>(existingService.record, '/jobs');
-          checks.service_read = { status: 'passed', check: 'authenticated Service Job read' };
-          checks.notion = { status: 'passed', check: 'authenticated Service Job read', visible_jobs: jobs.jobs?.length ?? null };
-          capabilities.notion_read = { status: 'available', verified_by: 'existing_service_read' };
-        } catch (error) {
-          const code = error instanceof ShotError ? error.code : 'SERVICE_READ_FAILED';
-          checks.service_read = { status: 'failed', code, check: 'authenticated Service Job read' };
-          failed = true;
-          // A Service health response can race with a later Service read failure.
-          // Recheck the Service separately, then diagnose Notion directly.
-          existingService = await serviceStatus({ discoveryPath: config.discoveryPath });
-          checks.service = existingService
-            ? { status: existingService.state, accepting: existingService.accepting, pid: existingService.record.pid }
-            : { status: 'unavailable', started_by_doctor: false };
-          if (!existingService) failed = true;
-          const store = new NotionStore(config.notionToken);
-          store.validateSchema(await store.database(databaseIdFromUrl(config.databaseUrl)));
-          checks.notion = { status: 'passed', check: 'Invocation database schema after Service read failure' };
-          capabilities.notion_read = { status: 'available', verified_by: 'schema_read_after_service_read_failure' };
-        }
-      } else {
-        checks.service_read = { status: 'not_checked', reason: 'service_unavailable' };
-        const store = new NotionStore(config.notionToken);
-        store.validateSchema(await store.database(databaseIdFromUrl(config.databaseUrl)));
-        checks.notion = { status: 'passed', check: 'Invocation database schema' };
-        capabilities.notion_read = { status: 'available', verified_by: 'schema_read' };
-      }
+      const jobs = await call<{ jobs?: unknown[] }>(existingService.record, '/jobs');
+      checks.service_read = { status: 'passed', check: 'authenticated Service Job read' };
+      checks.notion = { status: 'passed', check: 'authenticated Service Job read', visible_jobs: jobs.jobs?.length ?? null };
+      capabilities.notion_read = { status: 'available', verified_by: 'existing_service_read' };
+    } catch (error) {
+      const code = error instanceof ShotError ? error.code : 'SERVICE_READ_FAILED';
+      checks.service_read = { status: 'failed', code, check: 'authenticated Service Job read' };
+      serviceReadFailed = true;
+      failed = true;
+      // A Service health response can race with a later Service read failure.
+      // Recheck health without relying on caller-side Notion configuration.
+      const discoveryPath = state?.discoveryPath ?? config?.discoveryPath;
+      existingService = discoveryPath ? await serviceStatus({ discoveryPath }) : undefined;
+      checks.service = existingService
+        ? { status: existingService.state, accepting: existingService.accepting, pid: existingService.record.pid }
+        : { status: 'unavailable', started_by_doctor: false };
+      if (!existingService) failed = true;
+    }
+  } else {
+    checks.service_read = { status: 'not_checked', reason: config ? 'service_unavailable' : 'configuration_unavailable' };
+  }
+  if (config && (!existingService || serviceReadFailed)) {
+    try {
+      const store = new NotionStore(config.notionToken);
+      store.validateSchema(await store.database(databaseIdFromUrl(config.databaseUrl)));
+      checks.notion = { status: 'passed', check: serviceReadFailed ? 'Invocation database schema after Service read failure' : 'Invocation database schema' };
+      capabilities.notion_read = { status: 'available', verified_by: serviceReadFailed ? 'schema_read_after_service_read_failure' : 'schema_read' };
     } catch (error) {
       const code = error instanceof ShotError ? error.code : 'INTERNAL_ERROR';
       checks.notion = { status: 'failed', code };
@@ -277,9 +295,10 @@ export async function doctor(browser: boolean): Promise<Record<string, unknown>>
       failed = true;
     }
   } else {
-    checks.service_read = { status: 'not_checked', reason: 'configuration_unavailable' };
-    checks.notion = { status: 'not_checked', reason: 'configuration_unavailable' };
-    capabilities.notion_read = { status: 'unavailable', reason: 'configuration_unavailable' };
+    if (!config && (serviceReadFailed || !existingService)) {
+      checks.notion = { status: 'not_checked', reason: 'configuration_unavailable' };
+      capabilities.notion_read = { status: serviceReadFailed ? 'not_checked' : 'unavailable', reason: 'configuration_unavailable' };
+    }
   }
   if (browser && state) {
     try {

@@ -1,9 +1,9 @@
 import type { JobTelemetryAttempt, JobTelemetryRecord } from './job-telemetry.js';
 
 export type RemoteJobObservation =
-  | { status: 'not_checked' | 'unavailable'; source: 'notion'; reason: string; code?: string }
-  | { status: 'not_found'; source: 'notion' }
-  | { status: 'pending' | 'accepted'; source: 'notion'; job: { id: string; state: string; error?: string | null } };
+  | { status: 'not_checked' | 'unavailable'; source: 'notion'; reason: string; code?: string; service_read?: { status: 'failed'; code: string } }
+  | { status: 'not_found'; source: 'notion'; service_read?: { status: 'failed'; code: string } }
+  | { status: 'pending' | 'accepted'; source: 'notion'; job: { id: string; state: string; error?: string | null }; service_read?: { status: 'failed'; code: string } };
 
 type Delivery = 'submitted' | 'not_submitted' | 'uncertain' | 'unknown';
 const acceptedStates = new Set(['in_progress', 'completed', 'failed']);

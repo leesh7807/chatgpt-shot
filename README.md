@@ -62,7 +62,7 @@ A single Job read looks like this:
 }
 ```
 
-`chatgpt-shot jobs` without an ID lists recent Jobs. It contacts the Notion-backed Service but does not submit a prompt. `chatgpt-shot attempts [uuid]` reads local diagnostic trails without contacting Notion. `chatgpt-shot inspect <uuid>` returns JSON that joins a local Attempt with a read-only current Notion lookup when configured access is available. It does not start a Service or browser. Its `retry_safety` is evidence-based guidance; no automatic retry is performed.
+`chatgpt-shot jobs` without an ID lists recent Jobs. It contacts the Notion-backed Service but does not submit a prompt. `chatgpt-shot attempts [uuid]` reads local diagnostic trails without contacting Notion. `chatgpt-shot inspect <uuid>` returns JSON that joins a local Attempt with a read-only current Invocation lookup. It first uses an existing authenticated Service, even when caller-side Notion configuration is unavailable, then uses direct Notion access when configured. It does not start a Service or browser. Its `retry_safety` is evidence-based guidance; no automatic retry is performed.
 
 ## If something goes wrong
 

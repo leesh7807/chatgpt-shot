@@ -216,6 +216,8 @@ test('doctor and inspect retain Notion reads when Service fails after its health
 
     assert.equal(inspectReport.remote.status, 'accepted');
     assert.equal(inspectReport.remote.job.state, 'in_progress');
+    assert.equal(inspectReport.remote.service_read.status, 'failed');
+    assert.equal(inspectReport.remote.service_read.code, 'SERVICE_STOPPING');
     assert.equal(invocationReads, 1);
     assert.equal(doctorReport.checks.service.status, 'ready');
     assert.equal(doctorReport.checks.service_read.status, 'failed');
@@ -227,6 +229,86 @@ test('doctor and inspect retain Notion reads when Service fails after its health
   } finally {
     NotionStore.prototype.database = originalDatabase;
     NotionStore.prototype.findInvocation = originalFindInvocation;
+    process.exitCode = previousExitCode;
+    for (const name of envNames) {
+      const value = previousEnv[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    server.close();
+    await once(server, 'close');
+    rmSync(configHome, { recursive: true, force: true });
+    rmSync(dataHome, { recursive: true, force: true });
+    rmSync(cacheHome, { recursive: true, force: true });
+  }
+});
+
+test('inspect and doctor use an existing Service without caller-side Notion configuration', async () => {
+  const configHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-existing-service-configless-config-'));
+  const dataHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-existing-service-configless-data-'));
+  const cacheHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-existing-service-configless-cache-'));
+  const envNames = ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME'] as const;
+  const previousEnv = Object.fromEntries(envNames.map(name => [name, process.env[name]]));
+  const previousExitCode = process.exitCode;
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const credential = 'existing-service-without-caller-config';
+  let inspectReads = 0;
+  let jobReads = 0;
+  const server = createServer((request, response) => {
+    if (request.headers.authorization !== `Bearer ${credential}`) {
+      response.writeHead(401, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ code: 'UNAUTHORIZED', message: 'A current service credential is required.' }));
+      return;
+    }
+    if (request.url === '/health') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ pid: process.pid, protocolVersion: 1, accepting: true, state: 'ready' }));
+    } else if (request.url === `/attempts/${id}`) {
+      inspectReads++;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        schema_version: 1,
+        attempt_id: id,
+        local_attempt: { found: false, status: 'not_found', source: 'local_attempt_telemetry', authority: 'local_evidence' },
+        remote: { status: 'accepted', source: 'notion', job: { id: 'remote-job', state: 'in_progress' } },
+        retry_safety: { status: 'unsafe', automatic_retry: false, reason: 'An accepted remote Job was observed.' },
+        next_actions: ['chatgpt-shot jobs remote-job'],
+      }));
+    } else if (request.url === '/jobs') {
+      jobReads++;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ jobs: [{ id: 'remote-job', state: 'in_progress' }] }));
+    } else {
+      response.writeHead(404);
+      response.end(JSON.stringify({ code: 'NOT_FOUND', message: 'No route.' }));
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  try {
+    process.env.XDG_CONFIG_HOME = configHome;
+    process.env.XDG_DATA_HOME = dataHome;
+    process.env.XDG_CACHE_HOME = cacheHome;
+    const runtimeDirectory = join(cacheHome, 'chatgpt-shot');
+    mkdirSync(runtimeDirectory, { recursive: true });
+    writeFileSync(join(runtimeDirectory, 'runtime.json'), JSON.stringify({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential }));
+
+    const inspectReport = await inspectAttempt(id) as any;
+    const doctorReport = await doctor(false) as any;
+
+    assert.equal(inspectReport.remote.status, 'accepted');
+    assert.equal(inspectReport.remote.job.id, 'remote-job');
+    assert.equal(inspectReads, 1);
+    assert.equal(doctorReport.checks.configuration.status, 'failed');
+    assert.equal(doctorReport.checks.service.status, 'ready');
+    assert.equal(doctorReport.checks.service_read.status, 'passed');
+    assert.equal(doctorReport.checks.notion.status, 'passed');
+    assert.equal(doctorReport.capabilities.notion_read.status, 'available');
+    assert.equal(jobReads, 1);
+    assert.equal(process.exitCode, 1);
+  } finally {
     process.exitCode = previousExitCode;
     for (const name of envNames) {
       const value = previousEnv[name];

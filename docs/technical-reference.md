@@ -8,7 +8,7 @@ Configuration is owner-only (0600) at `$XDG_CONFIG_HOME/chatgpt-shot/.env`, defa
 
 On Linux, the browser runtime uses headful Chrome on a private broker-owned X11 display and requires `Xvfb`. `open` instead opens the retained profile in visible system Chrome, but only after an interactive terminal user types yes at its confirmation prompt. Non-interactive calls return `USER_INTERVENTION_REQUIRED` without opening a window. It needs local XDG paths but does not require Notion configuration. If the Service is running, it keeps the Service and discovery record alive while the visible browser is open. New submissions receive `SERVICE_BUSY` until Chrome closes. Accepted Jobs can continue their Notion completion polling because their submission tabs have already closed. If the Service is absent, `open` opens the profile without starting it; use `start` separately when you want the Service running. Closing Chrome does not verify sign-in or a browser challenge.
 
-`doctor` returns JSON with checked, skipped, and failed checks. By default it reads configuration, local telemetry, existing Service health, and the configured Notion schema without starting a Service or browser. It reports the authenticated Service `/jobs` read separately from health; if that read fails, `doctor` records the failure and exits nonzero while still attempting the independent read-only Notion schema check. A successful Notion check does not erase the Service read failure. `doctor --browser` explicitly starts or uses the private browser runtime to check availability, ChatGPT authentication, and composer access, even when Notion configuration is unavailable; it never opens visible Chrome or submits a Job. Neither mode verifies ChatGPT-to-Notion write access.
+`doctor` returns JSON with checked, skipped, and failed checks. By default it reads configuration, local telemetry, existing Service health, and accessible Notion state without starting a Service or browser. An authenticated read through an existing Service does not require caller-side Notion configuration. It reports the authenticated Service `/jobs` read separately from health; if that read fails, `doctor` records the failure and exits nonzero while still attempting the independent read-only Notion schema check when caller-side configuration is available. A successful Notion check does not erase the Service read failure. `doctor --browser` explicitly starts or uses the private browser runtime to check availability, ChatGPT authentication, and composer access, even when Notion configuration is unavailable; it never opens visible Chrome or submits a Job. Neither mode verifies ChatGPT-to-Notion write access.
 
 ## Submission and Job lifecycle
 
@@ -69,7 +69,7 @@ chatgpt-shot attempts <uuid>
 chatgpt-shot inspect <uuid>
 ```
 
-`inspect` returns schema-versioned JSON. It labels local Attempt telemetry as local evidence and the current Invocation read as a Notion observation. A Notion read failure is reported as unavailable; it does not turn the local Attempt into a failed or unsent Job. Retry safety is marked safe only when delivery is proven absent and any created Invocation is confirmed cleaned up or absent. The command never retries.
+`inspect` returns schema-versioned JSON. It first uses the authenticated read route of an existing Service, which does not require caller-side Notion configuration; when that route fails or is unavailable, it uses direct Notion access if caller-side configuration is available. If direct fallback succeeds after a Service read failure, the report includes both the Notion observation and the Service read failure. If remote reads remain unavailable, the report includes the source and reason; it does not turn the local Attempt into a failed or unsent Job. Retry safety is marked safe only when delivery is proven absent and any created Invocation is confirmed cleaned up or absent. The command never retries or starts a Service.
 
 ## Approval observation
 
@@ -130,7 +130,7 @@ Content-Type: application/json
 
 `GET /jobs` returns recent Job summaries. `GET /jobs/<uuid>` returns the current durable State, Result, and Error. Service failures return JSON `{"code","message"}` with a non-200 status. `pending` is only the pre-acceptance Notion record state; terminal Result and Error are read from the Job surface after submission.
 
-`GET /attempts/<uuid>` returns the same read-only recovery report as `chatgpt-shot inspect <uuid>`. It reads local telemetry and queries the current Invocation through Notion; it does not submit a prompt or start a browser.
+`GET /attempts/<uuid>` returns the same read-only recovery report as `chatgpt-shot inspect <uuid>`. It reads local telemetry and queries the current Invocation through the Service's configured Notion access; it does not submit a prompt or start a browser.
 
 ```http
 GET /jobs
