@@ -65,6 +65,22 @@ test('caller cancellation retains Attempt correlation from an early HTTP hint', 
   } finally { server.close(); await once(server, 'close'); }
 });
 
+test('an unexpected transport failure retains Attempt correlation from an early HTTP hint', async () => {
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const server = createServer((request, response) => {
+    response.writeEarlyHints({ link: `</attempts/${id}>; rel=related`, 'x-chatgpt-shot-attempt-id': id });
+    setTimeout(() => request.socket.destroy(), 25);
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  try {
+    await assert.rejects(
+      call({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'test' }, '/jobs', { prompt: 'x' }),
+      (error: unknown) => error instanceof ShotError && error.code === 'SUBMISSION_UNCERTAIN' && error.attemptId === id,
+    );
+  } finally { server.close(); await once(server, 'close'); }
+});
+
 test('authenticated HTTP Attempt inspection returns the same read-only recovery report', async () => {
   const root = mkdtempSync(join(tmpdir(), 'chatgpt-shot-http-inspect-'));
   const previousEnv = {

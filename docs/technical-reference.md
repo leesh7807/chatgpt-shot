@@ -28,7 +28,7 @@ An exception, interruption, acknowledgement timeout, or lost observer is not evi
 | --- | --- |
 | `SUBMISSION_FAILED` | The prompt was confirmed not sent. The pending Invocation was cleaned up; a new submit attempt is safe. |
 | `ADMISSION_TIMEOUT` | UI evidence confirmed delivery, but Notion acceptance was not observed within the budget. The Invocation is retained; do not retry automatically. |
-| `SUBMISSION_UNCERTAIN` | Acceptance was not observed and delivery could not be determined, including when the deadline expires with a Notion read still in flight. The Invocation is retained; do not retry automatically. |
+| `SUBMISSION_UNCERTAIN` | Acceptance was not observed and delivery could not be determined, including when the deadline expires with a Notion read still in flight or the caller loses its connection after receiving an Attempt ID. If an Invocation was created, it is retained; inspect the Attempt and any remote Job, and do not retry automatically. |
 | `NOTION_UNAVAILABLE` / `NOTION_RATE_LIMITED` | Notion observation failed and was not recovered within the admission window. The original Notion category is preserved. |
 | `ADMISSION_CANCELLED` | The caller or Service cancelled before acceptance was confirmed. Cancellation alone does not prove non-delivery. |
 | `BROWSER_CONTEXT_CLOSE_FAILED` | Remote acceptance was observed, but the tab could not be confirmed closed. The accepted Job remains active; recover its local UUID with `chatgpt-shot attempts` and do not submit it again. |

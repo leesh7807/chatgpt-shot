@@ -27,15 +27,26 @@ export async function call<T>(record: Discovery, path: string, body?: unknown, s
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const timeout = (path === '/jobs' && body !== undefined) || path === '/prepare-open' ? 0 : 10_000;
     let attemptId: string | undefined;
+    const correlateError = (error: unknown): unknown => {
+      if (!attemptId) return error;
+      if (error instanceof ShotError) {
+        if (!error.attemptId) error.attemptId = attemptId;
+        return error;
+      }
+      const correlated = new ShotError('SUBMISSION_UNCERTAIN', 'The Service connection failed after an Attempt was created; inspect this Attempt before considering another submission.', error);
+      correlated.attemptId = attemptId;
+      return correlated;
+    };
+    const rejectCorrelated = (error: unknown) => reject(correlateError(error));
     const req = httpRequest({ host: record.host, port: record.port, path, method: body === undefined ? 'GET' : 'POST', headers: { authorization: `Bearer ${record.credential}`, ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}) }, ...(timeout ? { timeout } : {}) }, res => {
       let text = ''; res.setEncoding('utf8'); res.on('data', c => text += c); res.on('end', () => {
         try {
           const parsed = JSON.parse(text) as { code?: unknown; message?: unknown; diagnostics?: unknown; attempt_id?: unknown };
           if (res.statusCode !== 200) {
-            if (isErrorCode(parsed.code)) { const error = new ShotError(parsed.code, typeof parsed.message === 'string' ? parsed.message : 'Service request failed.'); if (parsed.diagnostics !== undefined) error.diagnostics = parsed.diagnostics; if (typeof parsed.attempt_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.attempt_id)) error.attemptId = parsed.attempt_id.toLowerCase(); reject(error); }
-            else reject(new Error(typeof parsed.message === 'string' ? parsed.message : 'Service request failed.'));
+            if (isErrorCode(parsed.code)) { const error = new ShotError(parsed.code, typeof parsed.message === 'string' ? parsed.message : 'Service request failed.'); if (parsed.diagnostics !== undefined) error.diagnostics = parsed.diagnostics; if (typeof parsed.attempt_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.attempt_id)) error.attemptId = parsed.attempt_id.toLowerCase(); rejectCorrelated(error); }
+            else rejectCorrelated(new Error(typeof parsed.message === 'string' ? parsed.message : 'Service request failed.'));
           } else resolve(parsed as T);
-        } catch (error) { reject(error); }
+        } catch (error) { rejectCorrelated(error); }
       });
     });
     req.on('information', info => {
@@ -48,10 +59,7 @@ export async function call<T>(record: Discovery, path: string, body?: unknown, s
       req.destroy(error);
     };
     if (signal?.aborted) return abort();
-    signal?.addEventListener('abort', abort, { once: true }); req.once('error', error => {
-      if (attemptId && error instanceof ShotError && !error.attemptId) error.attemptId = attemptId;
-      reject(error);
-    });
+    signal?.addEventListener('abort', abort, { once: true }); req.once('error', rejectCorrelated);
     if (timeout) req.once('timeout', () => req.destroy(new Error('Service request timed out.')));
     if (payload) req.write(payload); req.end();
   });
