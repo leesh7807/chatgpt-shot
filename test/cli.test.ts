@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { ShotError } from '../src/errors.js';
-import { inspectAttempt, parseCli } from '../src/cli.js';
+import { doctor, inspectAttempt, parseCli } from '../src/cli.js';
 import { LocalJobTelemetryWriter } from '../src/job-telemetry.js';
 import { NotionStore } from '../src/notion.js';
 
@@ -103,6 +103,56 @@ test('default doctor reports passive capabilities without creating a Service or 
     assert.equal(existsSync(join(dataHome, 'chatgpt-shot', 'chrome-profile')), false);
     assert.equal(existsSync(join(cacheHome, 'chatgpt-shot', 'runtime.json')), false);
   } finally {
+    rmSync(configHome, { recursive: true, force: true });
+    rmSync(dataHome, { recursive: true, force: true });
+    rmSync(cacheHome, { recursive: true, force: true });
+  }
+});
+
+test('doctor reads Notion when existing Service discovery is unhealthy', async () => {
+  const configHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-doctor-unhealthy-config-'));
+  const dataHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-doctor-unhealthy-data-'));
+  const cacheHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-doctor-unhealthy-cache-'));
+  const envNames = ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME'] as const;
+  const previousEnv = Object.fromEntries(envNames.map(name => [name, process.env[name]]));
+  const previousExitCode = process.exitCode;
+  const originalDatabase = NotionStore.prototype.database;
+  try {
+    process.env.XDG_CONFIG_HOME = configHome;
+    process.env.XDG_DATA_HOME = dataHome;
+    process.env.XDG_CACHE_HOME = cacheHome;
+    const configDirectory = join(configHome, 'chatgpt-shot');
+    const runtimeDirectory = join(cacheHome, 'chatgpt-shot');
+    mkdirSync(configDirectory, { recursive: true });
+    mkdirSync(runtimeDirectory, { recursive: true });
+    writeFileSync(join(configDirectory, '.env'), 'NOTION_TOKEN=test-token\nCHATGPT_SHOT_NOTION_DATABASE_URL=https://www.notion.so/workspace/0123456789abcdef0123456789abcdef\n');
+    writeFileSync(join(runtimeDirectory, 'runtime.json'), JSON.stringify({ pid: 2_147_483_647, host: '127.0.0.1', port: 1, protocolVersion: 1, credential: 'stale-service' }));
+    NotionStore.prototype.database = async function () {
+      return { properties: {
+        ID: { type: 'title' },
+        State: { type: 'select', select: { options: [{ name: 'pending' }, { name: 'in_progress' }, { name: 'completed' }, { name: 'failed' }] } },
+        Error: { type: 'rich_text' },
+        'Created At': { type: 'created_time' },
+        'Updated At': { type: 'last_edited_time' },
+      } };
+    };
+
+    const report = await doctor(false);
+
+    assert.equal(report.checks.service.status, 'unavailable');
+    assert.equal(report.checks.notion.status, 'passed');
+    assert.equal(report.capabilities.notion_read.status, 'available');
+    assert.equal(existsSync(join(runtimeDirectory, 'runtime.json')), true);
+    assert.equal(existsSync(join(dataHome, 'chatgpt-shot', 'chrome-profile')), false);
+    assert.equal(process.exitCode, 1);
+  } finally {
+    NotionStore.prototype.database = originalDatabase;
+    process.exitCode = previousExitCode;
+    for (const name of envNames) {
+      const value = previousEnv[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
     rmSync(configHome, { recursive: true, force: true });
     rmSync(dataHome, { recursive: true, force: true });
     rmSync(cacheHome, { recursive: true, force: true });

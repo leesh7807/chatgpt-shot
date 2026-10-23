@@ -188,7 +188,7 @@ export async function inspectAttempt(attemptId: string): Promise<Record<string, 
   return buildAttemptRecoveryReport(normalizedId, attempt, remote, localErrorCode);
 }
 
-async function doctor(browser: boolean): Promise<void> {
+export async function doctor(browser: boolean): Promise<Record<string, unknown>> {
   const checks: Record<string, unknown> = {};
   const capabilities: Record<string, unknown> = {};
   let config: ReturnType<typeof loadConfig> | undefined;
@@ -228,17 +228,14 @@ async function doctor(browser: boolean): Promise<void> {
     checks.service = existingService
       ? { status: existingService.state, accepting: existingService.accepting, pid: existingService.record.pid }
       : { status: discoveryPresent ? 'unavailable' : 'absent', started_by_doctor: false };
+    if (discoveryPresent && !existingService) failed = true;
   } catch (error) {
     const code = error instanceof ShotError ? error.code : 'SERVICE_HEALTH_UNAVAILABLE';
     checks.service = { status: 'unavailable', code, started_by_doctor: false };
     failed = true;
   }
   if (config) {
-    if (discoveryPresent && !existingService) {
-      checks.notion = { status: 'unavailable', reason: 'service_health_unavailable' };
-      capabilities.notion_read = { status: 'unavailable', reason: 'service_health_unavailable' };
-      failed = true;
-    } else try {
+    try {
       if (existingService) {
         const jobs = await call<{ jobs?: unknown[] }>(existingService.record, '/jobs');
         checks.notion = { status: 'passed', check: 'authenticated Service Job read', visible_jobs: jobs.jobs?.length ?? null };
@@ -286,8 +283,9 @@ async function doctor(browser: boolean): Promise<void> {
   }
   checks.visible_browser = { status: 'not_requested', action: 'chatgpt-shot open requires interactive confirmation' };
   capabilities.visible_browser_intervention = { status: 'not_requested', authorization: 'not_granted' };
-  out(JSON.stringify({ schema_version: 1, mode: browser ? 'active_browser' : 'passive', checks, capabilities }, null, 2));
+  const report = { schema_version: 1, mode: browser ? 'active_browser' : 'passive', checks, capabilities };
   if (failed) process.exitCode = 1;
+  return report;
 }
 
 export async function main(args: string[]) {
@@ -308,7 +306,7 @@ export async function main(args: string[]) {
     if (action === 'set' && (key === 'NOTION_TOKEN' || key === 'CHATGPT_SHOT_NOTION_DATABASE_URL' || key === 'CHATGPT_SHOT_ACKNOWLEDGEMENT_TIMEOUT_MS') && valueParts.length) { setConfigValue(key as ConfigKey, valueParts.join(' '), state); return out(`saved ${key}`); }
     return fail('CONFIG_INVALID', 'Usage: chatgpt-shot config [path|show|set KEY VALUE]');
   }
-  if (command === 'doctor') return doctor(parsed.doctorBrowser === true);
+  if (command === 'doctor') return out(JSON.stringify(await doctor(parsed.doctorBrowser === true), null, 2));
   const config = loadConfig(); const databaseId = databaseIdFromUrl(config.databaseUrl);
   if (command === 'init') { if (rest.length) return fail('CONFIG_INVALID', 'Usage: chatgpt-shot init'); const store = new NotionStore(config.notionToken); const database = await store.database(databaseId); try { store.validateSchema(database); out(`already initialized: ${databaseId}`); } catch (error) { if (!(error instanceof ShotError) || error.code !== 'NOTION_SCHEMA_INVALID' || !store.isProvisionable(database)) throw error; await store.initializeSchema(database); store.validateSchema(await store.database(databaseId)); out(`initialized: ${databaseId}`); } return; }
   if (command === 'start') { out(String((await ensureService(config)).port)); return; }
