@@ -244,9 +244,13 @@ export async function doctor(browser: boolean): Promise<Record<string, unknown>>
       if (existingService) {
         try {
           const jobs = await call<{ jobs?: unknown[] }>(existingService.record, '/jobs');
+          checks.service_read = { status: 'passed', check: 'authenticated Service Job read' };
           checks.notion = { status: 'passed', check: 'authenticated Service Job read', visible_jobs: jobs.jobs?.length ?? null };
           capabilities.notion_read = { status: 'available', verified_by: 'existing_service_read' };
-        } catch {
+        } catch (error) {
+          const code = error instanceof ShotError ? error.code : 'SERVICE_READ_FAILED';
+          checks.service_read = { status: 'failed', code, check: 'authenticated Service Job read' };
+          failed = true;
           // A Service health response can race with a later Service read failure.
           // Recheck the Service separately, then diagnose Notion directly.
           existingService = await serviceStatus({ discoveryPath: config.discoveryPath });
@@ -260,6 +264,7 @@ export async function doctor(browser: boolean): Promise<Record<string, unknown>>
           capabilities.notion_read = { status: 'available', verified_by: 'schema_read_after_service_read_failure' };
         }
       } else {
+        checks.service_read = { status: 'not_checked', reason: 'service_unavailable' };
         const store = new NotionStore(config.notionToken);
         store.validateSchema(await store.database(databaseIdFromUrl(config.databaseUrl)));
         checks.notion = { status: 'passed', check: 'Invocation database schema' };
@@ -272,6 +277,7 @@ export async function doctor(browser: boolean): Promise<Record<string, unknown>>
       failed = true;
     }
   } else {
+    checks.service_read = { status: 'not_checked', reason: 'configuration_unavailable' };
     checks.notion = { status: 'not_checked', reason: 'configuration_unavailable' };
     capabilities.notion_read = { status: 'unavailable', reason: 'configuration_unavailable' };
   }

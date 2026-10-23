@@ -218,9 +218,12 @@ test('doctor and inspect retain Notion reads when Service fails after its health
     assert.equal(inspectReport.remote.job.state, 'in_progress');
     assert.equal(invocationReads, 1);
     assert.equal(doctorReport.checks.service.status, 'ready');
+    assert.equal(doctorReport.checks.service_read.status, 'failed');
+    assert.equal(doctorReport.checks.service_read.code, 'SERVICE_STOPPING');
     assert.equal(doctorReport.checks.notion.status, 'passed');
     assert.equal(doctorReport.capabilities.notion_read.status, 'available');
     assert.equal(databaseReads, 1);
+    assert.equal(process.exitCode, 1);
   } finally {
     NotionStore.prototype.database = originalDatabase;
     NotionStore.prototype.findInvocation = originalFindInvocation;
