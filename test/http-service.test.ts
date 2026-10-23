@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { once } from 'node:events';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { browserProfileBusyForOpen, call, discardDeadServiceDiscovery, JOB_TRANSPORT_TIMEOUT_MS, readDiscovery, removeDiscovery, REQUEST_BODY_TIMEOUT_MS, stopService } from '../src/http-service.js';
+import { browserProfileBusyForOpen, call, discardDeadServiceDiscovery, JOB_TRANSPORT_TIMEOUT_MS, readDiscovery, removeDiscovery, REQUEST_BODY_TIMEOUT_MS, runService, stopService } from '../src/http-service.js';
 import { ShotError } from '../src/errors.js';
+import { paths } from '../src/config.js';
+import { NotionStore } from '../src/notion.js';
+import { LocalJobTelemetryWriter } from '../src/job-telemetry.js';
 
 test('Job admission has no shorter client-side transport timeout', () => {
   assert.equal(JOB_TRANSPORT_TIMEOUT_MS, 0);
@@ -28,6 +31,137 @@ test('restores a defined Service submission failure code at the HTTP client boun
   const address = server.address(); assert.ok(address && typeof address !== 'string');
   try { await assert.rejects(call({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'test' }, '/jobs', { prompt: 'x' }), (error: unknown) => error instanceof ShotError && error.code === 'SUBMISSION_UNCERTAIN' && JSON.stringify(error.diagnostics) === '[{"stage":"after_fill","promptMatches":true}]'); }
   finally { server.close(); await once(server, 'close'); }
+});
+
+test('restores Attempt correlation from structured HTTP submission failures', async () => {
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const server = createServer((_, response) => {
+    response.writeHead(502, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ code: 'SUBMISSION_UNCERTAIN', message: 'status unknown', attempt_id: id, recovery: { inspect: `chatgpt-shot inspect ${id}`, automatic_retry: false } }));
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  try {
+    await assert.rejects(
+      call({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'test' }, '/jobs', { prompt: 'x' }),
+      (error: unknown) => error instanceof ShotError && error.code === 'SUBMISSION_UNCERTAIN' && error.attemptId === id,
+    );
+  } finally { server.close(); await once(server, 'close'); }
+});
+
+test('caller cancellation retains Attempt correlation from an early HTTP hint', async () => {
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const server = createServer((_, response) => {
+    response.writeEarlyHints({ link: `</attempts/${id}>; rel=related`, 'x-chatgpt-shot-attempt-id': id });
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const controller = new AbortController();
+  try {
+    const pending = call({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'test' }, '/jobs', { prompt: 'x' }, controller.signal);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    controller.abort();
+    await assert.rejects(pending, (error: unknown) => error instanceof ShotError && error.code === 'ADMISSION_CANCELLED' && error.attemptId === id);
+  } finally { server.close(); await once(server, 'close'); }
+});
+
+test('an unexpected transport failure retains Attempt correlation from an early HTTP hint', async () => {
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const server = createServer((request, response) => {
+    response.writeEarlyHints({ link: `</attempts/${id}>; rel=related`, 'x-chatgpt-shot-attempt-id': id });
+    setTimeout(() => request.socket.destroy(), 25);
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  try {
+    await assert.rejects(
+      call({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'test' }, '/jobs', { prompt: 'x' }),
+      (error: unknown) => error instanceof ShotError && error.code === 'SUBMISSION_UNCERTAIN' && error.attemptId === id,
+    );
+  } finally { server.close(); await once(server, 'close'); }
+});
+
+test('an incomplete response after an early Attempt hint rejects as uncertain', async () => {
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const server = createServer((_, response) => {
+    response.writeEarlyHints({ link: `</attempts/${id}>; rel=related`, 'x-chatgpt-shot-attempt-id': id });
+    response.writeHead(502, { 'content-type': 'application/json', 'content-length': '100' });
+    response.write('{"code":"SUBMISSION_UNCERTAIN"');
+    setTimeout(() => response.socket?.destroy(), 25);
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  try {
+    const outcome = await Promise.race([
+      call({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'test' }, '/jobs', { prompt: 'x' })
+        .then((value) => ({ kind: 'resolved' as const, value }), (error: unknown) => ({ kind: 'rejected' as const, error })),
+      new Promise<{ kind: 'pending' }>((resolve) => setTimeout(() => resolve({ kind: 'pending' }), 100)),
+    ]);
+    assert.equal(outcome.kind, 'rejected');
+    if (outcome.kind === 'rejected') {
+      assert.ok(outcome.error instanceof ShotError);
+      assert.equal(outcome.error.code, 'SUBMISSION_UNCERTAIN');
+      assert.equal(outcome.error.attemptId, id);
+    }
+  } finally { server.close(); await once(server, 'close'); }
+});
+
+test('authenticated HTTP Attempt inspection returns the same read-only recovery report', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'chatgpt-shot-http-inspect-'));
+  const previousEnv = {
+    XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+    XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+    XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+    CHATGPT_SHOT_STARTUP_TOKEN: process.env.CHATGPT_SHOT_STARTUP_TOKEN,
+  };
+  process.env.XDG_CONFIG_HOME = join(root, 'config');
+  process.env.XDG_DATA_HOME = join(root, 'data');
+  process.env.XDG_CACHE_HOME = join(root, 'cache');
+  const startupToken = 'test-startup-token';
+  process.env.CHATGPT_SHOT_STARTUP_TOKEN = startupToken;
+  const config = paths();
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const writer = new LocalJobTelemetryWriter(join(config.runtimeDirectory, 'jobs.jsonl'));
+  const timestamp = new Date().toISOString();
+  writer.record({ job_id: id, event: 'admission_started', timestamp, stage: 'authentication' });
+  writer.record({ job_id: id, event: 'admission_failed', timestamp, stage: 'authentication', error: { code: 'CHATGPT_AUTH_REQUIRED' } });
+  writeFileSync(config.envPath, 'NOTION_TOKEN=test-token\nCHATGPT_SHOT_NOTION_DATABASE_URL=https://www.notion.so/0123456789abcdef0123456789abcdef\n');
+  writeFileSync(config.lockPath, JSON.stringify({ pid: process.pid, token: startupToken }));
+  const originalFindInvocation = NotionStore.prototype.findInvocation;
+  NotionStore.prototype.findInvocation = async function () { return undefined; };
+  let serviceStarted = false;
+  try {
+    await runService();
+    serviceStarted = true;
+    const record = readDiscovery(config);
+    assert.ok(record);
+    const report = await call<any>(record, `/attempts/${id}`);
+    assert.equal(report.schema_version, 1);
+    assert.equal(report.local_attempt.found, true);
+    assert.equal(report.local_attempt.delivery, 'not_submitted');
+    assert.equal(report.remote.status, 'not_found');
+    assert.equal(report.retry_safety.status, 'safe');
+
+    const anonymousStatus = await new Promise<number>((resolve, reject) => {
+      const request = httpRequest({ host: record.host, port: record.port, path: `/attempts/${id}`, method: 'GET' }, response => {
+        response.resume();
+        response.once('end', () => resolve(response.statusCode ?? 0));
+      });
+      request.once('error', reject);
+      request.end();
+    });
+    assert.equal(anonymousStatus, 401);
+  } finally {
+    try { if (serviceStarted) await stopService(config); }
+    finally {
+      NotionStore.prototype.findInvocation = originalFindInvocation;
+      for (const [name, value] of Object.entries(previousEnv)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
 });
 
 test('preserves Job lookup and shutdown failure codes at the HTTP client boundary', async () => {

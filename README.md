@@ -37,7 +37,7 @@ Sign in to ChatGPT once using the retained browser profile:
 chatgpt-shot open
 ```
 
-`open` opens visible Chrome for you to sign in or complete a browser check. Close the window when finished. It does not verify that sign-in or the check succeeded, and it never automates either. If the Service is already running, it remains available but rejects new submissions until Chrome closes.
+`open` asks before opening visible Chrome for manual sign-in or a browser check. It requires an interactive terminal and a typed confirmation; non-interactive calls return `USER_INTERVENTION_REQUIRED` without opening a window. It does not require Notion configuration, verify that sign-in or the check succeeded, or automate either. If the Service is already running, it remains available but rejects new submissions until Chrome closes.
 
 The user configuration is stored with owner-only permissions under `$XDG_CONFIG_HOME/chatgpt-shot/.env`, or `~/.config/chatgpt-shot/.env` by default. `chatgpt-shot config show` reports whether the token is set without printing it. See the [technical reference](docs/technical-reference.md) for XDG paths and runtime details.
 
@@ -62,17 +62,17 @@ A single Job read looks like this:
 }
 ```
 
-`chatgpt-shot jobs` without an ID lists recent Jobs. It contacts the Notion-backed Service but does not submit a prompt. `chatgpt-shot attempts [uuid]` reads local diagnostic trails without contacting Notion.
+`chatgpt-shot jobs` without an ID lists recent Jobs. It contacts the Notion-backed Service but does not submit a prompt. `jobs` uses an existing authenticated Service even when caller-side Notion configuration is unavailable; if no usable Service exists, it needs configuration to start one. `chatgpt-shot attempts [uuid]` reads local diagnostic trails without contacting Notion. `chatgpt-shot inspect <uuid>` returns JSON that joins a local Attempt with a read-only current Invocation lookup. It first uses an existing authenticated Service, even when caller-side Notion configuration is unavailable, then uses direct Notion access when configured. It does not start a Service or browser. Its `retry_safety` is evidence-based guidance; no automatic retry is performed.
 
 ## If something goes wrong
 
 Treat submission errors separately from a Job that was accepted and later reached `failed`.
 
-- **`CHATGPT_AUTH_REQUIRED` or `USER_INTERVENTION_REQUIRED`** — The prompt was not submitted. Use `open` to sign in or handle the browser check yourself, close Chrome, then submit once.
+- **`CHATGPT_AUTH_REQUIRED` or `USER_INTERVENTION_REQUIRED`** — The prompt was not submitted. In a terminal, run `chatgpt-shot open`, review its prompt, and type yes only if you want visible Chrome opened. Sign in or handle the browser check yourself, close Chrome, then submit once.
 - **`SUBMISSION_FAILED`** — The CLI confirmed the prompt was not sent and cleaned up its pending Invocation. A new submission is safe.
-- **`ADMISSION_TIMEOUT` or `SUBMISSION_UNCERTAIN`** — Acceptance was not observed and the prompt may have been sent. The Invocation is retained. Inspect `chatgpt-shot attempts` and the matching Job before deciding anything; do not retry automatically.
-- **`NOTION_UNAVAILABLE`, `NOTION_RATE_LIMITED`, or `ADMISSION_CANCELLED`** — These do not by themselves prove that the prompt was not sent. Read the local attempt trail and available Jobs. If the original outcome remains unclear, stop and ask the user before another submission.
-- **`BROWSER_CONTEXT_CLOSE_FAILED`** — Remote acceptance was observed, but the submission tab could not be confirmed closed. Find the UUID in `attempts`, read that Job, and do not submit it again.
+- **`ADMISSION_TIMEOUT` or `SUBMISSION_UNCERTAIN`** — Acceptance was not observed and prompt delivery may be uncertain. If an Invocation was created, it is retained. Run `chatgpt-shot inspect <attempt-uuid>` to reconcile the Attempt and any remote Job; do not retry automatically.
+- **`NOTION_UNAVAILABLE`, `NOTION_RATE_LIMITED`, or `ADMISSION_CANCELLED`** — These do not by themselves prove that the prompt was not sent. Run `chatgpt-shot inspect <attempt-uuid>` to read local evidence and retry the Notion lookup when access is available. If the original outcome remains unclear, do not submit again.
+- **`BROWSER_CONTEXT_CLOSE_FAILED`** — Remote acceptance was observed, but the submission tab could not be confirmed closed. Use the UUID from the structured recovery line or local `attempts` with `chatgpt-shot inspect <uuid>`, then track that same Job with `jobs`.
 - **`SERVICE_BUSY` or `SERVICE_STOPPING`** — The Service rejected the request before browser admission. Close a manually opened Chrome window or wait for Service startup or shutdown to finish, then retry.
 
 For `NOTION_SCHEMA_INVALID` or configuration errors, check the configured database and integration access. `init` can create a compatible schema when the selected database is provisionable; otherwise it reports the mismatch. Do not use `doctor` as a repair command.
@@ -84,15 +84,16 @@ For `NOTION_SCHEMA_INVALID` or configuration errors, check the configured databa
 | `submit "<prompt>"` | Send one prompt; success prints its accepted Job UUID. `--diagnostics` adds redacted browser observations on failure. |
 | `jobs [uuid]` | List recent Jobs or read one Job's current remote State, Result, and Error. |
 | `attempts [uuid]` | Read local submission diagnostics; no Notion request. |
+| `inspect <uuid>` | Reconcile one local Attempt with the current remote Invocation and report conservative retry safety as JSON. |
 | `config` | Open the configuration file in the default editor. |
 | `config path` | Print the configuration-file path. |
 | `config show` / `config set KEY VALUE` | Inspect or change local configuration. `config show` redacts the token. |
 | `init` | Create or validate the configured Notion Invocation database. |
-| `open` | Open visible Chrome for manual sign-in or a browser check. |
-| `doctor` | Actively checks configuration, Notion schema, browser profile, authentication, and composer readiness. It may start the private browser runtime and does not test ChatGPT-to-Notion write access. |
+| `open` | Ask for confirmation, then open visible Chrome for manual sign-in or a browser check. |
+| `doctor` / `doctor --browser` | Passive checks by default; `--browser` explicitly checks the private browser runtime and authentication, even when Notion configuration is unavailable. Neither mode opens visible Chrome or submits a Job. |
 | `start`, `status`, `port`, `stop` | Explicitly start, inspect, or stop the local Service. `submit` and `jobs` start it when needed. |
 
-The optional `npm run smoke` command is an end-to-end verification, not routine setup. It performs a real external submission and Job read using the repository's ignored `.env`; authentication needs may open a browser for manual sign-in. See [smoke and runtime details](docs/technical-reference.md#sandbox-smoke).
+The optional `npm run smoke` command is an end-to-end verification, not routine setup. It performs a real external submission and Job read using the repository's ignored `.env`. If manual authentication is needed, an interactive run asks before opening the isolated profile; an unattended run stops without opening a browser. See [smoke and runtime details](docs/technical-reference.md#sandbox-smoke).
 
 For the authenticated loopback HTTP interface, detailed submission semantics, local diagnostics, and smoke cleanup behavior, see the [technical reference](docs/technical-reference.md).
 
@@ -101,10 +102,10 @@ For the authenticated loopback HTTP interface, detailed submission semantics, lo
 Use only capabilities that are available in the current environment and actions the user or parent agent has authorized. Browser access, Notion access, local CLI access, and permission to act are separate conditions; having one does not imply the others.
 
 - **Normal path:** when the requested prompt is authorized and the CLI is available, submit it once, capture the returned UUID, and read that same Job with `chatgpt-shot jobs <uuid>`. Repeat the read to check progress; `submit` does not wait for a final Result.
-- **Before another submission:** inspect `chatgpt-shot attempts [uuid]` first, then reconcile the existing Job through `chatgpt-shot jobs [uuid]` when Notion access is available. A not-yet-confirmed Job is not permission to submit again.
+- **Before another submission:** run `chatgpt-shot inspect <uuid>` to reconcile local evidence and the remote Job. A not-yet-confirmed Job is not permission to submit again.
 - **Retry only when known safe:** retry after `SUBMISSION_FAILED`, or after a request rejected before browser admission such as an authentication, user-intervention, or Service-busy error has been resolved. Never retry `ADMISSION_TIMEOUT`, `SUBMISSION_UNCERTAIN`, cancellation, or a lost Notion response unless the original Job is reconciled and the user authorizes any remaining risk.
-- **Visible browser boundary:** `open` launches visible Chrome with the retained profile. Do not run it without user approval. It does not sign in or verify a challenge for the user.
-- **Diagnostics are active:** `doctor` performs Notion and browser checks; it is not a general retry or repair step. `npm run smoke` makes a real submission and may open Chrome. Do not invoke either without authorization for those effects.
+- **Visible browser boundary:** `open` launches visible Chrome only after an interactive typed confirmation. It does not sign in or verify a challenge for the user.
+- **Diagnostics are passive by default:** `doctor` does not start a browser or Service. `doctor --browser` is an explicit private-browser check. `npm run smoke` makes a real submission; if authentication is required, it asks before opening Chrome and never opens one during an unattended run.
 - **When blocked:** if CLI, Notion, browser, or interactive user capabilities are missing—or the user has not authorized the required action—do not invent a recovery path. Report what was and was not observed, the concrete limitation, and the user action needed.
 
 See the technical reference for protocol details.

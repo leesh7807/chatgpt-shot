@@ -3,39 +3,67 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, openSync, closeSync, linkSync, readFileSync, renameSync, unlinkSync, writeFileSync, chmodSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
-import { loadConfig, type Config } from './config.js';
+import { loadConfig, paths, type Config, type Paths } from './config.js';
 import { databaseIdFromUrl, NotionStore } from './notion.js';
 import { ChatGPTBrowser, openProfileBrowser, shutdownBroker } from './browser.js';
 import { startJob } from './service.js';
 import { isErrorCode, ShotError, fail } from './errors.js';
-import { JobTelemetrySession, type JobTelemetryInput } from './job-telemetry.js';
+import { JobTelemetrySession, readRecentJobTelemetry, type JobTelemetryInput } from './job-telemetry.js';
+import { buildAttemptRecoveryReport, type RemoteJobObservation } from './recovery.js';
 
 export type Discovery = { pid: number; host: '127.0.0.1'; port: number; protocolVersion: 1; credential: string };
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-const responseError = (error: unknown) => error instanceof ShotError ? { code: error.code, message: error.message, ...(error.diagnostics ? { diagnostics: error.diagnostics } : {}) } : { code: 'INTERNAL_ERROR', message: error instanceof Error ? error.message : String(error) };
+const responseError = (error: unknown, attemptId?: string) => ({
+  ...(error instanceof ShotError ? { code: error.code, message: error.message, ...(error.diagnostics ? { diagnostics: error.diagnostics } : {}) } : { code: 'INTERNAL_ERROR', message: error instanceof Error ? error.message : String(error) }),
+  ...(attemptId ? { attempt_id: attemptId, recovery: { inspect: `chatgpt-shot inspect ${attemptId}`, automatic_retry: false } } : {}),
+});
 export function readDiscovery(config: Pick<Config, 'discoveryPath'> = loadConfig()): Discovery | undefined { try { const record = JSON.parse(readFileSync(config.discoveryPath, 'utf8')); return record?.host === '127.0.0.1' && Number.isInteger(record.port) && typeof record.credential === 'string' ? record : undefined; } catch { return undefined; } }
 function publish(config: Config, record: Discovery) { const temporary = `${config.discoveryPath}.${process.pid}.${randomBytes(4).toString('hex')}`; writeFileSync(temporary, JSON.stringify(record), { mode: 0o600 }); chmodSync(temporary, 0o600); renameSync(temporary, config.discoveryPath); chmodSync(config.discoveryPath, 0o600); }
-export function removeDiscovery(config: Pick<Config, 'discoveryPath'>, expectedCredential: string) { const current = readDiscovery(config); if (current?.credential !== expectedCredential) return; try { unlinkSync(config.discoveryPath); } catch {} }
+export function removeDiscovery(config: Pick<Paths, 'discoveryPath'>, expectedCredential: string) { const current = readDiscovery(config); if (current?.credential !== expectedCredential) return; try { unlinkSync(config.discoveryPath); } catch {} }
 export const JOB_TRANSPORT_TIMEOUT_MS = 0;
 export const REQUEST_BODY_TIMEOUT_MS = 30_000;
 export async function call<T>(record: Discovery, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   return await new Promise<T>((resolve, reject) => {
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const timeout = (path === '/jobs' && body !== undefined) || path === '/prepare-open' ? 0 : 10_000;
+    let attemptId: string | undefined;
+    const correlateError = (error: unknown): unknown => {
+      if (!attemptId) return error;
+      if (error instanceof ShotError) {
+        if (!error.attemptId) error.attemptId = attemptId;
+        return error;
+      }
+      const correlated = new ShotError('SUBMISSION_UNCERTAIN', 'The Service connection failed after an Attempt was created; inspect this Attempt before considering another submission.', error);
+      correlated.attemptId = attemptId;
+      return correlated;
+    };
+    const rejectCorrelated = (error: unknown) => reject(correlateError(error));
     const req = httpRequest({ host: record.host, port: record.port, path, method: body === undefined ? 'GET' : 'POST', headers: { authorization: `Bearer ${record.credential}`, ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}) }, ...(timeout ? { timeout } : {}) }, res => {
+      const rejectIncompleteResponse = () => rejectCorrelated(new Error('Service response ended before the complete response body was received.'));
+      res.once('aborted', rejectIncompleteResponse);
+      res.once('error', rejectCorrelated);
+      res.once('close', () => { if (!res.complete) rejectIncompleteResponse(); });
       let text = ''; res.setEncoding('utf8'); res.on('data', c => text += c); res.on('end', () => {
         try {
-          const parsed = JSON.parse(text) as { code?: unknown; message?: unknown; diagnostics?: unknown };
+          const parsed = JSON.parse(text) as { code?: unknown; message?: unknown; diagnostics?: unknown; attempt_id?: unknown };
           if (res.statusCode !== 200) {
-            if (isErrorCode(parsed.code)) { const error = new ShotError(parsed.code, typeof parsed.message === 'string' ? parsed.message : 'Service request failed.'); if (parsed.diagnostics !== undefined) error.diagnostics = parsed.diagnostics; reject(error); }
-            else reject(new Error(typeof parsed.message === 'string' ? parsed.message : 'Service request failed.'));
+            if (isErrorCode(parsed.code)) { const error = new ShotError(parsed.code, typeof parsed.message === 'string' ? parsed.message : 'Service request failed.'); if (parsed.diagnostics !== undefined) error.diagnostics = parsed.diagnostics; if (typeof parsed.attempt_id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.attempt_id)) error.attemptId = parsed.attempt_id.toLowerCase(); rejectCorrelated(error); }
+            else rejectCorrelated(new Error(typeof parsed.message === 'string' ? parsed.message : 'Service request failed.'));
           } else resolve(parsed as T);
-        } catch (error) { reject(error); }
+        } catch (error) { rejectCorrelated(error); }
       });
     });
-    const abort = () => req.destroy(new ShotError('ADMISSION_CANCELLED', 'The caller cancelled Job admission.'));
+    req.on('information', info => {
+      const hinted = info.headers['x-chatgpt-shot-attempt-id'];
+      if (typeof hinted === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(hinted)) attemptId = hinted.toLowerCase();
+    });
+    const abort = () => {
+      const error = new ShotError('ADMISSION_CANCELLED', 'The caller cancelled Job admission.');
+      if (attemptId) error.attemptId = attemptId;
+      req.destroy(error);
+    };
     if (signal?.aborted) return abort();
-    signal?.addEventListener('abort', abort, { once: true }); req.once('error', reject);
+    signal?.addEventListener('abort', abort, { once: true }); req.once('error', rejectCorrelated);
     if (timeout) req.once('timeout', () => req.destroy(new Error('Service request timed out.')));
     if (payload) req.write(payload); req.end();
   });
@@ -52,7 +80,7 @@ export async function serviceStatus(config: Pick<Config, 'discoveryPath'> = load
 export async function healthy(config: Pick<Config, 'discoveryPath'> = loadConfig()): Promise<Discovery | undefined> { return (await serviceStatus(config))?.record; }
 function processAlive(pid: number) { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; } }
 export function browserProfileBusyForOpen(openingBrowser: boolean, browserAdmissions: number): boolean { return openingBrowser || browserAdmissions > 0; }
-export function discardDeadServiceDiscovery(config: Pick<Config, 'discoveryPath'>): boolean {
+export function discardDeadServiceDiscovery(config: Pick<Paths, 'discoveryPath'>): boolean {
   const record = readDiscovery(config);
   if (!record) return true;
   if (processAlive(record.pid)) return false;
@@ -63,22 +91,22 @@ type StartupRecord = { pid: number; token: string };
 type StartupLock = StartupRecord & { fd: number };
 type ManualOpenRecord = { pid: number; token: string; browserPid?: number };
 type ManualOpenLock = ManualOpenRecord & { fd: number };
-function readStartup(config: Config): StartupRecord | undefined { try { const record = JSON.parse(readFileSync(config.lockPath, 'utf8')); return Number.isInteger(record?.pid) && typeof record?.token === 'string' ? record : undefined; } catch { return undefined; } }
+function readStartup(config: Pick<Paths, 'lockPath'>): StartupRecord | undefined { try { const record = JSON.parse(readFileSync(config.lockPath, 'utf8')); return Number.isInteger(record?.pid) && typeof record?.token === 'string' ? record : undefined; } catch { return undefined; } }
 function lock(config: Config): StartupLock | undefined { try { const fd = openSync(config.lockPath, 'wx', 0o600); const record = { pid: process.pid, token: randomBytes(24).toString('base64url') }; writeFileSync(fd, JSON.stringify(record)); chmodSync(config.lockPath, 0o600); return { fd, ...record }; } catch { return undefined; } }
 function releaseStartup(config: Config, token: string, fd?: number) { try { if (readStartup(config)?.token === token) unlinkSync(config.lockPath); } catch {} finally { if (fd !== undefined) try { closeSync(fd); } catch {} } }
-function reclaimStaleStartup(config: Config): boolean { const owner = readStartup(config); if (owner && processAlive(owner.pid)) return false; if (readStartup(config)?.token !== owner?.token) return false; try { unlinkSync(config.lockPath); return true; } catch { return false; } }
+function reclaimStaleStartup(config: Pick<Paths, 'lockPath'>): boolean { const owner = readStartup(config); if (owner && processAlive(owner.pid)) return false; if (readStartup(config)?.token !== owner?.token) return false; try { unlinkSync(config.lockPath); return true; } catch { return false; } }
 function claimStartup(config: Config, token: string): boolean { const owner = readStartup(config); if (owner?.token !== token) return false; writeFileSync(config.lockPath, JSON.stringify({ pid: process.pid, token }), { mode: 0o600 }); chmodSync(config.lockPath, 0o600); return true; }
-function readManualOpen(config: Config): ManualOpenRecord | undefined {
+function readManualOpen(config: Pick<Paths, 'manualOpenLockPath'>): ManualOpenRecord | undefined {
   try {
     const record = JSON.parse(readFileSync(config.manualOpenLockPath, 'utf8'));
     return Number.isInteger(record?.pid) && record.pid > 0 && typeof record?.token === 'string' && (record.browserPid === undefined || (Number.isInteger(record.browserPid) && record.browserPid > 0)) ? record : undefined;
   } catch { return undefined; }
 }
-function publishManualOpen(config: Config, record: ManualOpenRecord) {
+function publishManualOpen(config: Pick<Paths, 'manualOpenLockPath'>, record: ManualOpenRecord) {
   const temporary = `${config.manualOpenLockPath}.${process.pid}.${randomBytes(4).toString('hex')}`;
   writeFileSync(temporary, JSON.stringify(record), { mode: 0o600 }); chmodSync(temporary, 0o600); renameSync(temporary, config.manualOpenLockPath); chmodSync(config.manualOpenLockPath, 0o600);
 }
-function lockManualOpen(config: Config): ManualOpenLock | undefined {
+function lockManualOpen(config: Pick<Paths, 'manualOpenLockPath'>): ManualOpenLock | undefined {
   const record = { pid: process.pid, token: randomBytes(24).toString('base64url') };
   const temporary = `${config.manualOpenLockPath}.${process.pid}.${randomBytes(4).toString('hex')}`;
   try {
@@ -93,14 +121,14 @@ function lockManualOpen(config: Config): ManualOpenLock | undefined {
     return undefined;
   }
 }
-function updateManualOpen(config: Config, token: string, browserPid: number) {
+function updateManualOpen(config: Pick<Paths, 'manualOpenLockPath'>, token: string, browserPid: number) {
   const current = readManualOpen(config); if (current?.token === token) publishManualOpen(config, { ...current, browserPid });
 }
-function releaseManualOpen(config: Config, token: string, fd?: number) {
+function releaseManualOpen(config: Pick<Paths, 'manualOpenLockPath'>, token: string, fd?: number) {
   try { if (readManualOpen(config)?.token === token) unlinkSync(config.manualOpenLockPath); }
   catch {} finally { if (fd !== undefined) try { closeSync(fd); } catch {} }
 }
-function reclaimStaleManualOpen(config: Config): boolean {
+function reclaimStaleManualOpen(config: Pick<Paths, 'manualOpenLockPath'>): boolean {
   const owner = readManualOpen(config); if (!owner) return false;
   if (processAlive(owner.pid) || (owner.browserPid !== undefined && processAlive(owner.browserPid))) return false;
   if (readManualOpen(config)?.token !== owner.token) return false;
@@ -141,7 +169,7 @@ export async function ensureService(config = loadConfig()): Promise<Discovery> {
   }
   return fail('BROWSER_UNAVAILABLE', 'Could not start a healthy chatgpt-shot Service.') as never;
 }
-export async function openBrowser(config = loadConfig()): Promise<void> {
+export async function openBrowser(config: Pick<Paths, 'browserProfilePath' | 'discoveryPath' | 'lockPath' | 'manualOpenLockPath'> = paths()): Promise<void> {
   let record = await healthy(config);
   if (!record && !discardDeadServiceDiscovery(config)) return fail('BROWSER_UNAVAILABLE', 'Service health could not be confirmed for a live Service process; discovery was preserved and the browser profile was not opened.') as never;
   if (!record && existsSync(config.lockPath) && !reclaimStaleStartup(config)) return fail('SERVICE_BUSY', 'Service startup or shutdown is in progress. Retry opening the profile shortly.') as never;
@@ -174,10 +202,10 @@ export async function runService(): Promise<void> {
   const credential = randomBytes(32).toString('base64url'); let stopping = false; let openingBrowser = false; let active = 0; let browserAdmissions = 0; let server: ReturnType<typeof createServer>;
   const admissions = new Set<AbortController>();
   const json = (res: any, status: number, body: unknown) => { if (!res.destroyed) { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); } };
-  const jsonError = (res: any, error: unknown) => {
+  const jsonError = (res: any, error: unknown, attemptId?: string) => {
     if (error instanceof ShotError && error.code === 'NOTION_RATE_LIMITED') {
       if (error.retryAfterSeconds !== undefined) res.setHeader('retry-after', String(error.retryAfterSeconds));
-      return json(res, 429, responseError(error));
+      return json(res, 429, responseError(error, attemptId));
     }
     const status = error instanceof ShotError ? error.httpStatus ?? ({
       ADMISSION_TIMEOUT: 504,
@@ -194,7 +222,7 @@ export async function runService(): Promise<void> {
       NOTION_SCHEMA_INVALID: 422,
       INVOCATION_CREATE_FAILED: 502,
     } as Record<string, number>)[error.code] ?? 500 : 500;
-    return json(res, status, responseError(error));
+    return json(res, status, responseError(error, attemptId));
   };
   const durable = async (store: NotionStore, databaseId: string, id: string) => {
     const invocation = await store.findInvocation(databaseId, id);
@@ -209,6 +237,26 @@ export async function runService(): Promise<void> {
       if (existsSync(config.manualOpenLockPath)) reclaimStaleManualOpen(config);
       const manualOpen = existsSync(config.manualOpenLockPath);
       return json(res, 200, { pid: process.pid, protocolVersion: 1, accepting: !stopping && !openingBrowser && !manualOpen, state: stopping ? 'stopping' : openingBrowser || manualOpen ? 'browser-open' : 'ready' });
+    }
+    const attemptMatch = req.url?.match(/^\/attempts\/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i);
+    if (req.method === 'GET' && attemptMatch) {
+      const attemptId = attemptMatch[1].toLowerCase();
+      let attempt;
+      let localErrorCode: string | undefined;
+      try { attempt = readRecentJobTelemetry(undefined, attemptId)[0]; }
+      catch (error) { localErrorCode = error instanceof ShotError ? error.code : 'LOCAL_DIAGNOSTICS_UNAVAILABLE'; }
+      let remote: RemoteJobObservation;
+      try {
+        const current = loadConfig();
+        const invocation = await new NotionStore(current.notionToken).findInvocation(databaseIdFromUrl(current.databaseUrl), attemptId);
+        remote = invocation
+          ? { status: invocation.state === 'pending' ? 'pending' : 'accepted', source: 'notion', job: { id: invocation.id, state: invocation.state, ...(invocation.error ? { error: invocation.error } : {}) } }
+          : { status: 'not_found', source: 'notion' };
+      } catch (error) {
+        const code = error instanceof ShotError ? error.code : 'INTERNAL_ERROR';
+        remote = { status: 'unavailable', source: 'notion', code, reason: code === 'CONFIG_INVALID' ? 'configuration_unavailable' : 'notion_lookup_failed' };
+      }
+      return json(res, 200, buildAttemptRecoveryReport(attemptId, attempt, remote, localErrorCode));
     }
     if (req.url === '/stop' && req.method === 'POST') { json(res, 200, { stopping: true }); void stop(); return; }
     if (req.url === '/prepare-open' && req.method === 'POST') {
@@ -251,6 +299,7 @@ export async function runService(): Promise<void> {
         if (!input || typeof input !== 'object' || Array.isArray(input) || typeof prompt !== 'string' || !prompt.trim() || fields.some(field => field !== 'prompt' && field !== 'diagnostics' && field !== 'observeApproval') || (input.diagnostics !== undefined && typeof input.diagnostics !== 'boolean') || (input.observeApproval !== undefined && typeof input.observeApproval !== 'boolean')) fail('CONFIG_INVALID', 'jobs requires a non-empty prompt and optional diagnostics and observeApproval booleans.');
         const id = randomUUID();
         telemetry = new JobTelemetrySession(id);
+        if (!responseDisconnected && !res.destroyed) res.writeEarlyHints({ link: `</attempts/${id}>; rel=related`, 'x-chatgpt-shot-attempt-id': id });
         const event = (name: JobTelemetryInput['event'], fields: Omit<JobTelemetryInput, 'event'> = {}) => telemetry!.record({ event: name, ...fields });
         event('admission_started', { stage: 'service_request' });
         requestAdmission = new AbortController(); admissions.add(requestAdmission);
@@ -277,7 +326,7 @@ export async function runService(): Promise<void> {
           throw error;
         }
         event('notion_schema_validation', { stage, outcome: 'succeeded', duration_ms: performance.now() - schemaStarted });
-        if (stopping || openingBrowser || existsSync(config.manualOpenLockPath)) { if (existsSync(config.manualOpenLockPath)) reclaimStaleManualOpen(config); const manualOpen = existsSync(config.manualOpenLockPath); const error = new ShotError(stopping ? 'SERVICE_STOPPING' : 'SERVICE_BUSY', stopping ? 'Service is not accepting this request.' : manualOpen ? 'The browser profile is open for manual use. Retry after the browser window closes.' : 'Service is preparing the browser profile.'); event('admission_failed', { stage: 'service_admission', error: { code: error.code } }); return json(res, 503, responseError(error)); }
+        if (stopping || openingBrowser || existsSync(config.manualOpenLockPath)) { if (existsSync(config.manualOpenLockPath)) reclaimStaleManualOpen(config); const manualOpen = existsSync(config.manualOpenLockPath); const error = new ShotError(stopping ? 'SERVICE_STOPPING' : 'SERVICE_BUSY', stopping ? 'Service is not accepting this request.' : manualOpen ? 'The browser profile is open for manual use. Retry after the browser window closes.' : 'Service is preparing the browser profile.'); event('admission_failed', { stage: 'service_admission', error: { code: error.code } }); return json(res, 503, responseError(error, telemetry?.jobId)); }
         if (requestAdmission.signal.aborted) fail('ADMISSION_CANCELLED', 'The caller disconnected before Job admission began.');
         stage = 'browser_admission';
         telemetryDelegated = true;
@@ -295,9 +344,9 @@ export async function runService(): Promise<void> {
         }
         const manualOpen = existsSync(config.manualOpenLockPath);
         if (manualOpen) reclaimStaleManualOpen(config);
-        if (stopping) return json(res, 503, { code: 'SERVICE_STOPPING', message: 'Service is not accepting this request.' });
-        if (openingBrowser || manualOpen) return json(res, 503, { code: 'SERVICE_BUSY', message: 'The browser profile is reserved for manual use. Retry after the browser window closes.' });
-        return jsonError(res, error);
+        if (stopping) return json(res, 503, responseError(new ShotError('SERVICE_STOPPING', 'Service is not accepting this request.'), telemetry?.jobId));
+        if (openingBrowser || manualOpen) return json(res, 503, responseError(new ShotError('SERVICE_BUSY', 'The browser profile is reserved for manual use. Retry after the browser window closes.'), telemetry?.jobId));
+        return jsonError(res, error, telemetry?.jobId);
       } finally { if (requestAdmission) admissions.delete(requestAdmission); }
     });
   });
