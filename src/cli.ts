@@ -170,9 +170,14 @@ export async function inspectAttempt(attemptId: string): Promise<Record<string, 
     const config = loadConfig();
     const running = await serviceStatus(config);
     if (running) {
-      const report = await call<Record<string, unknown>>(running.record, `/attempts/${normalizedId}`);
-      if (localErrorCode) report.local_attempt = { found: false, status: 'unavailable', code: localErrorCode, source: 'local_attempt_telemetry', authority: 'local_evidence' };
-      return report;
+      try {
+        const report = await call<Record<string, unknown>>(running.record, `/attempts/${normalizedId}`);
+        if (localErrorCode) report.local_attempt = { found: false, status: 'unavailable', code: localErrorCode, source: 'local_attempt_telemetry', authority: 'local_evidence' };
+        return report;
+      } catch {
+        // The Service may become unreachable after its health check. Keep the
+        // independent read-only Notion reconciliation available in that race.
+      }
     }
     // Inspect is read-only. When an existing Service cannot be reached, keep
     // reconciliation available through the same configured Notion read used
@@ -237,14 +242,29 @@ export async function doctor(browser: boolean): Promise<Record<string, unknown>>
   if (config) {
     try {
       if (existingService) {
-        const jobs = await call<{ jobs?: unknown[] }>(existingService.record, '/jobs');
-        checks.notion = { status: 'passed', check: 'authenticated Service Job read', visible_jobs: jobs.jobs?.length ?? null };
+        try {
+          const jobs = await call<{ jobs?: unknown[] }>(existingService.record, '/jobs');
+          checks.notion = { status: 'passed', check: 'authenticated Service Job read', visible_jobs: jobs.jobs?.length ?? null };
+          capabilities.notion_read = { status: 'available', verified_by: 'existing_service_read' };
+        } catch {
+          // A Service health response can race with a later Service read failure.
+          // Recheck the Service separately, then diagnose Notion directly.
+          existingService = await serviceStatus({ discoveryPath: config.discoveryPath });
+          checks.service = existingService
+            ? { status: existingService.state, accepting: existingService.accepting, pid: existingService.record.pid }
+            : { status: 'unavailable', started_by_doctor: false };
+          if (!existingService) failed = true;
+          const store = new NotionStore(config.notionToken);
+          store.validateSchema(await store.database(databaseIdFromUrl(config.databaseUrl)));
+          checks.notion = { status: 'passed', check: 'Invocation database schema after Service read failure' };
+          capabilities.notion_read = { status: 'available', verified_by: 'schema_read_after_service_read_failure' };
+        }
       } else {
         const store = new NotionStore(config.notionToken);
         store.validateSchema(await store.database(databaseIdFromUrl(config.databaseUrl)));
         checks.notion = { status: 'passed', check: 'Invocation database schema' };
+        capabilities.notion_read = { status: 'available', verified_by: 'schema_read' };
       }
-      capabilities.notion_read = { status: 'available', verified_by: existingService ? 'existing_service_read' : 'schema_read' };
     } catch (error) {
       const code = error instanceof ShotError ? error.code : 'INTERNAL_ERROR';
       checks.notion = { status: 'failed', code };

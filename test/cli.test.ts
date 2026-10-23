@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -153,6 +155,83 @@ test('doctor reads Notion when existing Service discovery is unhealthy', async (
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
+    rmSync(configHome, { recursive: true, force: true });
+    rmSync(dataHome, { recursive: true, force: true });
+    rmSync(cacheHome, { recursive: true, force: true });
+  }
+});
+
+test('doctor and inspect retain Notion reads when Service fails after its health check', async () => {
+  const configHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-doctor-race-config-'));
+  const dataHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-doctor-race-data-'));
+  const cacheHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-doctor-race-cache-'));
+  const envNames = ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME'] as const;
+  const previousEnv = Object.fromEntries(envNames.map(name => [name, process.env[name]]));
+  const previousExitCode = process.exitCode;
+  const originalDatabase = NotionStore.prototype.database;
+  const originalFindInvocation = NotionStore.prototype.findInvocation;
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  let databaseReads = 0;
+  let invocationReads = 0;
+  const server = createServer((request, response) => {
+    if (request.url === '/health') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ pid: process.pid, protocolVersion: 1, accepting: true, state: 'ready' }));
+      return;
+    }
+    response.writeHead(503, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ code: 'SERVICE_STOPPING', message: 'service read failed after health' }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  try {
+    process.env.XDG_CONFIG_HOME = configHome;
+    process.env.XDG_DATA_HOME = dataHome;
+    process.env.XDG_CACHE_HOME = cacheHome;
+    const configDirectory = join(configHome, 'chatgpt-shot');
+    const runtimeDirectory = join(cacheHome, 'chatgpt-shot');
+    mkdirSync(configDirectory, { recursive: true });
+    mkdirSync(runtimeDirectory, { recursive: true });
+    writeFileSync(join(configDirectory, '.env'), 'NOTION_TOKEN=test-token\nCHATGPT_SHOT_NOTION_DATABASE_URL=https://www.notion.so/workspace/0123456789abcdef0123456789abcdef\n');
+    writeFileSync(join(runtimeDirectory, 'runtime.json'), JSON.stringify({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'healthy-then-failing-service' }));
+    NotionStore.prototype.database = async function () {
+      databaseReads++;
+      return { properties: {
+        ID: { type: 'title' },
+        State: { type: 'select', select: { options: [{ name: 'pending' }, { name: 'in_progress' }, { name: 'completed' }, { name: 'failed' }] } },
+        Error: { type: 'rich_text' },
+        'Created At': { type: 'created_time' },
+        'Updated At': { type: 'last_edited_time' },
+      } };
+    };
+    NotionStore.prototype.findInvocation = async function (_databaseId, invocationId) {
+      invocationReads++;
+      return { id: invocationId, pageId: 'remote-page', state: 'in_progress', error: '' };
+    };
+
+    const inspectReport = await inspectAttempt(id) as any;
+    const doctorReport = await doctor(false) as any;
+
+    assert.equal(inspectReport.remote.status, 'accepted');
+    assert.equal(inspectReport.remote.job.state, 'in_progress');
+    assert.equal(invocationReads, 1);
+    assert.equal(doctorReport.checks.service.status, 'ready');
+    assert.equal(doctorReport.checks.notion.status, 'passed');
+    assert.equal(doctorReport.capabilities.notion_read.status, 'available');
+    assert.equal(databaseReads, 1);
+  } finally {
+    NotionStore.prototype.database = originalDatabase;
+    NotionStore.prototype.findInvocation = originalFindInvocation;
+    process.exitCode = previousExitCode;
+    for (const name of envNames) {
+      const value = previousEnv[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    server.close();
+    await once(server, 'close');
     rmSync(configHome, { recursive: true, force: true });
     rmSync(dataHome, { recursive: true, force: true });
     rmSync(cacheHome, { recursive: true, force: true });
