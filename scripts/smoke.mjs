@@ -215,6 +215,14 @@ function run(executable, args, env) {
   });
 }
 
+function runInteractive(executable, args, env) {
+  return new Promise((resolveResult, reject) => {
+    const child = spawn(executable, args, { cwd: repositoryRoot, env, stdio: 'inherit' });
+    child.once('error', reject);
+    child.once('close', (code, signal) => resolveResult({ code, signal }));
+  });
+}
+
 async function buildProductionCli() {
   const result = await run(process.execPath, [join(repositoryRoot, 'node_modules', 'typescript', 'bin', 'tsc'), '-p', 'tsconfig.json'], process.env);
   if (result.code !== 0) {
@@ -239,9 +247,10 @@ function isAuthenticationFailure(result) {
 async function submitProbe() {
   let submitted = await cli('submit', probe);
   if (isAuthenticationFailure(submitted)) {
-    process.stdout.write('The retained smoke browser profile needs a manual ChatGPT sign-in. Sign in to the opened profile and close the browser to continue.\n');
-    const opened = await cli('open');
-    if (opened.code !== 0) throw new Error(`Could not open the retained smoke browser profile: ${failureDetail(opened)}`);
+    if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('The isolated smoke profile needs manual ChatGPT sign-in. No browser was opened because this run has no interactive user; rerun smoke in a terminal and confirm `chatgpt-shot open` when prompted.');
+    process.stdout.write('The isolated smoke profile needs manual ChatGPT sign-in. The next step asks before opening visible Chrome.\n');
+    const opened = await runInteractive(process.execPath, [cliPath, 'open'], childEnv());
+    if (opened.code !== 0) throw new Error(`Manual sign-in was not completed: chatgpt-shot open exited with ${opened.signal ?? opened.code}.`);
     submitted = await cli('submit', probe);
   }
   if (submitted.code !== 0) throw new Error(`Production submit failed: ${failureDetail(submitted)}`);

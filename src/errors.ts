@@ -7,6 +7,7 @@ export type ErrorCode =
 
 export class ShotError extends Error {
   diagnostics?: unknown;
+  attemptId?: string;
   retryAfterSeconds?: number;
   retryable?: boolean;
   httpStatus?: number;

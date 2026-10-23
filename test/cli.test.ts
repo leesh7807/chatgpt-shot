@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { ShotError } from '../src/errors.js';
 import { parseCli } from '../src/cli.js';
+import { LocalJobTelemetryWriter } from '../src/job-telemetry.js';
 
 const cli = (args: string[], configHome: string, extraEnv: NodeJS.ProcessEnv = {}) => spawnSync(process.execPath, ['--import', 'tsx', resolve('src/cli.ts'), ...args], { encoding: 'utf8', env: { ...process.env, XDG_CONFIG_HOME: configHome, ...extraEnv } });
 
@@ -25,13 +26,14 @@ test('every public command has local help on both supported flags', () => {
     ['config', /Usage:\n  chatgpt-shot config\n  chatgpt-shot config path\n  chatgpt-shot config show\n  chatgpt-shot config set KEY VALUE/],
     ['init', /Usage: chatgpt-shot init\n\nCreate or validate/],
     ['open', /Usage: chatgpt-shot open\n\nOpen the retained Chrome profile/],
-    ['doctor', /Usage: chatgpt-shot doctor\n\nCheck configuration/],
+    ['doctor', /Usage: chatgpt-shot doctor \[--browser\][\s\S]*without starting a Service or browser/],
     ['start', /Usage: chatgpt-shot start\n\nStart the local Service/],
     ['status', /Usage: chatgpt-shot status\n\nReport whether/],
     ['port', /Usage: chatgpt-shot port\n\nPrint the port/],
     ['submit', /Usage: chatgpt-shot submit \[--diagnostics\] \[--observe-approval\] "<prompt>"\n\nSubmit exactly one non-empty prompt and print its accepted Job UUID/],
     ['jobs', /Usage:\n  chatgpt-shot jobs[\s\S]*current State, Result, or Error/],
     ['attempts', /Usage:\n  chatgpt-shot attempts[\s\S]*latest 100 local submission diagnostic trails/],
+    ['inspect', /Usage: chatgpt-shot inspect <uuid>[\s\S]*retry safety/],
     ['stop', /Usage: chatgpt-shot stop\n\nStop the local Service/]
   ]);
   try {
@@ -51,11 +53,13 @@ test('every public command has local help on both supported flags', () => {
 
 test('help tokens resolve to their scope and are not submit prompts', () => {
   assert.deepEqual(parseCli(['--help']), { kind: 'help', scope: 'global' });
-  for (const command of ['config', 'init', 'open', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'attempts', 'stop'] as const) {
+  for (const command of ['config', 'init', 'open', 'doctor', 'start', 'status', 'port', 'submit', 'jobs', 'attempts', 'inspect', 'stop'] as const) {
     for (const flag of ['--help', '-h']) assert.deepEqual(parseCli([command, flag]), { kind: 'help', scope: command });
   }
   assert.deepEqual(parseCli(['submit', '--help']), { kind: 'help', scope: 'submit' });
   assert.deepEqual(parseCli(['submit', '-h']), { kind: 'help', scope: 'submit' });
+  assert.deepEqual(parseCli(['doctor']), { kind: 'command', command: 'doctor', rest: [] });
+  assert.deepEqual(parseCli(['doctor', '--browser']), { kind: 'command', command: 'doctor', rest: ['--browser'], doctorBrowser: true });
 });
 
 test('submit accepts one positional prompt exactly and preserves it', () => {
@@ -72,6 +76,84 @@ test('attempts accepts an optional version 4 Job UUID only', () => {
   assert.deepEqual(parseCli(['attempts']), { kind: 'command', command: 'attempts', rest: [] });
   assert.deepEqual(parseCli(['attempts', id]), { kind: 'command', command: 'attempts', rest: [id] });
   assert.throws(() => parseCli(['attempts', 'not-a-uuid']), (error: any) => error.code === 'CONFIG_INVALID');
+});
+
+test('inspect accepts exactly one version 4 Attempt UUID', () => {
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  assert.deepEqual(parseCli(['inspect', id]), { kind: 'command', command: 'inspect', rest: [id] });
+  for (const args of [['inspect'], ['inspect', 'bad'], ['inspect', id, id]]) assert.throws(() => parseCli(args), (error: any) => error.code === 'CONFIG_INVALID');
+  assert.throws(() => parseCli(['doctor', '--active']), (error: any) => error.code === 'CONFIG_INVALID');
+});
+
+test('default doctor reports passive capabilities without creating a Service or browser profile', () => {
+  const configHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-doctor-config-'));
+  const dataHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-doctor-data-'));
+  const cacheHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-doctor-cache-'));
+  try {
+    const result = cli(['doctor'], configHome, { XDG_DATA_HOME: dataHome, XDG_CACHE_HOME: cacheHome });
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr, '');
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.mode, 'passive');
+    assert.equal(report.checks.service.status, 'absent');
+    assert.equal(report.checks.private_browser.status, 'not_checked');
+    assert.equal(report.checks.visible_browser.status, 'not_requested');
+    assert.equal(report.capabilities.local_diagnostics.status, 'available');
+    assert.equal(existsSync(join(dataHome, 'chatgpt-shot', 'chrome-profile')), false);
+    assert.equal(existsSync(join(cacheHome, 'chatgpt-shot', 'runtime.json')), false);
+  } finally {
+    rmSync(configHome, { recursive: true, force: true });
+    rmSync(dataHome, { recursive: true, force: true });
+    rmSync(cacheHome, { recursive: true, force: true });
+  }
+});
+
+test('non-interactive open requests human intervention without starting Chrome', () => {
+  const configHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-open-config-'));
+  const dataHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-open-data-'));
+  const result = cli(['open'], configHome, { XDG_DATA_HOME: dataHome });
+  try {
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /^USER_INTERVENTION_REQUIRED:/);
+    assert.equal(existsSync(join(dataHome, 'chatgpt-shot', 'chrome-profile')), false);
+  } finally { rmSync(configHome, { recursive: true, force: true }); rmSync(dataHome, { recursive: true, force: true }); }
+});
+
+test('inspect remains available without Notion configuration and reports remote capability as unavailable', () => {
+  const configHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-inspect-config-'));
+  const cacheHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-inspect-cache-'));
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  try {
+    const result = cli(['inspect', id], configHome, { XDG_CACHE_HOME: cacheHome });
+    assert.equal(result.status, 0);
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.attempt_id, id);
+    assert.equal(report.local_attempt.found, false);
+    assert.equal(report.remote.status, 'unavailable');
+    assert.equal(report.remote.reason, 'configuration_unavailable');
+    assert.equal(report.retry_safety.status, 'unknown');
+  } finally { rmSync(configHome, { recursive: true, force: true }); rmSync(cacheHome, { recursive: true, force: true }); }
+});
+
+test('inspect reconciles a local Attempt through the CLI when Notion configuration is unavailable', () => {
+  const configHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-inspect-config-'));
+  const cacheHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-inspect-cache-'));
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const writer = new LocalJobTelemetryWriter(join(cacheHome, 'chatgpt-shot', 'jobs.jsonl'));
+  const timestamp = new Date().toISOString();
+  writer.record({ job_id: id, event: 'admission_started', timestamp, stage: 'authentication' });
+  writer.record({ job_id: id, event: 'admission_failed', timestamp, stage: 'authentication', error: { code: 'CHATGPT_AUTH_REQUIRED' } });
+  try {
+    const result = cli(['inspect', id], configHome, { XDG_CACHE_HOME: cacheHome });
+    assert.equal(result.status, 0);
+    const report = JSON.parse(result.stdout);
+    assert.equal(report.local_attempt.found, true);
+    assert.equal(report.local_attempt.delivery, 'not_submitted');
+    assert.equal(report.local_attempt.error_code, 'CHATGPT_AUTH_REQUIRED');
+    assert.equal(report.remote.status, 'unavailable');
+    assert.equal(report.retry_safety.status, 'safe');
+    assert.match(report.next_actions[0], /chatgpt-shot open/);
+  } finally { rmSync(configHome, { recursive: true, force: true }); rmSync(cacheHome, { recursive: true, force: true }); }
 });
 
 test('attempts reads local diagnostics without requiring a Notion configuration', () => {

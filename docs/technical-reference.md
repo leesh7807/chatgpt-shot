@@ -6,9 +6,9 @@ This document contains the runtime and diagnostic contracts behind the user work
 
 Configuration is owner-only (0600) at `$XDG_CONFIG_HOME/chatgpt-shot/.env`, defaulting to `~/.config/chatgpt-shot/.env`. The retained browser profile is at `$XDG_DATA_HOME/chatgpt-shot/chrome-profile` or `~/.local/share/chatgpt-shot/chrome-profile`. Service discovery is at `$XDG_CACHE_HOME/chatgpt-shot/runtime.json` or `~/.cache/chatgpt-shot/runtime.json`. XDG overrides apply. `config show` never prints the token.
 
-On Linux, the browser runtime uses headful Chrome on a private broker-owned X11 display and requires `Xvfb`. `open` instead opens the retained profile in visible system Chrome. If the Service is running, it keeps the Service and discovery record alive while the visible browser is open. New submissions receive `SERVICE_BUSY` until Chrome closes. Accepted Jobs can continue their Notion completion polling because their submission tabs have already closed. If the Service is absent, `open` opens the profile without starting it; use `start` separately when you want the Service running. Closing Chrome does not verify sign-in or a browser challenge.
+On Linux, the browser runtime uses headful Chrome on a private broker-owned X11 display and requires `Xvfb`. `open` instead opens the retained profile in visible system Chrome, but only after an interactive terminal user types yes at its confirmation prompt. Non-interactive calls return `USER_INTERVENTION_REQUIRED` without opening a window. It needs local XDG paths but does not require Notion configuration. If the Service is running, it keeps the Service and discovery record alive while the visible browser is open. New submissions receive `SERVICE_BUSY` until Chrome closes. Accepted Jobs can continue their Notion completion polling because their submission tabs have already closed. If the Service is absent, `open` opens the profile without starting it; use `start` separately when you want the Service running. Closing Chrome does not verify sign-in or a browser challenge.
 
-`doctor` validates the configured Notion database and actively starts or uses the browser runtime to check browser availability, ChatGPT authentication, and composer access. It does not verify ChatGPT-to-Notion write access. It is a diagnostic, not a recovery command.
+`doctor` returns JSON with checked, skipped, and failed checks. By default it reads configuration, local telemetry, existing Service health, and the configured Notion schema without starting a Service or browser. `doctor --browser` explicitly starts or uses the private browser runtime to check availability, ChatGPT authentication, and composer access, even when Notion configuration is unavailable; it never opens visible Chrome or submits a Job. Neither mode verifies ChatGPT-to-Notion write access.
 
 ## Submission and Job lifecycle
 
@@ -32,6 +32,8 @@ An exception, interruption, acknowledgement timeout, or lost observer is not evi
 | `NOTION_UNAVAILABLE` / `NOTION_RATE_LIMITED` | Notion observation failed and was not recovered within the admission window. The original Notion category is preserved. |
 | `ADMISSION_CANCELLED` | The caller or Service cancelled before acceptance was confirmed. Cancellation alone does not prove non-delivery. |
 | `BROWSER_CONTEXT_CLOSE_FAILED` | Remote acceptance was observed, but the tab could not be confirmed closed. The accepted Job remains active; recover its local UUID with `chatgpt-shot attempts` and do not submit it again. |
+
+When a Service submission error occurs after its local Attempt is created, the HTTP error includes `attempt_id` and a read-only inspect command. The CLI preserves its normal `CODE: message` line and appends a `RECOVERY_JSON:` line with the correlation ID. Use `chatgpt-shot inspect <attempt-id>` to see local delivery evidence, the current Notion lookup and conservative retry guidance. The prompt is never stored in telemetry.
 
 There is no execution timeout: submission ends after remote acceptance, while terminal Result and Error remain Job-read concerns.
 
@@ -64,7 +66,10 @@ Read available trails without a Notion request:
 ```sh
 chatgpt-shot attempts
 chatgpt-shot attempts <uuid>
+chatgpt-shot inspect <uuid>
 ```
+
+`inspect` returns schema-versioned JSON. It labels local Attempt telemetry as local evidence and the current Invocation read as a Notion observation. A Notion read failure is reported as unavailable; it does not turn the local Attempt into a failed or unsent Job. Retry safety is marked safe only when delivery is proven absent and any created Invocation is confirmed cleaned up or absent. The command never retries.
 
 ## Approval observation
 
@@ -86,13 +91,13 @@ When the repository root contains its ignored `.env`, run the production-path sm
 npm run smoke
 ```
 
-The smoke copies that configuration into ignored `.smoke/` state with owner-only permissions, sets all three XDG locations there for the production CLI and detached children, builds and invokes the CLI, submits a fixed probe, then reads the returned Job UUID through `chatgpt-shot jobs`. If the retained smoke profile needs authentication, it opens that profile for manual sign-in; it never automates login. This command performs a real external submission and is not a routine setup or repair command.
+The smoke copies that configuration into ignored `.smoke/` state with owner-only permissions, sets all three XDG locations there for the production CLI and detached children, builds and invokes the CLI, submits a fixed probe, then reads the returned Job UUID through `chatgpt-shot jobs`. If the isolated profile needs authentication, an interactive run asks before opening visible Chrome for manual sign-in; an unattended run stops with a human-intervention message and never opens a browser. It never automates login. This command performs a real external submission and is not a routine setup or repair command.
 
 After the CLI stops the smoke Service and drains accepted work, smoke removes runtime caches, telemetry, Chrome caches, profile singleton links, and other machine-local XDG files. It retains only `.smoke/config/chatgpt-shot/.env` and `.smoke/data/chatgpt-shot/chrome-profile`, preserving the authenticated profile. A missing or invalid `.env`, browser or external readiness failure, unsuccessful submission, unreadable Job, or unsuccessful final cleanup exits with failure. Forced process or machine termination can interrupt cleanup; after normal completion, retained state is transfer-ready. The ordinary CLI continues to use the user's XDG locations.
 
 ## Authenticated local HTTP contract
 
-The Service binds only to `127.0.0.1` on an OS-selected port. Its owner-only discovery record contains `{ pid, host, port, protocolVersion, credential }`; treat it only as discovery, call health before trusting it, and send the same bearer credential on every request. All Job HTTP surfaces require bearer authentication; a UUID alone is not authorization.
+The Service binds only to `127.0.0.1` on an OS-selected port. Its owner-only discovery record contains `{ pid, host, port, protocolVersion, credential }`; treat it only as discovery, call health before trusting it, and send the same bearer credential on every request. All Job and Attempt HTTP surfaces require bearer authentication; a UUID alone is not authorization.
 
 `GET /health` returns health including `accepting` and `state` (`ready`, `browser-open`, or `stopping`). `accepting` is false while the Service is stopping or the retained browser profile is open for manual use.
 
@@ -111,7 +116,7 @@ Content-Type: application/json
 {"token":"<current profile reservation token>"}
 ```
 
-`POST /jobs` accepts `{"prompt":"<non-empty prompt>"}` and optional boolean `diagnostics` and `observeApproval` fields. It does not accept caller-supplied Job IDs. Success responds only with `{"id":"<Service-generated UUID>"}` after remote acceptance and confirmed tab closure, even when the first observed State is `completed` or `failed`. If tab closure cannot be confirmed, the request fails with `BROWSER_CONTEXT_CLOSE_FAILED`; the remote Job remains owned by the agent and its UUID can be recovered from local `attempts`.
+`POST /jobs` accepts `{"prompt":"<non-empty prompt>"}` and optional boolean `diagnostics` and `observeApproval` fields. It does not accept caller-supplied Job IDs. Success responds only with `{"id":"<Service-generated UUID>"}` after remote acceptance and confirmed tab closure, even when the first observed State is `completed` or `failed`. If tab closure cannot be confirmed, the request fails with `BROWSER_CONTEXT_CLOSE_FAILED`; when an Attempt exists, errors include `attempt_id` and `recovery: { inspect, automatic_retry: false }` while preserving `code` and `message`.
 
 ```http
 POST /jobs
@@ -123,11 +128,16 @@ Content-Type: application/json
 
 `GET /jobs` returns recent Job summaries. `GET /jobs/<uuid>` returns the current durable State, Result, and Error. Service failures return JSON `{"code","message"}` with a non-200 status. `pending` is only the pre-acceptance Notion record state; terminal Result and Error are read from the Job surface after submission.
 
+`GET /attempts/<uuid>` returns the same read-only recovery report as `chatgpt-shot inspect <uuid>`. It reads local telemetry and queries the current Invocation through Notion; it does not submit a prompt or start a browser.
+
 ```http
 GET /jobs
 Authorization: Bearer <credential>
 
 GET /jobs/<uuid>
+Authorization: Bearer <credential>
+
+GET /attempts/<uuid>
 Authorization: Bearer <credential>
 ```
 
