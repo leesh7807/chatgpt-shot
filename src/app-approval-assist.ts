@@ -6,7 +6,7 @@ export type AppApprovalReason =
   | 'broker_unavailable'
   | 'invalid_result';
 
-export type AppApprovalChoice = 'always_allow' | 'allow_once';
+export type AppApprovalChoice = 'always_allow' | 'allow_once' | 'allow';
 export type ApprovalScreenshot = { frame: 'before_click' | 'after_click'; png: string };
 type ApprovalObservation = {
   beforeArtifact?: string;
@@ -44,7 +44,7 @@ export async function recoverPendingAppApproval(browser?: AppApprovalBrowser): P
 
 type Probe = { status: 'ready'; choice: AppApprovalChoice; target: { x: number; y: number } } | { status: 'not_present' };
 
-/** Prefer an enabled Always allow button, then fall back to enabled Allow once. */
+/** Prefer Always allow, then Allow once, then an enabled Allow button. */
 export function appApprovalPageProbe(): Probe {
   function normalize(value: string): string {
     return value.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
@@ -65,6 +65,7 @@ export function appApprovalPageProbe(): Probe {
     const matches = (expected: string) => labels.some(label => label === expected || label.startsWith(`${expected} `));
     if (matches('always allow')) return 'always_allow';
     if (matches('allow once')) return 'allow_once';
+    if (labels.includes('allow')) return 'allow';
     return undefined;
   }
   function enabled(button: HTMLButtonElement): boolean {
@@ -82,7 +83,8 @@ export function appApprovalPageProbe(): Probe {
     .filter((element): element is HTMLButtonElement => element.tagName === 'BUTTON')
     .filter(candidate => visible(candidate) && enabled(candidate) && hasSupportedAppContext(candidate));
   const button = candidates.find(candidate => choice(candidate) === 'always_allow')
-    ?? candidates.find(candidate => choice(candidate) === 'allow_once');
+    ?? candidates.find(candidate => choice(candidate) === 'allow_once')
+    ?? candidates.find(candidate => choice(candidate) === 'allow');
   if (!button) return { status: 'not_present' };
 
   const rect = button.getBoundingClientRect();
@@ -217,7 +219,9 @@ export async function checkAndAllowAppApproval(
 
   let click: Awaited<ReturnType<AppApprovalPage['clickAt']>>;
   const attemptedChoice = before.choice;
-  const label = attemptedChoice === 'always_allow' ? 'Always allow' : 'Allow once';
+  const label = attemptedChoice === 'always_allow' ? 'Always allow'
+    : attemptedChoice === 'allow_once' ? 'Allow once'
+      : 'Allow';
   try {
     click = await activePage.within(Date.now() + 1_500, () => activePage.clickAt(before.target.x, before.target.y, {
       label,

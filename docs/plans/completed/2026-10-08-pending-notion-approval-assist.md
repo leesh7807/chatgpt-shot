@@ -63,4 +63,8 @@ ChatGPT Web에서 Notion 도구 사용 승인 카드가 반복적으로 나타�
 
 ## Subsequent scope update (2026-10-23)
 
-This plan records the original Notion-only implementation. The current helper also recognizes Chrome approval cards while the Notion Invocation is pending. Its module, browser method, broker operation, and newly emitted telemetry event use app-generic names; `notion_write_access_recovery` remains accepted for existing local telemetry records. Current behavior prefers an enabled `Always allow` button and falls back to an enabled `Allow once` button. The current runtime contract is documented in the [technical reference](../../technical-reference.md#app-approval-assist-and-observation).
+This plan records the original Notion-only implementation. The current helper also recognizes Chrome approval cards while the Notion Invocation is pending. Its module, browser method, broker operation, and newly emitted telemetry event use app-generic names; `notion_write_access_recovery` remains accepted for existing local telemetry records. The current runtime contract is documented in the [technical reference](../../technical-reference.md#app-approval-assist-and-observation).
+
+## Subsequent scope update (2026-10-24)
+
+The probe prefers enabled `Always allow`, then enabled `Allow once`, then a button whose normalized label is exactly `Allow`. This adds the observed plain `Allow` choice while preserving the existing choices and their priority.
