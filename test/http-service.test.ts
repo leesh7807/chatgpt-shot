@@ -81,6 +81,31 @@ test('an unexpected transport failure retains Attempt correlation from an early 
   } finally { server.close(); await once(server, 'close'); }
 });
 
+test('an incomplete response after an early Attempt hint rejects as uncertain', async () => {
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const server = createServer((_, response) => {
+    response.writeEarlyHints({ link: `</attempts/${id}>; rel=related`, 'x-chatgpt-shot-attempt-id': id });
+    response.writeHead(502, { 'content-type': 'application/json', 'content-length': '100' });
+    response.write('{"code":"SUBMISSION_UNCERTAIN"');
+    setTimeout(() => response.socket?.destroy(), 25);
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  try {
+    const outcome = await Promise.race([
+      call({ pid: process.pid, host: '127.0.0.1', port: address.port, protocolVersion: 1, credential: 'test' }, '/jobs', { prompt: 'x' })
+        .then((value) => ({ kind: 'resolved' as const, value }), (error: unknown) => ({ kind: 'rejected' as const, error })),
+      new Promise<{ kind: 'pending' }>((resolve) => setTimeout(() => resolve({ kind: 'pending' }), 100)),
+    ]);
+    assert.equal(outcome.kind, 'rejected');
+    if (outcome.kind === 'rejected') {
+      assert.ok(outcome.error instanceof ShotError);
+      assert.equal(outcome.error.code, 'SUBMISSION_UNCERTAIN');
+      assert.equal(outcome.error.attemptId, id);
+    }
+  } finally { server.close(); await once(server, 'close'); }
+});
+
 test('authenticated HTTP Attempt inspection returns the same read-only recovery report', async () => {
   const root = mkdtempSync(join(tmpdir(), 'chatgpt-shot-http-inspect-'));
   const previousEnv = {

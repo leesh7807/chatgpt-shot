@@ -39,6 +39,10 @@ export async function call<T>(record: Discovery, path: string, body?: unknown, s
     };
     const rejectCorrelated = (error: unknown) => reject(correlateError(error));
     const req = httpRequest({ host: record.host, port: record.port, path, method: body === undefined ? 'GET' : 'POST', headers: { authorization: `Bearer ${record.credential}`, ...(payload ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } : {}) }, ...(timeout ? { timeout } : {}) }, res => {
+      const rejectIncompleteResponse = () => rejectCorrelated(new Error('Service response ended before the complete response body was received.'));
+      res.once('aborted', rejectIncompleteResponse);
+      res.once('error', rejectCorrelated);
+      res.once('close', () => { if (!res.complete) rejectIncompleteResponse(); });
       let text = ''; res.setEncoding('utf8'); res.on('data', c => text += c); res.on('end', () => {
         try {
           const parsed = JSON.parse(text) as { code?: unknown; message?: unknown; diagnostics?: unknown; attempt_id?: unknown };
