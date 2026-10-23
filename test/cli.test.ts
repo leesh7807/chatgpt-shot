@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { ShotError } from '../src/errors.js';
-import { doctor, inspectAttempt, parseCli } from '../src/cli.js';
+import { doctor, inspectAttempt, main, parseCli } from '../src/cli.js';
 import { LocalJobTelemetryWriter } from '../src/job-telemetry.js';
 import { NotionStore } from '../src/notion.js';
 
@@ -243,7 +243,7 @@ test('doctor and inspect retain Notion reads when Service fails after its health
   }
 });
 
-test('inspect and doctor use an existing Service without caller-side Notion configuration', async () => {
+test('inspect, doctor, and jobs use an existing Service without caller-side Notion configuration', async () => {
   const configHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-existing-service-configless-config-'));
   const dataHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-existing-service-configless-data-'));
   const cacheHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-existing-service-configless-cache-'));
@@ -274,10 +274,12 @@ test('inspect and doctor use an existing Service without caller-side Notion conf
         retry_safety: { status: 'unsafe', automatic_retry: false, reason: 'An accepted remote Job was observed.' },
         next_actions: ['chatgpt-shot jobs remote-job'],
       }));
-    } else if (request.url === '/jobs') {
+    } else if (request.url === '/jobs' || request.url === '/jobs/remote-job') {
       jobReads++;
       response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ jobs: [{ id: 'remote-job', state: 'in_progress' }] }));
+      response.end(JSON.stringify(request.url === '/jobs'
+        ? { jobs: [{ id: 'remote-job', state: 'in_progress' }] }
+        : { id: 'remote-job', state: 'in_progress', result: null, error: null }));
     } else {
       response.writeHead(404);
       response.end(JSON.stringify({ code: 'NOT_FOUND', message: 'No route.' }));
@@ -300,6 +302,7 @@ test('inspect and doctor use an existing Service without caller-side Notion conf
 
     assert.equal(inspectReport.remote.status, 'accepted');
     assert.equal(inspectReport.remote.job.id, 'remote-job');
+    assert.equal(inspectReport.next_actions[0], 'chatgpt-shot jobs remote-job');
     assert.equal(inspectReads, 1);
     assert.equal(doctorReport.checks.configuration.status, 'failed');
     assert.equal(doctorReport.checks.service.status, 'ready');
@@ -308,6 +311,20 @@ test('inspect and doctor use an existing Service without caller-side Notion conf
     assert.equal(doctorReport.capabilities.notion_read.status, 'available');
     assert.equal(jobReads, 1);
     assert.equal(process.exitCode, 1);
+
+    const jobsOutput: string[] = [];
+    const originalStdoutWrite = process.stdout.write;
+    const previousJobsExitCode = process.exitCode;
+    process.exitCode = undefined;
+    process.stdout.write = ((chunk: unknown) => { jobsOutput.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    try { await main(['jobs', 'remote-job']); }
+    finally {
+      process.stdout.write = originalStdoutWrite;
+      process.exitCode = previousJobsExitCode;
+    }
+    assert.deepEqual(JSON.parse(jobsOutput.join('')), { id: 'remote-job', state: 'in_progress', result: null, error: null });
+    assert.equal(jobReads, 2);
+    assert.equal(existsSync(join(configHome, 'chatgpt-shot', '.env')), false);
   } finally {
     process.exitCode = previousExitCode;
     for (const name of envNames) {

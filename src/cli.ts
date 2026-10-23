@@ -212,6 +212,16 @@ export async function inspectAttempt(attemptId: string): Promise<Record<string, 
   return buildAttemptRecoveryReport(normalizedId, attempt, remote, localErrorCode);
 }
 
+async function readJobs(attemptId?: string) {
+  const state = paths();
+  const running = await serviceStatus({ discoveryPath: state.discoveryPath });
+  if (running && running.state !== 'stopping') {
+    return call(running.record, attemptId ? `/jobs/${attemptId}` : '/jobs');
+  }
+  const config = loadConfig();
+  return call(await ensureService(config), attemptId ? `/jobs/${attemptId}` : '/jobs');
+}
+
 export async function doctor(browser: boolean): Promise<Record<string, unknown>> {
   const checks: Record<string, unknown> = {};
   const capabilities: Record<string, unknown> = {};
@@ -342,6 +352,7 @@ export async function main(args: string[]) {
   const { command, rest } = parsed;
   if (command === 'attempts') return out(JSON.stringify({ attempts: readRecentJobTelemetry(undefined, rest[0]) }, null, 2));
   if (command === 'inspect') return out(JSON.stringify(await inspectAttempt(rest[0]), null, 2));
+  if (command === 'jobs') return out(JSON.stringify(await readJobs(rest[0])));
   if (command === 'open') { await confirmVisibleBrowser(); await openBrowser(paths()); out('Manual browser session closed. Authentication and browser-check results were not verified.'); return; }
   if (command === 'config') {
     const [action, key, ...valueParts] = rest; const state = paths();
@@ -358,7 +369,6 @@ export async function main(args: string[]) {
   if (command === 'status') { const status = await serviceStatus(config); out(!status ? 'absent' : `${status.state === 'ready' ? 'healthy' : status.state} ${status.record.host}:${status.record.port} pid=${status.record.pid}`); return; }
   if (command === 'port') { const record = await healthy(config); if (!record) return fail('BROWSER_UNAVAILABLE', 'No healthy chatgpt-shot Service is running.'); out(String(record.port)); return; }
   if (command === 'stop') { await stopService(config); out('chatgpt-shot Service stopped.'); return; }
-  if (command === 'jobs') { const record = await ensureService(config); out(JSON.stringify(await call(record, rest[0] ? `/jobs/${rest[0]}` : '/jobs'))); return; }
   if (command === 'submit') {
     const record = await ensureService(config); const controller = new AbortController();
     const remove = installCancellationHandler(async () => { controller.abort(); });
