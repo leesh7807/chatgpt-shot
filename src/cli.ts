@@ -159,7 +159,7 @@ async function confirmVisibleBrowser(): Promise<void> {
   } finally { prompt.close(); }
 }
 
-async function inspectAttempt(attemptId: string): Promise<void> {
+export async function inspectAttempt(attemptId: string): Promise<Record<string, unknown>> {
   const normalizedId = attemptId.toLowerCase();
   let attempt;
   let localErrorCode: string | undefined;
@@ -172,10 +172,11 @@ async function inspectAttempt(attemptId: string): Promise<void> {
     if (running) {
       const report = await call<Record<string, unknown>>(running.record, `/attempts/${normalizedId}`);
       if (localErrorCode) report.local_attempt = { found: false, status: 'unavailable', code: localErrorCode, source: 'local_attempt_telemetry', authority: 'local_evidence' };
-      out(JSON.stringify(report, null, 2));
-      return;
+      return report;
     }
-    if (existsSync(config.discoveryPath)) throw new ShotError('BROWSER_UNAVAILABLE', 'Existing Service health could not be confirmed; Notion lookup was not routed around it.');
+    // Inspect is read-only. When an existing Service cannot be reached, keep
+    // reconciliation available through the same configured Notion read used
+    // when no Service is present; do not start or repair that Service here.
     const invocation = await new NotionStore(config.notionToken).findInvocation(databaseIdFromUrl(config.databaseUrl), normalizedId);
     remote = invocation
       ? { status: invocation.state === 'pending' ? 'pending' : 'accepted', source: 'notion', job: { id: invocation.id, state: invocation.state, ...(invocation.error ? { error: invocation.error } : {}) } }
@@ -184,7 +185,7 @@ async function inspectAttempt(attemptId: string): Promise<void> {
     const code = error instanceof ShotError ? error.code : 'INTERNAL_ERROR';
     remote = { status: 'unavailable', source: 'notion', code, reason: code === 'CONFIG_INVALID' ? 'configuration_unavailable' : 'notion_lookup_failed' };
   }
-  out(JSON.stringify(buildAttemptRecoveryReport(normalizedId, attempt, remote, localErrorCode), null, 2));
+  return buildAttemptRecoveryReport(normalizedId, attempt, remote, localErrorCode);
 }
 
 async function doctor(browser: boolean): Promise<void> {
@@ -297,7 +298,7 @@ export async function main(args: string[]) {
   if (parsed.kind === 'help') return out(parsed.scope === 'global' ? globalHelp : commandHelp[parsed.scope]);
   const { command, rest } = parsed;
   if (command === 'attempts') return out(JSON.stringify({ attempts: readRecentJobTelemetry(undefined, rest[0]) }, null, 2));
-  if (command === 'inspect') return inspectAttempt(rest[0]);
+  if (command === 'inspect') return out(JSON.stringify(await inspectAttempt(rest[0]), null, 2));
   if (command === 'open') { await confirmVisibleBrowser(); await openBrowser(paths()); out('Manual browser session closed. Authentication and browser-check results were not verified.'); return; }
   if (command === 'config') {
     const [action, key, ...valueParts] = rest; const state = paths();

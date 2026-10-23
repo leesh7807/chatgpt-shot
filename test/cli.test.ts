@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { ShotError } from '../src/errors.js';
-import { parseCli } from '../src/cli.js';
+import { inspectAttempt, parseCli } from '../src/cli.js';
 import { LocalJobTelemetryWriter } from '../src/job-telemetry.js';
+import { NotionStore } from '../src/notion.js';
 
 const cli = (args: string[], configHome: string, extraEnv: NodeJS.ProcessEnv = {}) => spawnSync(process.execPath, ['--import', 'tsx', resolve('src/cli.ts'), ...args], { encoding: 'utf8', env: { ...process.env, XDG_CONFIG_HOME: configHome, ...extraEnv } });
 
@@ -154,6 +155,47 @@ test('inspect reconciles a local Attempt through the CLI when Notion configurati
     assert.equal(report.retry_safety.status, 'safe');
     assert.match(report.next_actions[0], /chatgpt-shot open/);
   } finally { rmSync(configHome, { recursive: true, force: true }); rmSync(cacheHome, { recursive: true, force: true }); }
+});
+
+test('inspect reads Notion directly when existing Service discovery is unhealthy', async () => {
+  const configHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-inspect-unhealthy-config-'));
+  const dataHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-inspect-unhealthy-data-'));
+  const cacheHome = mkdtempSync(join(tmpdir(), 'chatgpt-shot-inspect-unhealthy-cache-'));
+  const id = '01234567-89ab-4def-8123-456789abcdef';
+  const envNames = ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME'] as const;
+  const previousEnv = Object.fromEntries(envNames.map(name => [name, process.env[name]]));
+  const originalFindInvocation = NotionStore.prototype.findInvocation;
+  let readAttemptId: string | undefined;
+  try {
+    process.env.XDG_CONFIG_HOME = configHome;
+    process.env.XDG_DATA_HOME = dataHome;
+    process.env.XDG_CACHE_HOME = cacheHome;
+    const configDirectory = join(configHome, 'chatgpt-shot');
+    const runtimeDirectory = join(cacheHome, 'chatgpt-shot');
+    mkdirSync(configDirectory, { recursive: true });
+    mkdirSync(runtimeDirectory, { recursive: true });
+    writeFileSync(join(configDirectory, '.env'), 'NOTION_TOKEN=test-token\nCHATGPT_SHOT_NOTION_DATABASE_URL=https://www.notion.so/workspace/0123456789abcdef0123456789abcdef\n');
+    writeFileSync(join(runtimeDirectory, 'runtime.json'), JSON.stringify({ pid: 2_147_483_647, host: '127.0.0.1', port: 1, protocolVersion: 1, credential: 'stale-service' }));
+    NotionStore.prototype.findInvocation = async function (_databaseId, invocationId) {
+      readAttemptId = invocationId;
+      return { id: invocationId, pageId: 'remote-page', state: 'in_progress', error: '' };
+    };
+    const report = await inspectAttempt(id);
+    assert.equal(readAttemptId, id);
+    assert.equal(report.remote.status, 'accepted');
+    assert.equal(report.remote.job.state, 'in_progress');
+    assert.equal(report.retry_safety.status, 'unsafe');
+  } finally {
+    NotionStore.prototype.findInvocation = originalFindInvocation;
+    for (const name of envNames) {
+      const value = previousEnv[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    rmSync(configHome, { recursive: true, force: true });
+    rmSync(dataHome, { recursive: true, force: true });
+    rmSync(cacheHome, { recursive: true, force: true });
+  }
 });
 
 test('attempts reads local diagnostics without requiring a Notion configuration', () => {
