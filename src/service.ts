@@ -3,7 +3,7 @@ import { fail, ShotError } from './errors.js';
 import type { BrowserTransport, Inspection, SubmissionInspection, SubmitAttempt } from './browser.js';
 import type { Invocation, NotionStore } from './notion.js';
 import { JobTelemetrySession, LocalJobTelemetryWriter, type JobTelemetryInput, type JobTelemetryWriter } from './job-telemetry.js';
-import { recoverNotionWriteAccess } from './notion-approval-assist.js';
+import { recoverPendingAppApproval } from './app-approval-assist.js';
 
 export type SubmitOptions = { acknowledgementMs?: number; pollMs?: number; telemetry?: JobTelemetryWriter; telemetrySession?: JobTelemetrySession; signal?: AbortSignal; diagnostics?: boolean };
 export type JobExecution = { job: Invocation; completion: Promise<void> };
@@ -282,16 +282,16 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
         if (current.state !== 'pending') fail('INVALID_INVOCATION_STATE', `Invocation ${id} has invalid State ${current.state}.`);
         const recoveryStartedAt = performance.now();
         // Retry while pending; fresh-tab absence is logged, and clicks never end this loop.
-        const recovery = await recoverNotionWriteAccess(browser);
+        const recovery = await recoverPendingAppApproval(browser);
         if (recovery && (recovery.status !== 'not_present' || recovery.openedFreshTab === true)) {
           const attemptedChoice = 'attemptedChoice' in recovery ? recovery.attemptedChoice : undefined;
           const buttonFound = recovery.status === 'click_reported'
             || recovery.status === 'click_unconfirmed'
-            || attemptedChoice === 'always_allow';
+            || attemptedChoice !== undefined;
           const clickAttempted = recovery.status === 'click_reported'
             || recovery.status === 'click_unconfirmed'
-            || attemptedChoice === 'always_allow';
-          event('notion_write_access_recovery', {
+            || attemptedChoice !== undefined;
+          event('app_approval_recovery', {
             stage,
             outcome: recovery.status === 'click_reported'
               ? 'approval_button_click_reported'

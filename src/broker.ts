@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { fail, isStaleBrowserSessionError } from './errors.js';
-import { checkAndAllowNotionUpdate } from './notion-approval-assist.js';
+import { checkAndAllowAppApproval } from './app-approval-assist.js';
 import { LocalApprovalObservationWriter } from './approval-observation.js';
 
 type Request = { operation: string; sessionId?: string; prompt?: string; submissionMarker?: string; diagnostics?: boolean; observeApproval?: boolean; jobId?: string };
@@ -46,7 +46,7 @@ const prepareTrustedClick = `(x,y,expectation,key)=>{
     const style=getComputedStyle(current);
     if(style.display==='none'||style.visibility==='hidden'||Number(style.opacity)===0)return {status:'target_obscured'};
     const text=(current.innerText||current.textContent||'').replace(/\\s+/g,' ').toLocaleLowerCase();
-    if(expectation.context.every(value=>text.includes(normalize(value)))){contextFound=true;break;}
+    if(expectation.context.some(value=>text.includes(normalize(value)))){contextFound=true;break;}
   }
   if(!contextFound)return {status:'target_mismatch'};
   const state={button,eventSeen:false,targetMatched:false,listener:undefined};
@@ -465,7 +465,7 @@ class Broker {
       const page = request.sessionId ? this.pages.get(request.sessionId) : undefined;
       if (request.operation === 'close' && !page) return { closed: true, verified: true };
       if (!page) return fail('BROWSER_UNAVAILABLE', 'Browser invocation page is unavailable.');
-      if (request.operation === 'notion-approval-assist') {
+      if (request.operation === 'app-approval-assist') {
         if (request.observeApproval && !request.jobId) fail('INTERNAL_ERROR', 'Approval observation requires a Job ID.');
         const observations = request.observeApproval ? new LocalApprovalObservationWriter(request.jobId!) : undefined;
         const tabControl = {
@@ -503,7 +503,7 @@ class Broker {
             }
           },
         };
-        return checkAndAllowNotionUpdate(page, observations ? screenshot => observations.write(screenshot) : undefined, tabControl);
+        return checkAndAllowAppApproval(page, observations ? screenshot => observations.write(screenshot) : undefined, tabControl);
       }
       if (request.operation === 'fill') {
         const deadline = Date.now() + 45_000;
@@ -598,7 +598,7 @@ export const brokerRequest = async (root: string, request: Request): Promise<any
   // never time out while the broker can still perform that side effect.
   // ensure may cold-start Chrome, create/attach a target, navigate, and wait for readiness.
   // Its caller must outlive every bounded private-CDP operation in that startup path.
-  const timeoutMs = request.operation === 'ensure' ? 180_000 : request.operation === 'submit' ? 95_000 : request.operation === 'open' || request.operation === 'shutdown' ? 90_000 : request.operation === 'fill' || request.operation === 'auth' ? 60_000 : request.operation === 'notion-approval-assist' ? 30_000 : 15_000;
+  const timeoutMs = request.operation === 'ensure' ? 180_000 : request.operation === 'submit' ? 95_000 : request.operation === 'open' || request.operation === 'shutdown' ? 90_000 : request.operation === 'fill' || request.operation === 'auth' ? 60_000 : request.operation === 'app-approval-assist' ? 30_000 : 15_000;
   const timeout = setTimeout(() => finish(new Error('Broker RPC timed out.')), timeoutMs);
   socket.setEncoding('utf8'); socket.once('error', (error) => finish(error)); socket.on('data', chunk => { body += chunk; }); socket.on('end', () => { try { const response = JSON.parse(body) as Response; if (!response.ok) { const error: any = new Error(response.message); error.code = response.code; finish(error); } else finish(undefined, response.value); } catch (error: any) { finish(error); } }); socket.end(JSON.stringify(request));
 });

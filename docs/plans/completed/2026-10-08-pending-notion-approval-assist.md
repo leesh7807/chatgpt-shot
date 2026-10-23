@@ -60,3 +60,7 @@ ChatGPT Web에서 Notion 도구 사용 승인 카드가 반복적으로 나타�
 - 새 빌드 Service의 실제 CLI submit Job `878eafcb-1b04-4a75-ad84-6784f0e748c1`은 `completed`로 전이했고 `jobs <uuid>` readback에서 Result `pending approval helper runtime check complete.`를 확인했다.
 - 해당 Job의 이전 telemetry에는 probe 결과 `clicked` 뒤에도 수락되지 않는 케이스가 기록됐다. 기존 구현은 DOM click 호출만으로 성공을 기록하고 재시도 잠금을 유지했으므로, 이를 trusted input과 클릭 후 확인/재시도로 교체했다.
 - 최종 빌드/테스트 후 Service를 재기동했고 `healthy 127.0.0.1:45211 pid=131399`을 확인했다.
+
+## Subsequent scope update (2026-10-23)
+
+This plan records the original Notion-only implementation. The current helper also recognizes Chrome approval cards while the Notion Invocation is pending. Its module, browser method, broker operation, and newly emitted telemetry event use app-generic names; `notion_write_access_recovery` remains accepted for existing local telemetry records. Current behavior prefers an enabled `Always allow` button and falls back to an enabled `Allow once` button. The current runtime contract is documented in the [technical reference](../../technical-reference.md#app-approval-assist-and-observation).

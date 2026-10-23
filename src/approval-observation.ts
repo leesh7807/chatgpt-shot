@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { jobTelemetryPath } from './job-telemetry.js';
-import type { ApprovalScreenshot } from './notion-approval-assist.js';
+import type { ApprovalScreenshot } from './app-approval-assist.js';
 
 const uid = process.getuid?.();
 

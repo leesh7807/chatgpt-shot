@@ -21,7 +21,8 @@ export type JobTelemetryEventName =
   | 'submit_action_returned'
   | 'submit_action_failed'
   | 'submission_inspected'
-  | 'notion_write_access_recovery'
+  | 'app_approval_recovery'
+  | 'notion_write_access_recovery' // Legacy event name retained for compatibility with existing local telemetry.
   | 'notion_observation'
   | 'notion_request'
   | 'accepted'
@@ -66,7 +67,7 @@ export interface JobTelemetryWriter {
 
 const allowedEvents = new Set<JobTelemetryEventName>([
   'admission_started', 'notion_schema_validation', 'browser_stage', 'browser_context_opened', 'invocation_created', 'prompt_fill_started', 'prompt_filled', 'prompt_fill_failed',
-  'submission_attempted', 'submit_action_returned', 'submit_action_failed', 'submission_inspected', 'notion_write_access_recovery',
+  'submission_attempted', 'submit_action_returned', 'submit_action_failed', 'submission_inspected', 'app_approval_recovery', 'notion_write_access_recovery',
   'notion_observation', 'notion_request', 'accepted', 'browser_context_closed', 'terminal_observed',
   'admission_deadline_reached', 'admission_failed', 'observer_failed', 'cleanup', 'caller_cancelled',
 ]);

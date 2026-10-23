@@ -9,13 +9,13 @@ export type SubmitAttempt = { outcome: 'clicked'; method?: string } | { outcome:
 export type SubmissionInspection = { inspection: Inspection; messageMarkerSeen?: boolean; composerMarkerPresent?: boolean; composerPresent?: boolean; sampleCount?: number; reason?: string };
 export type InspectionOptions = { settleMs?: number };
 export type BrowserDiagnosticEntry = { offset_ms: number; stage: string; [key: string]: unknown };
-export interface BrowserTransport { withBrowser<T>(operation: () => Promise<T>): Promise<T>; ensureAvailable(): Promise<void>; ensureAuthenticated(): Promise<void>; openFreshContext(): Promise<void>; fillPrompt(prompt: string, submissionMarker: string): Promise<void>; submitPrompt(submissionMarker: string): Promise<SubmitAttempt>; inspectSubmission(submissionMarker: string, options?: InspectionOptions): Promise<SubmissionInspection | Inspection>; requestNotionApprovalAssist?(): Promise<unknown>; close(): Promise<void>; diagnosticReport?(): BrowserDiagnosticEntry[]; }
+export interface BrowserTransport { withBrowser<T>(operation: () => Promise<T>): Promise<T>; ensureAvailable(): Promise<void>; ensureAuthenticated(): Promise<void>; openFreshContext(): Promise<void>; fillPrompt(prompt: string, submissionMarker: string): Promise<void>; submitPrompt(submissionMarker: string): Promise<SubmitAttempt>; inspectSubmission(submissionMarker: string, options?: InspectionOptions): Promise<SubmissionInspection | Inspection>; requestAppApprovalAssist?(): Promise<unknown>; close(): Promise<void>; diagnosticReport?(): BrowserDiagnosticEntry[]; }
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const pendingBrokerStarts = new Map<string, Promise<void>>();
 const profilePath = (profile: string) => profile;
 const systemChrome = () => [process.env.CHATGPT_SHOT_BROWSER, '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome'].find((path): path is string => Boolean(path && existsSync(path)));
-async function request(root: string, operation: string, sessionId?: string, prompt?: string, submissionMarker?: string, send: typeof brokerRequest = brokerRequest, diagnostics = false, observeApproval = false, jobId?: string) { try { return await send(root, { operation, sessionId, prompt, submissionMarker, ...(diagnostics ? { diagnostics: true } : {}), ...(observeApproval && operation === 'notion-approval-assist' ? { observeApproval: true, jobId } : {}) }); } catch (error: any) { if (error.code) return fail(error.code, error.message, error); throw error; } }
+async function request(root: string, operation: string, sessionId?: string, prompt?: string, submissionMarker?: string, send: typeof brokerRequest = brokerRequest, diagnostics = false, observeApproval = false, jobId?: string) { try { return await send(root, { operation, sessionId, prompt, submissionMarker, ...(diagnostics ? { diagnostics: true } : {}), ...(observeApproval && operation === 'app-approval-assist' ? { observeApproval: true, jobId } : {}) }); } catch (error: any) { if (error.code) return fail(error.code, error.message, error); throw error; } }
 export async function ensureBroker(profile: string) {
   const assertProfileAvailable = () => { if (existsSync(paths().manualOpenLockPath)) fail('SERVICE_BUSY', 'The retained browser profile is open for manual use.'); };
   const absent = (error: any) => error?.code === 'ENOENT' || error?.code === 'ECONNREFUSED';
@@ -222,13 +222,13 @@ export class ChatGPTBrowser implements BrowserTransport {
       return { ...last, inspection: last.inspection === 'not_submitted' && allNotSubmitted ? 'not_submitted' : 'uncertain', sampleCount: successfulSamples };
     } catch (error) { if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); return { inspection: 'uncertain', reason: 'stale_browser_session' }; } throw error; }
   }
-  async requestNotionApprovalAssist(): Promise<unknown> {
+  async requestAppApprovalAssist(): Promise<unknown> {
     if (!this.sessionId) {
       const error = new Error('Browser invocation page is unavailable.') as Error & { code: string };
       error.code = 'BROWSER_UNAVAILABLE';
       throw error;
     }
-    return this.rpc('notion-approval-assist', this.sessionId);
+    return this.rpc('app-approval-assist', this.sessionId);
   }
   diagnosticReport() { return this.diagnostics.map(entry => ({ ...entry })); }
   async close() {

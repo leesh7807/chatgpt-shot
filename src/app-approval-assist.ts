@@ -1,4 +1,4 @@
-export type NotionApprovalReason =
+export type AppApprovalReason =
   | 'target_mismatch'
   | 'target_obscured'
   | 'click_not_received'
@@ -6,6 +6,7 @@ export type NotionApprovalReason =
   | 'broker_unavailable'
   | 'invalid_result';
 
+export type AppApprovalChoice = 'always_allow' | 'allow_once';
 export type ApprovalScreenshot = { frame: 'before_click' | 'after_click'; png: string };
 type ApprovalObservation = {
   beforeArtifact?: string;
@@ -15,25 +16,25 @@ type ApprovalObservation = {
   openedFreshTab?: boolean;
 };
 
-export type NotionApprovalCheck =
+export type AppApprovalCheck =
   | ({ status: 'not_present' } & Partial<ApprovalObservation>)
-  | ({ status: 'click_reported'; attemptedChoice: 'always_allow' } & Partial<ApprovalObservation>)
-  | ({ status: 'click_unconfirmed'; reason: NotionApprovalReason; attemptedChoice: 'always_allow' } & Partial<ApprovalObservation>)
-  | ({ status: 'unavailable'; reason: NotionApprovalReason; attemptedChoice?: 'always_allow' } & Partial<ApprovalObservation>);
+  | ({ status: 'click_reported'; attemptedChoice: AppApprovalChoice } & Partial<ApprovalObservation>)
+  | ({ status: 'click_unconfirmed'; reason: AppApprovalReason; attemptedChoice: AppApprovalChoice } & Partial<ApprovalObservation>)
+  | ({ status: 'unavailable'; reason: AppApprovalReason; attemptedChoice?: AppApprovalChoice } & Partial<ApprovalObservation>);
 
-export interface NotionApprovalBrowser {
-  requestNotionApprovalAssist?(): Promise<unknown>;
+export interface AppApprovalBrowser {
+  requestAppApprovalAssist?(): Promise<unknown>;
 }
 
 /** Approval recovery is best-effort; Notion readback remains authoritative. */
-export async function recoverNotionWriteAccess(browser?: NotionApprovalBrowser): Promise<NotionApprovalCheck | undefined> {
-  if (!browser?.requestNotionApprovalAssist) return undefined;
+export async function recoverPendingAppApproval(browser?: AppApprovalBrowser): Promise<AppApprovalCheck | undefined> {
+  if (!browser?.requestAppApprovalAssist) return undefined;
   try {
-    const result = await browser.requestNotionApprovalAssist();
+    const result = await browser.requestAppApprovalAssist();
     if (result === undefined) return undefined;
     if (result && typeof result === 'object' && 'status' in result && typeof result.status === 'string'
       && ['not_present', 'click_reported', 'click_unconfirmed', 'unavailable'].includes(result.status)) {
-      return result as NotionApprovalCheck;
+      return result as AppApprovalCheck;
     }
     return { status: 'unavailable', reason: 'invalid_result' };
   } catch {
@@ -41,10 +42,10 @@ export async function recoverNotionWriteAccess(browser?: NotionApprovalBrowser):
   }
 }
 
-type Probe = { status: 'ready'; target: { x: number; y: number } } | { status: 'not_present' };
+type Probe = { status: 'ready'; choice: AppApprovalChoice; target: { x: number; y: number } } | { status: 'not_present' };
 
-/** Find the Notion prompt's visible Always allow button directly. */
-export function notionApprovalPageProbe(): Probe {
+/** Prefer an enabled Always allow button, then fall back to enabled Allow once. */
+export function appApprovalPageProbe(): Probe {
   function normalize(value: string): string {
     return value.replace(/\s+/g, ' ').trim().toLocaleLowerCase()
       .replace(/\s*(?:esc|enter|return|↵|⏎|▼)$/i, '').trim();
@@ -58,37 +59,43 @@ export function notionApprovalPageProbe(): Probe {
     }
     return true;
   }
-  function hasAlwaysAllowLabel(button: HTMLButtonElement): boolean {
-    return [button.getAttribute('aria-label'), button.getAttribute('title'), button.innerText, button.textContent]
-      .filter(Boolean)
-      .some(value => {
-        const label = normalize(value as string);
-        return label === 'always allow' || label.startsWith('always allow ');
-      });
+  function choice(button: HTMLButtonElement): AppApprovalChoice | undefined {
+    const labels = [button.getAttribute('aria-label'), button.getAttribute('title'), button.innerText, button.textContent]
+      .filter(Boolean).map(value => normalize(value as string));
+    const matches = (expected: string) => labels.some(label => label === expected || label.startsWith(`${expected} `));
+    if (matches('always allow')) return 'always_allow';
+    if (matches('allow once')) return 'allow_once';
+    return undefined;
   }
-  function hasNotionContext(button: HTMLButtonElement): boolean {
+  function enabled(button: HTMLButtonElement): boolean {
+    return !button.disabled && button.getAttribute('aria-disabled') !== 'true';
+  }
+  function hasSupportedAppContext(button: HTMLButtonElement): boolean {
     for (let parent: Element | null = button, depth = 0; parent && depth < 3; parent = parent.parentElement, depth++) {
-      if (normalize((parent as HTMLElement).innerText || parent.textContent || '').includes('notion')) return true;
+      const text = normalize((parent as HTMLElement).innerText || parent.textContent || '');
+      if (text.includes('notion') || text.includes('chrome')) return true;
     }
     return false;
   }
 
-  const button = [...document.querySelectorAll('button')]
+  const candidates = [...document.querySelectorAll('button')]
     .filter((element): element is HTMLButtonElement => element.tagName === 'BUTTON')
-    .find(candidate => visible(candidate) && hasAlwaysAllowLabel(candidate) && hasNotionContext(candidate));
+    .filter(candidate => visible(candidate) && enabled(candidate) && hasSupportedAppContext(candidate));
+  const button = candidates.find(candidate => choice(candidate) === 'always_allow')
+    ?? candidates.find(candidate => choice(candidate) === 'allow_once');
   if (!button) return { status: 'not_present' };
 
   const rect = button.getBoundingClientRect();
-  return { status: 'ready', target: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } };
+  return { status: 'ready', choice: choice(button)!, target: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } };
 }
 
 /** Build a self-contained expression for the browser page. */
-export function serializedNotionApprovalPageProbe(): string {
-  const source = notionApprovalPageProbe.toString().replace(/__name\([\w$]+,\s*["'][^"']+["']\);/g, '');
+export function serializedAppApprovalPageProbe(): string {
+  const source = appApprovalPageProbe.toString().replace(/__name\([\w$]+,\s*["'][^"']+["']\);/g, '');
   return `() => (${source})()`;
 }
 
-export interface NotionApprovalPage {
+export interface AppApprovalPage {
   within<T>(deadline: number, operation: () => Promise<T>): Promise<T>;
   evaluate<T>(expression: string, args?: unknown[]): Promise<T>;
   clickAt(x: number, y: number, expectation: { label: string; context: string[] }): Promise<{
@@ -97,20 +104,20 @@ export interface NotionApprovalPage {
   captureAround?(x: number, y: number): Promise<string>;
 }
 
-export interface NotionApprovalTabControl {
+export interface AppApprovalTabControl {
   currentUrl(): Promise<string>;
-  openConversationTab(url: string): Promise<NotionApprovalPage>;
+  openConversationTab(url: string): Promise<AppApprovalPage>;
 }
 
 type ApprovalTabState = {
   tabCount: number;
   activeTabIndex: number;
-  activePage: NotionApprovalPage;
+  activePage: AppApprovalPage;
   openNextTab: boolean;
 };
 
 const MAX_APPROVAL_TABS = 3;
-const approvalTabStates = new WeakMap<NotionApprovalPage, ApprovalTabState>();
+const approvalTabStates = new WeakMap<AppApprovalPage, ApprovalTabState>();
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 function isChatGptConversationUrl(value: string): boolean {
@@ -120,12 +127,12 @@ function isChatGptConversationUrl(value: string): boolean {
   } catch { return false; }
 }
 
-async function inspectFreshTab(page: NotionApprovalPage): Promise<Probe | 'probe_failed'> {
+async function inspectFreshTab(page: AppApprovalPage): Promise<Probe | 'probe_failed'> {
   const deadline = Date.now() + 5_000;
   let probeSucceeded = false;
   while (Date.now() < deadline) {
     try {
-      const result = await page.within(Math.min(deadline, Date.now() + 1_200), () => page.evaluate<Probe>(serializedNotionApprovalPageProbe()));
+      const result = await page.within(Math.min(deadline, Date.now() + 1_200), () => page.evaluate<Probe>(serializedAppApprovalPageProbe()));
       probeSucceeded = true;
       if (result.status === 'ready') return result;
     } catch { /* A newly opened conversation can still be hydrating. */ }
@@ -135,11 +142,11 @@ async function inspectFreshTab(page: NotionApprovalPage): Promise<Probe | 'probe
 }
 
 /** Check the active conversation tab, then advance to a fresh tab after each pending read and click. */
-export async function checkAndAllowNotionUpdate(
-  page: NotionApprovalPage,
+export async function checkAndAllowAppApproval(
+  page: AppApprovalPage,
   writeScreenshot?: (screenshot: ApprovalScreenshot) => string | undefined,
-  tabControl?: NotionApprovalTabControl,
-): Promise<NotionApprovalCheck> {
+  tabControl?: AppApprovalTabControl,
+): Promise<AppApprovalCheck> {
   let state = approvalTabStates.get(page);
 
   let activePage = state?.activePage ?? page;
@@ -173,7 +180,7 @@ export async function checkAndAllowNotionUpdate(
     }
   }
 
-  const expression = serializedNotionApprovalPageProbe();
+  const expression = serializedAppApprovalPageProbe();
   const inspect = () => activePage.within(Date.now() + 1_200, () => activePage.evaluate<Probe>(expression));
   let before: Probe;
   if (openedFreshTab) {
@@ -208,11 +215,13 @@ export async function checkAndAllowNotionUpdate(
   };
   await capture('before_click');
 
-  let click: Awaited<ReturnType<NotionApprovalPage['clickAt']>>;
+  let click: Awaited<ReturnType<AppApprovalPage['clickAt']>>;
+  const attemptedChoice = before.choice;
+  const label = attemptedChoice === 'always_allow' ? 'Always allow' : 'Allow once';
   try {
     click = await activePage.within(Date.now() + 1_500, () => activePage.clickAt(before.target.x, before.target.y, {
-      label: 'Always allow',
-      context: ['Notion'],
+      label,
+      context: ['Notion', 'Chrome'],
     }));
   } catch {
     if (tabControl) {
@@ -222,7 +231,7 @@ export async function checkAndAllowNotionUpdate(
       state.openNextTab = state.tabCount < MAX_APPROVAL_TABS;
       approvalTabStates.set(page, state);
     }
-    return { status: 'unavailable', reason: 'broker_unavailable', attemptedChoice: 'always_allow', ...(tabControl ? { tabIndex, ...(openedFreshTab ? { openedFreshTab: true } : {}) } : {}) };
+    return { status: 'unavailable', reason: 'broker_unavailable', attemptedChoice, ...(tabControl ? { tabIndex, ...(openedFreshTab ? { openedFreshTab: true } : {}) } : {}) };
   }
   if (writeScreenshot) await new Promise(resolve => setTimeout(resolve, 500));
   let postClickProbe: ApprovalObservation['postClickProbe'];
@@ -246,6 +255,6 @@ export async function checkAndAllowNotionUpdate(
     }
     approvalTabStates.set(page, state);
   }
-  if (click.status !== 'clicked') return { status: 'click_unconfirmed', reason: click.status, attemptedChoice: 'always_allow', ...observation };
-  return { status: 'click_reported', attemptedChoice: 'always_allow', ...observation };
+  if (click.status !== 'clicked') return { status: 'click_unconfirmed', reason: click.status, attemptedChoice, ...observation };
+  return { status: 'click_reported', attemptedChoice, ...observation };
 }

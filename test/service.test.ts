@@ -47,7 +47,7 @@ class Browser {
   closeError?: Error;
   approvalChecks = 0;
   approvalError?: Error;
-  async requestNotionApprovalAssist(): Promise<any> { this.approvalChecks++; if (this.approvalChecks === 1 && this.approvalError) throw this.approvalError; return { status: 'click_reported' as const, attemptedChoice: 'always_allow' as const }; }
+  async requestAppApprovalAssist(): Promise<any> { this.approvalChecks++; if (this.approvalChecks === 1 && this.approvalError) throw this.approvalError; return { status: 'click_reported' as const, attemptedChoice: 'always_allow' as const }; }
   async withBrowser<T>(operation: () => Promise<T>): Promise<T> {
     let value!: T; let operationError: unknown;
     try { value = await operation(); } catch (error) { operationError = error; }
@@ -134,7 +134,7 @@ test('pending approval assist runs only while Notion remains pending and never c
   const result = await startJob(store as any, 'db', browser as any, 'task', 'job-approval', { ...options, telemetry });
   assert.equal(result.job.state, 'in_progress');
   assert.equal(browser.approvalChecks, 2);
-  const recoveries = telemetry.events.filter(item => item.event === 'notion_write_access_recovery');
+  const recoveries = telemetry.events.filter(item => item.event === 'app_approval_recovery');
   assert.equal(recoveries.length, 2);
   assert.equal(recoveries[0].outcome, 'approval_assist_unavailable');
   assert.deepEqual(recoveries[0].details, { reason: 'broker_unavailable' });
@@ -143,15 +143,15 @@ test('pending approval assist runs only while Notion remains pending and never c
   await result.completion;
 
   const noRecoveryBrowser = new Browser();
-  noRecoveryBrowser.requestNotionApprovalAssist = async () => { noRecoveryBrowser.approvalChecks++; return { status: 'not_present' as const }; };
+  noRecoveryBrowser.requestAppApprovalAssist = async () => { noRecoveryBrowser.approvalChecks++; return { status: 'not_present' as const }; };
   const noRecoveryTelemetry = new Telemetry();
   const noRecovery = await startJob(new Store(['pending', 'in_progress', 'completed']) as any, 'db', noRecoveryBrowser as any, 'task', 'job-no-recovery', { ...options, telemetry: noRecoveryTelemetry });
   assert.equal(noRecoveryBrowser.approvalChecks, 1);
-  assert.equal(noRecoveryTelemetry.events.some(item => item.event === 'notion_write_access_recovery'), false);
+  assert.equal(noRecoveryTelemetry.events.some(item => item.event === 'app_approval_recovery'), false);
   await noRecovery.completion;
 
   const artifactBrowser = new Browser();
-  artifactBrowser.requestNotionApprovalAssist = async () => {
+  artifactBrowser.requestAppApprovalAssist = async () => {
     artifactBrowser.approvalChecks++;
     return {
       status: 'click_reported' as const,
@@ -166,7 +166,7 @@ test('pending approval assist runs only while Notion remains pending and never c
     ...options,
     telemetry: artifactTelemetry,
   });
-  assert.deepEqual(artifactTelemetry.events.find(item => item.event === 'notion_write_access_recovery')?.details, {
+  assert.deepEqual(artifactTelemetry.events.find(item => item.event === 'app_approval_recovery')?.details, {
     button_found: true,
     click_attempted: true,
     attempted_choice: 'always_allow',
@@ -179,7 +179,7 @@ test('pending approval assist runs only while Notion remains pending and never c
   const repeatingBrowser = new Browser();
   const repeatingTelemetry = new Telemetry();
   const repeating = await startJob(new Store(['pending', 'pending', 'pending', 'in_progress', 'completed']) as any, 'db', repeatingBrowser as any, 'task', 'job-repeated-approval', { ...options, telemetry: repeatingTelemetry });
-  const repeatedClicks = repeatingTelemetry.events.filter(item => item.event === 'notion_write_access_recovery');
+  const repeatedClicks = repeatingTelemetry.events.filter(item => item.event === 'app_approval_recovery');
   assert.equal(repeatingBrowser.approvalChecks, 3);
   assert.equal(repeatedClicks.length, 3);
   assert.deepEqual(repeatedClicks.map(item => item.outcome), [
@@ -192,7 +192,7 @@ test('pending approval assist runs only while Notion remains pending and never c
 
 test('records when a fresh conversation tab no longer shows the approval card', async () => {
   const browser = new Browser();
-  browser.requestNotionApprovalAssist = async () => {
+  browser.requestAppApprovalAssist = async () => {
     browser.approvalChecks++;
     return browser.approvalChecks === 1
       ? { status: 'click_reported' as const, attemptedChoice: 'always_allow' as const, tabIndex: 1 }
@@ -200,7 +200,7 @@ test('records when a fresh conversation tab no longer shows the approval card', 
   };
   const telemetry = new Telemetry();
   const result = await startJob(new Store(['pending', 'pending', 'in_progress', 'completed']) as any, 'db', browser as any, 'task', 'job-fresh-tab-observation', { ...options, telemetry });
-  const recoveries = telemetry.events.filter(item => item.event === 'notion_write_access_recovery');
+  const recoveries = telemetry.events.filter(item => item.event === 'app_approval_recovery');
   assert.deepEqual(recoveries.map(item => item.outcome), [
     'approval_button_click_reported',
     'approval_card_not_present_in_fresh_tab',

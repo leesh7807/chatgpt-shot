@@ -71,15 +71,17 @@ chatgpt-shot inspect <uuid>
 
 `inspect` returns schema-versioned JSON. It first uses the authenticated read route of an existing Service, which does not require caller-side Notion configuration; when that route fails or is unavailable, it uses direct Notion access if caller-side configuration is available. If direct fallback succeeds after a Service read failure, the report includes both the Notion observation and the Service read failure. If remote reads remain unavailable, the report includes the source and reason; it does not turn the local Attempt into a failed or unsent Job. Retry safety is marked safe only when delivery is proven absent and any created Invocation is confirmed cleaned up or absent. The command never retries or starts a Service.
 
-## Approval observation
+## App approval assist and observation
 
-For an opt-in approval UI investigation, add `--observe-approval` to `submit`. When the broker finds and clicks a Notion approval button, it saves a small screenshot region before and after the click, then records filenames, tab index, and follow-up probe result in that click's existing `attempts` record. A fresh tab with no approval card is recorded without a screenshot. Screenshots are owner-only under `$XDG_CACHE_HOME/chatgpt-shot/observations/<job-uuid>/` or `~/.cache/chatgpt-shot/observations/<job-uuid>/`. They can contain nearby ChatGPT page content; use this option only when local image artifacts are appropriate.
+During normal `submit`, the Service checks for app approval cards whenever it observes the Invocation in `pending`. The broker looks for a visible Notion or Chrome approval card and prefers an enabled `Always allow` button. If that button is absent or disabled, it clicks an enabled `Allow once` button. Both choices use trusted mouse input. The click is only an approval attempt; Notion State remains the sole acceptance signal. `Always allow` can persist the app permission, while `Allow once` applies to the current request.
+
+`--observe-approval` does not enable approval handling; it only opts in to screenshots when a click is attempted. The broker saves a small screenshot region before and after the click, then records filenames, tab index, and follow-up probe result in that click's existing `attempts` record. A fresh tab with no approval card is recorded without a screenshot. Screenshots are owner-only under `$XDG_CACHE_HOME/chatgpt-shot/observations/<job-uuid>/` or `~/.cache/chatgpt-shot/observations/<job-uuid>/`. They can contain nearby ChatGPT page content; use this option only when local image artifacts are appropriate.
 
 ```sh
 chatgpt-shot submit --observe-approval "Search Notion for the page named Example and report whether it exists. Do not create or edit anything."
 ```
 
-If a click is followed by another `pending` Notion read, the broker opens the same conversation in a fresh tab and checks for the approval card there. It clicks only when the card is visible and uses at most three submission tabs per Job. If a fresh tab has no card, that tab branch stops while the original tab remains under observation. Notion State remains authoritative. The broker closes all submission and approval tabs before handing an accepted Job back to the caller.
+If a click is followed by another `pending` Notion read, the broker opens the same conversation in a fresh tab and checks for a Notion or Chrome approval card there. It uses at most three submission tabs per Job. If a fresh tab has no card, that tab branch stops while the original tab remains under observation. Notion State remains authoritative. The broker closes all submission and approval tabs before handing an accepted Job back to the caller.
 
 These screenshots and event records are local diagnostics, not a public Job surface or additional Job lifecycle. They are not written to the Notion Invocation and do not change the `submit` or `jobs` contract. Delete `$XDG_CACHE_HOME/chatgpt-shot/jobs.jsonl` and `$XDG_CACHE_HOME/chatgpt-shot/observations/` to remove these local diagnostics and screenshots.
 

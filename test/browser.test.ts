@@ -123,15 +123,15 @@ test('approval observation opt-in reaches only the approval-assist broker reques
   const browser = new ChatGPTBrowser('profile', async (_root, request) => {
     operations.push({ operation: request.operation, observeApproval: request.observeApproval, jobId: request.jobId });
     if (request.operation === 'open') return 'session-1';
-    if (request.operation === 'notion-approval-assist') return { status: 'not_present' };
+    if (request.operation === 'app-approval-assist') return { status: 'not_present' };
     return undefined;
   }, false, true, '456fae40-f8fb-4657-94ce-b791835e93d2');
 
   await browser.openFreshContext();
-  await browser.requestNotionApprovalAssist();
+  await browser.requestAppApprovalAssist();
   assert.deepEqual(operations, [
     { operation: 'open', observeApproval: undefined, jobId: undefined },
-    { operation: 'notion-approval-assist', observeApproval: true, jobId: '456fae40-f8fb-4657-94ce-b791835e93d2' },
+    { operation: 'app-approval-assist', observeApproval: true, jobId: '456fae40-f8fb-4657-94ce-b791835e93d2' },
   ]);
 });
 
