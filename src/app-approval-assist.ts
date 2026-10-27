@@ -107,13 +107,25 @@ export function appApprovalPageProbe(): Probe {
     while (branch.parentElement && branch.parentElement !== root) branch = branch.parentElement;
     return branch === root ? undefined : branch;
   }
-  function describesSupportedRequest(text: string): boolean {
+  function directText(element: Element): string {
+    return [...element.childNodes]
+      .filter(node => node.nodeType === 3 || node.nodeType === 4)
+      .map(node => node.textContent || '')
+      .join(' ');
+  }
+  function requestTargets(text: string): Set<string> {
     const value = normalize(text);
     const targets = new Set<string>();
     for (const match of value.matchAll(/\ballow\s+chatgpt\b.{0,60}?\b(?:to use|access(?:\s+to)?)\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) targets.add(match[1]);
     for (const match of value.matchAll(/\bchatgpt\b.{0,80}?\bwants? to use\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) targets.add(match[1]);
     for (const match of value.matchAll(/\bchatgpt\b.{0,80}?\brequests? (?:access|permission)(?:\s+to\s+(?:use|access))?\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) targets.add(match[1]);
-    for (const match of value.matchAll(/\bchatgpt\b.{0,80}?\bwill call\s+(notion|chrome)\b/g)) targets.add(match[1]);
+    for (const match of value.matchAll(/\bchatgpt\b.{0,80}?\bwill call\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) {
+      if (!['its', 'his', 'her', 'their'].includes(match[1])) targets.add(match[1]);
+    }
+    return targets;
+  }
+  function describesSupportedRequest(text: string): boolean {
+    const targets = requestTargets(text);
     return targets.size === 1 && ['notion', 'chrome'].includes([...targets][0]);
   }
   function actionGroups(root: Element): Element[] {
@@ -134,11 +146,17 @@ export function appApprovalPageProbe(): Probe {
       const hasNotion = /\bnotion\b/.test(text);
       const hasChrome = /\bchrome\b/.test(text);
       if (hasNotion === hasChrome) continue;
+      // Reject a bounded ancestor that contains conflicting app requests,
+      // including an unsupported request next to a supported one.
+      if (!describesSupportedRequest(text)) continue;
       const branch = directBranch(parent, group);
-      // App identity and request wording must live in the same child branch as
-      // this action group. Text in a sibling section or broad card ancestor
-      // cannot authorize a generic Allow button for another app.
-      if (!branch || !describesSupportedRequest((branch as HTMLElement).innerText || branch.textContent || '')) continue;
+      // The request must share the action branch or be text directly owned by
+      // this bounded card. Text in a sibling section cannot authorize a
+      // generic Allow button; the unique paired group below excludes a broader
+      // ancestor containing multiple approval cards.
+      const requestInBranch = branch && describesSupportedRequest((branch as HTMLElement).innerText || branch.textContent || '');
+      const requestOnCard = describesSupportedRequest(directText(parent));
+      if (!requestInBranch && !requestOnCard) continue;
       const groups = actionGroups(parent);
       if (groups.length === 1 && groups[0] === group) return parent;
     }

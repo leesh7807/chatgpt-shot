@@ -27,6 +27,7 @@ function element(tagName: string, text = '', children: any[] = [], options: { ro
     },
     click() { options.onClick?.(); },
   };
+  node.childNodes = [...(text ? [{ nodeType: 3, textContent: text }] : []), ...children];
   node.ownText = text;
   Object.defineProperty(node, 'textContent', { get: () => `${text} ${children.map(child => child.textContent).join(' ')}`.trim() });
   Object.defineProperty(node, 'innerText', { get: () => `${text} ${children.map(child => child.innerText).join(' ')}`.trim() });
@@ -109,6 +110,20 @@ test('probe accepts the third ancestor when it contains one supported approval a
   assert.deepEqual(withDom(card, () => appApprovalPageProbe()), {
     status: 'ready', choice: 'always_allow', target: { x: 50, y: 10 },
   });
+});
+
+test('probe accepts request text owned by the third-ancestor approval card', () => {
+  const actions = element('FORM', '', [element('BUTTON', 'Always allow'), element('BUTTON', 'Deny Esc')]);
+  const card = element('DIV', 'Allow ChatGPT to use Notion?', [element('DIV', '', [actions])]);
+  assert.deepEqual(withDom(card, () => appApprovalPageProbe()), {
+    status: 'ready', choice: 'always_allow', target: { x: 50, y: 10 },
+  });
+});
+
+test('probe rejects an unsupported request inside a card with direct supported-app text', () => {
+  const actions = element('FORM', '', [element('BUTTON', 'Always allow'), element('BUTTON', 'Deny Esc')]);
+  const card = element('DIV', 'Allow ChatGPT to use Notion?', [element('DIV', 'ChatGPT will call Calendar', [actions])]);
+  assert.deepEqual(withDom(card, () => appApprovalPageProbe()), { status: 'not_present' });
 });
 
 test('probe rejects app context found only above the third ancestor', () => {
