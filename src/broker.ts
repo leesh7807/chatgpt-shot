@@ -5,17 +5,17 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { fail, isStaleBrowserSessionError } from './errors.js';
-import { checkAndAllowAppApproval } from './app-approval-assist.js';
+import { chatGptConversationIdentity, checkAndAllowAppApproval, serializedAppApprovalPageProbe } from './app-approval-assist.js';
 import { LocalApprovalObservationWriter } from './approval-observation.js';
 
-type Request = { operation: string; sessionId?: string; prompt?: string; submissionMarker?: string; diagnostics?: boolean; observeApproval?: boolean; jobId?: string };
+type Request = { operation: string; sessionId?: string; prompt?: string; submissionMarker?: string; diagnostics?: boolean; observeApproval?: boolean; jobId?: string; conversationUrl?: string };
 type Response = { ok: true; value?: unknown } | { ok: false; code: string; message: string };
 type Message = { id?: number; sessionId?: string; result?: any; error?: { message: string } };
 export type SubmissionEvidence = { seen: boolean; composerValue: string };
 export type SubmissionInspection = 'submitted' | 'not_submitted' | 'uncertain';
 export const classifySubmissionEvidence = (submissionMarker: string, evidence: SubmissionEvidence): SubmissionInspection => !submissionMarker ? 'uncertain' : evidence.seen ? 'submitted' : evidence.composerValue.includes(submissionMarker) ? 'not_submitted' : 'uncertain';
 export type TrustedMouseEvent = { type: 'mouseMoved' | 'mousePressed' | 'mouseReleased'; x: number; y: number; button: 'none' | 'left'; buttons: number; clickCount: number };
-export type TrustedClickExpectation = { label: string; context: string[] };
+export type TrustedClickExpectation = { label: string; choice: string };
 export type TrustedClickResult = { status: 'clicked' | 'target_mismatch' | 'target_obscured' | 'click_not_received' };
 export type XScreenMetrics = { screenX: number; screenY: number; outerHeight: number; innerHeight: number; devicePixelRatio: number };
 export function viewportPointToXScreen(x: number, y: number, metrics: XScreenMetrics) {
@@ -31,6 +31,8 @@ export async function dispatchTrustedClick(dispatch: (event: TrustedMouseEvent) 
   finally { await dispatch({ type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 }); }
 }
 const prepareTrustedClick = `(x,y,expectation,key)=>{
+  const fresh=(${serializedAppApprovalPageProbe()})();
+  if(fresh.status!=='ready'||fresh.choice!==expectation.choice||fresh.target.x!==x||fresh.target.y!==y)return {status:'target_mismatch'};
   const normalize=value=>String(value||'').replace(/\\s+/g,' ').trim().toLocaleLowerCase().replace(/\\s*(?:esc|enter|return|↵|⏎|▼)$/i,'').trim();
   const matches=value=>{const label=normalize(value);const expected=normalize(expectation.label);return label===expected||label.startsWith(expected+' ')};
   const target=document.elementFromPoint(x,y);
@@ -41,14 +43,7 @@ const prepareTrustedClick = `(x,y,expectation,key)=>{
   if(button.disabled||button.getAttribute('aria-disabled')==='true')return {status:'target_mismatch'};
   const rect=button.getBoundingClientRect();
   if(rect.width<=0||rect.height<=0||x<rect.left||x>rect.right||y<rect.top||y>rect.bottom)return {status:'target_obscured'};
-  let contextFound=false;
-  for(let current=button,depth=0;current&&depth<3;current=current.parentElement,depth++){
-    const style=getComputedStyle(current);
-    if(style.display==='none'||style.visibility==='hidden'||Number(style.opacity)===0)return {status:'target_obscured'};
-    const text=(current.innerText||current.textContent||'').replace(/\\s+/g,' ').toLocaleLowerCase();
-    if(expectation.context.some(value=>text.includes(normalize(value)))){contextFound=true;break;}
-  }
-  if(!contextFound)return {status:'target_mismatch'};
+  for(let current=button;current;current=current.parentElement){const style=getComputedStyle(current);if(style.display==='none'||style.visibility==='hidden'||Number(style.opacity)===0)return {status:'target_obscured'}}
   const state={button,eventSeen:false,targetMatched:false,listener:undefined};
   state.listener=event=>{
     if(!event.isTrusted)return;
@@ -327,7 +322,7 @@ const visibility = `const visible=e=>{const s=getComputedStyle(e),b=e.getBoundin
 const authProbe = `()=>{${visibility}const c=[...document.querySelectorAll('a,button')].filter(visible);const loginVisible=c.some(e=>/^(log in|sign up)$/i.test((e.textContent||'').trim())||/\\/(auth|login)/i.test(e.href||''));const accountVisible=c.some(e=>/(account|profile|settings|upgrade plan|my plan|log out|user menu|avatar)/i.test([e.getAttribute('aria-label'),e.getAttribute('title'),e.getAttribute('data-testid'),e.textContent].filter(Boolean).join(' ')))||[...document.querySelectorAll('[data-testid*="profile"],[data-testid*="account"],img[alt*="profile" i],img[alt*="avatar" i]')].some(visible);return {loginVisible,accountVisible,authenticated:!loginVisible&&accountVisible}}`;
 const composerProbe = `()=>{${visibility}return [...document.querySelectorAll('textarea,[contenteditable="true"]')].some(visible)}`;
 const browserDiagnosticProbe = `(marker,expected,basePath)=>{${visibility}const composers=[...document.querySelectorAll('textarea,[contenteditable="true"]')].filter(visible);const controls=[...document.querySelectorAll('button,[role="button"]')].filter(visible);const relevant=/send|submit|message|prompt|stop|voice|audio|arrow|enter|go/i;const describe=(e,includeText=false)=>{const text=(e.textContent||'').trim().slice(0,60);return {tag:e.tagName.toLowerCase(),role:e.getAttribute('role'),ariaLabel:e.getAttribute('aria-label'),title:e.getAttribute('title'),placeholder:e.getAttribute('placeholder')||e.getAttribute('data-placeholder'),testId:e.getAttribute('data-testid'),...(includeText&&relevant.test(text)?{text}:{}),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true'}};const composer=composers[0];const value=e=>e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'');const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let messageContainsMarker=false,node;while(node=walker.nextNode()){const parent=node.parentElement;if(!parent?.closest('textarea,[contenteditable="true"]')&&node.textContent?.includes(marker)){messageContainsMarker=true;break}}const buttonCandidates=controls.map(e=>describe(e,true));const sendLikeCandidates=buttonCandidates.filter(b=>relevant.test([b.ariaLabel,b.title,b.testId,b.text].filter(Boolean).join(' '))).slice(0,20);return {path:location.pathname,composerCount:composers.length,composer:composer?{...describe(composer),valueLength:value(composer).length,containsSubmissionMarker:value(composer).includes(marker),matchesFilledPrompt:typeof expected==='string'?value(composer)===expected:null}:null,messageContainsMarker,routeChanged:typeof basePath==='string'&&location.pathname!==basePath,visibleControlCount:controls.length,sendLikeCandidates,stopControlVisible:controls.some(e=>/stop|cancel generation/i.test([e.getAttribute('aria-label'),e.getAttribute('title'),e.getAttribute('data-testid'),e.textContent].filter(Boolean).join(' ')))}}`;
-const sendControlProbe = `(marker)=>{${visibility}const labelPattern=new RegExp(${JSON.stringify(SEND_BUTTON_LABEL_PATTERN.source)},'i');const describe=e=>e?{tag:e.tagName.toLowerCase(),role:e.getAttribute('role'),ariaLabel:e.getAttribute('aria-label'),title:e.getAttribute('title'),testId:e.getAttribute('data-testid'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true'}:null;const value=e=>e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'');const composer=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);if(!marker||!composer||!value(composer).includes(marker))return {method:'wait',reason:'composer_marker_missing'};const isSend=e=>{const labels=[e.getAttribute('aria-label'),e.getAttribute('title'),e.textContent].filter(Boolean);return labels.some(label=>labelPattern.test(label.trim()))||/^(?:send|submit)-button$/i.test(e.getAttribute('data-testid')||'')};const button=[...document.querySelectorAll('button,[role="button"]')].find(e=>visible(e)&&isSend(e));if(!button)return {method:'wait',reason:'send_button_not_found'};if(button.disabled||button.getAttribute('aria-disabled')==='true')return {method:'wait',reason:'send_button_disabled',button:describe(button)};const selected=describe(button);button.click();return {method:'click',button:selected}}`;
+const sendControlProbe = `(marker)=>{${visibility}const labelPattern=new RegExp(${JSON.stringify(SEND_BUTTON_LABEL_PATTERN.source)},'i');const describe=e=>e?{tag:e.tagName.toLowerCase(),role:e.getAttribute('role'),ariaLabel:e.getAttribute('aria-label'),title:e.getAttribute('title'),testId:e.getAttribute('data-testid'),disabled:!!e.disabled||e.getAttribute('aria-disabled')==='true'}:null;const value=e=>e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'');const composer=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);if(!marker||!composer||!value(composer).includes(marker))return {method:'wait',reason:'composer_marker_missing'};const isSend=e=>{const labels=[e.getAttribute('aria-label'),e.getAttribute('title'),e.textContent].filter(Boolean);return labels.some(label=>labelPattern.test(label.trim()))||/^(?:send|submit)-button$/i.test(e.getAttribute('data-testid')||'')};const button=[...document.querySelectorAll('button,[role="button"]')].find(e=>visible(e)&&isSend(e));if(!button)return {method:'wait',reason:'send_button_not_found'};if(button.disabled||button.getAttribute('aria-disabled')==='true')return {method:'wait',reason:'send_button_disabled',button:describe(button)};const selected=describe(button);button.click();return {method:'click',button:selected,conversationUrl:location.href}}`;
 
 class Broker {
   private process?: ChildProcess; private display?: VirtualDisplay; private cdp?: PipeCdp; private control?: Page; private starting?: Promise<void>; private startingChild?: ChildProcess; private startingDisplay?: VirtualDisplay; private startingCdp?: PipeCdp; private stopping = false;
@@ -461,6 +456,29 @@ class Broker {
       if (request.operation === 'auth') {
         return this.authenticateControl();
       }
+      if (request.operation === 'app-approval-observation-open') {
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.jobId ?? '')) {
+          fail('BROWSER_UNAVAILABLE', 'Approval observation requires a valid Job ID.');
+        }
+        const conversationUrl = chatGptConversationIdentity(request.conversationUrl);
+        if (!conversationUrl) fail('BROWSER_UNAVAILABLE', 'Approval observation requires the submitted ChatGPT conversation.');
+        const deadline = Date.now() + 20_000;
+        const page = await this.createPage(this.cdp!, deadline);
+        const sessionId = randomUUID();
+        this.pages.set(sessionId, page);
+        try {
+          await page.within(deadline, async () => {
+            await page.navigate(conversationUrl);
+            await this.ready(page);
+            const currentUrl = chatGptConversationIdentity(await page.evaluate<string>('()=>location.href'));
+            if (currentUrl !== conversationUrl) fail('BROWSER_UNAVAILABLE', 'The approval observation tab did not load the submitted ChatGPT conversation.');
+          });
+          return sessionId;
+        } catch (error) {
+          await this.closePage(sessionId, page).catch(() => {});
+          throw error;
+        }
+      }
       if (request.operation === 'open') { const deadline = Date.now() + 75_000; const page = await this.createPage(this.cdp!, deadline); const id = randomUUID(); this.pages.set(id, page); try { await page.within(deadline, async () => { await page.navigate(); const auth = await this.auth(page); if (!auth.authenticated) fail('CHATGPT_AUTH_REQUIRED', 'ChatGPT authentication is required. Run `chatgpt-shot open`.'); await this.composer(page); }); return id; } catch (error) { try { await this.closePage(id, page); } catch (closeError) { const failure: any = new Error('Browser context could not be closed after open failed.'); failure.code = 'BROWSER_CONTEXT_CLOSE_FAILED'; failure.cause = closeError; throw failure; } throw error; } }
       const page = request.sessionId ? this.pages.get(request.sessionId) : undefined;
       if (request.operation === 'close' && !page) return { closed: true, verified: true };
@@ -533,7 +551,7 @@ class Broker {
       if (request.operation === 'inspect') {
         const marker = request.submissionMarker ?? '';
         if (!marker) return { inspection: 'uncertain', reason: 'marker_missing', sampleCount: 1, messageMarkerSeen: false, composerMarkerPresent: false, composerPresent: false };
-        const value = await page.within(Date.now() + 1_000, () => page.evaluate<{ seen: boolean; composerPresent: boolean; composerHasMarker: boolean; composerValue: string }>(`marker=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);const text=e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'');const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let seen=false,node;while(node=walker.nextNode()){const parent=node.parentElement;if(!parent?.closest('textarea,[contenteditable="true"]')&&node.textContent?.includes(marker)){seen=true;break}}return {seen,composerPresent:!!e,composerHasMarker:text.includes(marker),composerValue:text}}`, [marker]));
+        const value = await page.within(Date.now() + 1_000, () => page.evaluate<{ seen: boolean; composerPresent: boolean; composerHasMarker: boolean; composerValue: string; conversationUrl: string }>(`marker=>{${visibility}const e=[...document.querySelectorAll('textarea,[contenteditable="true"]')].find(visible);const text=e instanceof HTMLTextAreaElement?e.value:(e?.textContent||'');const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let seen=false,node;while(node=walker.nextNode()){const parent=node.parentElement;if(!parent?.closest('textarea,[contenteditable="true"]')&&node.textContent?.includes(marker)){seen=true;break}}return {seen,composerPresent:!!e,composerHasMarker:text.includes(marker),composerValue:text,conversationUrl:location.href}}`, [marker]));
         const inspection = classifySubmissionEvidence(marker, { seen: value.seen, composerValue: value.composerValue });
         const result = {
           inspection,
@@ -542,6 +560,7 @@ class Broker {
           composerPresent: value.composerPresent,
           sampleCount: 1,
           reason: inspection === 'submitted' ? 'marker_in_message' : inspection === 'not_submitted' ? 'marker_in_composer' : !value.composerPresent ? 'composer_missing' : value.seen && value.composerHasMarker ? 'marker_seen_in_both' : 'marker_seen_in_neither',
+          conversationUrl: chatGptConversationIdentity(value.conversationUrl),
         };
         if (!request.diagnostics) return result;
         return { ...result, snapshot: await this.diagnosticSnapshot(page, request.sessionId!, marker, 'acceptance_deadline') };
@@ -585,7 +604,7 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export async function runBroker(profilePath: string): Promise<void> {
   const directory = runtimeDirectory(); mkdirSync(directory, { recursive: true, mode: 0o700 }); chmodSync(directory, 0o700); if (!ownedDirectory(directory)) fail('BROWSER_UNAVAILABLE', 'Broker runtime directory is not owner-controlled.'); const socket = brokerSocket(profilePath); const broker = new Broker(profilePath); let stopping = false;
-  const server = net.createServer({ allowHalfOpen: true }, connection => { const peer = (connection as unknown as { getPeerCredentials?: () => { uid?: number } }).getPeerCredentials?.(); if (peer?.uid !== undefined && process.getuid && peer.uid !== process.getuid()) return connection.destroy(); let body = ''; let responseStarted = false; let clientGone = false; connection.setEncoding('utf8'); connection.on('error', () => {}); connection.on('close', () => { if (!responseStarted) clientGone = true; }); connection.on('data', chunk => { body += chunk; }); connection.on('end', async () => { let response: Response; try { const request = JSON.parse(body) as Request; if (request.operation === 'shutdown') { await shutdown(); response = { ok: true }; } else { const value = await broker.handle(request); if ((clientGone || connection.destroyed) && request.operation === 'open' && typeof value === 'string') await broker.discard(value); if (clientGone || connection.destroyed) return; response = { ok: true, value }; } } catch (error: any) { response = { ok: false, code: error?.code ?? 'INTERNAL_ERROR', message: error?.message ?? String(error) }; } responseStarted = true; connection.end(JSON.stringify(response)); }); });
+  const server = net.createServer({ allowHalfOpen: true }, connection => { const peer = (connection as unknown as { getPeerCredentials?: () => { uid?: number } }).getPeerCredentials?.(); if (peer?.uid !== undefined && process.getuid && peer.uid !== process.getuid()) return connection.destroy(); let body = ''; let responseStarted = false; let clientGone = false; connection.setEncoding('utf8'); connection.on('error', () => {}); connection.on('close', () => { if (!responseStarted) clientGone = true; }); connection.on('data', chunk => { body += chunk; }); connection.on('end', async () => { let response: Response; try { const request = JSON.parse(body) as Request; if (request.operation === 'shutdown') { await shutdown(); response = { ok: true }; } else { const value = await broker.handle(request); if ((clientGone || connection.destroyed) && ['open', 'app-approval-observation-open'].includes(request.operation) && typeof value === 'string') await broker.discard(value); if (clientGone || connection.destroyed) return; response = { ok: true, value }; } } catch (error: any) { response = { ok: false, code: error?.code ?? 'INTERNAL_ERROR', message: error?.message ?? String(error) }; } responseStarted = true; connection.end(JSON.stringify(response)); }); });
   let shutdownPromise: Promise<void> | undefined;
   const shutdown = () => shutdownPromise ??= (async () => { if (stopping) return; stopping = true; await broker.close(); server.close(); try { unlinkSync(socket); } catch {} })();
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socket, () => { try { chmodSync(socket, 0o600); resolve(); } catch (error) { reject(error); } }); }); process.on('SIGINT', () => void shutdown()); process.on('SIGTERM', () => void shutdown());
@@ -598,7 +617,7 @@ export const brokerRequest = async (root: string, request: Request): Promise<any
   // never time out while the broker can still perform that side effect.
   // ensure may cold-start Chrome, create/attach a target, navigate, and wait for readiness.
   // Its caller must outlive every bounded private-CDP operation in that startup path.
-  const timeoutMs = request.operation === 'ensure' ? 180_000 : request.operation === 'submit' ? 95_000 : request.operation === 'open' || request.operation === 'shutdown' ? 90_000 : request.operation === 'fill' || request.operation === 'auth' ? 60_000 : request.operation === 'app-approval-assist' ? 30_000 : 15_000;
+  const timeoutMs = request.operation === 'ensure' ? 180_000 : request.operation === 'submit' ? 95_000 : request.operation === 'open' || request.operation === 'shutdown' ? 90_000 : request.operation === 'fill' || request.operation === 'auth' ? 60_000 : request.operation === 'app-approval-assist' || request.operation === 'app-approval-observation-open' ? 30_000 : 15_000;
   const timeout = setTimeout(() => finish(new Error('Broker RPC timed out.')), timeoutMs);
   socket.setEncoding('utf8'); socket.once('error', (error) => finish(error)); socket.on('data', chunk => { body += chunk; }); socket.on('end', () => { try { const response = JSON.parse(body) as Response; if (!response.ok) { const error: any = new Error(response.message); error.code = response.code; finish(error); } else finish(undefined, response.value); } catch (error: any) { finish(error); } }); socket.end(JSON.stringify(request));
 });

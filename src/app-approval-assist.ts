@@ -23,14 +23,25 @@ export type AppApprovalCheck =
   | ({ status: 'unavailable'; reason: AppApprovalReason; attemptedChoice?: AppApprovalChoice } & Partial<ApprovalObservation>);
 
 export interface AppApprovalBrowser {
-  requestAppApprovalAssist?(): Promise<unknown>;
+  requestAppApprovalAssist?(observationSession?: boolean): Promise<unknown>;
+}
+
+/** Only the concrete conversation route captured from a Job's submission page is reusable. */
+export function chatGptConversationIdentity(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.hostname !== 'chatgpt.com' || url.username || url.password
+      || !/^\/c\/[A-Za-z0-9_-]+\/?$/.test(url.pathname)) return undefined;
+    return `https://chatgpt.com${url.pathname.replace(/\/$/, '')}`;
+  } catch { return undefined; }
 }
 
 /** Approval recovery is best-effort; Notion readback remains authoritative. */
-export async function recoverPendingAppApproval(browser?: AppApprovalBrowser): Promise<AppApprovalCheck | undefined> {
+export async function requestAppApproval(browser?: AppApprovalBrowser, observationSession = false): Promise<AppApprovalCheck | undefined> {
   if (!browser?.requestAppApprovalAssist) return undefined;
   try {
-    const result = await browser.requestAppApprovalAssist();
+    const result = await browser.requestAppApprovalAssist(observationSession);
     if (result === undefined) return undefined;
     if (result && typeof result === 'object' && 'status' in result && typeof result.status === 'string'
       && ['not_present', 'click_reported', 'click_unconfirmed', 'unavailable'].includes(result.status)) {
@@ -62,7 +73,7 @@ export function appApprovalPageProbe(): Probe {
   function choice(button: HTMLButtonElement): AppApprovalChoice | undefined {
     const labels = [button.getAttribute('aria-label'), button.getAttribute('title'), button.innerText, button.textContent]
       .filter(Boolean).map(value => normalize(value as string));
-    const matches = (expected: string) => labels.some(label => label === expected || label.startsWith(`${expected} `));
+    function matches(expected: string): boolean { return labels.some(label => label === expected || label.startsWith(`${expected} `)); }
     if (matches('always allow')) return 'always_allow';
     if (matches('allow once')) return 'allow_once';
     if (labels.includes('allow')) return 'allow';
@@ -71,20 +82,101 @@ export function appApprovalPageProbe(): Probe {
   function enabled(button: HTMLButtonElement): boolean {
     return !button.disabled && button.getAttribute('aria-disabled') !== 'true';
   }
-  function hasSupportedAppContext(button: HTMLButtonElement): boolean {
-    for (let parent: Element | null = button, depth = 0; parent && depth < 3; parent = parent.parentElement, depth++) {
-      const text = normalize((parent as HTMLElement).innerText || parent.textContent || '');
-      if (text.includes('notion') || text.includes('chrome')) return true;
+  function hasChoice(button: Element): boolean {
+    return choice(button as HTMLButtonElement) !== undefined;
+  }
+  function isDenial(button: Element): boolean {
+    const labels = [(button as HTMLElement).getAttribute('aria-label'), (button as HTMLElement).getAttribute('title'),
+      (button as HTMLElement).innerText, button.textContent]
+      .filter(Boolean).map(value => normalize(value as string));
+    return labels.some(label => /^(?:deny|decline|don't allow|do not allow)(?:\b|$)/.test(label));
+  }
+  function pairedActionGroup(button: HTMLButtonElement): Element | undefined {
+    for (let parent: Element | null = button.parentElement, depth = 1; parent && depth <= 3; parent = parent.parentElement, depth++) {
+      const controls = [...parent.querySelectorAll('button')];
+      if (controls.some(hasChoice) && controls.some(isDenial)) return parent;
     }
+    return undefined;
+  }
+  function contains(root: Element, child: Element): boolean {
+    for (let current: Element | null = child; current; current = current.parentElement) if (current === root) return true;
     return false;
+  }
+  function directBranch(root: Element, descendant: Element): Element | undefined {
+    let branch = descendant;
+    while (branch.parentElement && branch.parentElement !== root) branch = branch.parentElement;
+    return branch === root ? undefined : branch;
+  }
+  function directText(element: Element): string {
+    return [...element.childNodes]
+      .filter(node => node.nodeType === 3 || node.nodeType === 4)
+      .map(node => node.textContent || '')
+      .join(' ');
+  }
+  function requestTargets(text: string): Set<string> {
+    const value = normalize(text);
+    const targets = new Set<string>();
+    for (const match of value.matchAll(/\ballow\s+chatgpt\b.{0,60}?\b(?:to use|access(?:\s+to)?)\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) targets.add(match[1]);
+    for (const match of value.matchAll(/\bchatgpt\b.{0,80}?\bwants? to use\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) targets.add(match[1]);
+    for (const match of value.matchAll(/\bchatgpt\b.{0,80}?\brequests? (?:access|permission)(?:\s+to\s+(?:use|access))?\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) targets.add(match[1]);
+    for (const match of value.matchAll(/\bchatgpt\b.{0,80}?\bwill call\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) {
+      if (!['its', 'his', 'her', 'their'].includes(match[1])) targets.add(match[1]);
+    }
+    return targets;
+  }
+  function describesSupportedRequest(text: string): boolean {
+    const targets = requestTargets(text);
+    return targets.size === 1 && ['notion', 'chrome'].includes([...targets][0]);
+  }
+  function actionGroups(root: Element): Element[] {
+    const groups = new Set<Element>();
+    for (const candidate of [...root.querySelectorAll('button')]) {
+      if (!hasChoice(candidate)) continue;
+      const group = pairedActionGroup(candidate as HTMLButtonElement);
+      if (group && contains(root, group)) groups.add(group);
+    }
+    return [...groups];
+  }
+  function supportedAppContext(button: HTMLButtonElement): Element | undefined {
+    const group = pairedActionGroup(button);
+    if (!group) return undefined;
+    for (let parent: Element | null = button, depth = 0; parent && depth <= 3; parent = parent.parentElement, depth++) {
+      if (!contains(parent, group)) continue;
+      const text = normalize((parent as HTMLElement).innerText || parent.textContent || '');
+      const hasNotion = /\bnotion\b/.test(text);
+      const hasChrome = /\bchrome\b/.test(text);
+      if (hasNotion === hasChrome) continue;
+      // Reject a bounded ancestor that contains conflicting app requests,
+      // including an unsupported request next to a supported one.
+      if (!describesSupportedRequest(text)) continue;
+      const branch = directBranch(parent, group);
+      // The request must share the action branch or be text directly owned by
+      // this bounded card. Text in a sibling section cannot authorize a
+      // generic Allow button; the unique paired group below excludes a broader
+      // ancestor containing multiple approval cards.
+      const requestInBranch = branch && describesSupportedRequest((branch as HTMLElement).innerText || branch.textContent || '');
+      const requestOnCard = describesSupportedRequest(directText(parent));
+      if (!requestInBranch && !requestOnCard) continue;
+      const groups = actionGroups(parent);
+      if (groups.length === 1 && groups[0] === group) return parent;
+    }
+    return undefined;
   }
 
   const candidates = [...document.querySelectorAll('button')]
     .filter((element): element is HTMLButtonElement => element.tagName === 'BUTTON')
-    .filter(candidate => visible(candidate) && enabled(candidate) && hasSupportedAppContext(candidate));
-  const button = candidates.find(candidate => choice(candidate) === 'always_allow')
-    ?? candidates.find(candidate => choice(candidate) === 'allow_once')
-    ?? candidates.find(candidate => choice(candidate) === 'allow');
+    .filter(candidate => visible(candidate) && enabled(candidate) && supportedAppContext(candidate));
+  const cardRoots = new Set(candidates.map(candidate => supportedAppContext(candidate)!));
+  if (cardRoots.size !== 1) return { status: 'not_present' };
+  const card = [...cardRoots][0];
+  const cardCandidates = candidates.filter(candidate => supportedAppContext(candidate) === card);
+  const button = (['always_allow', 'allow_once', 'allow'] as const)
+    .map(wanted => cardCandidates.filter(candidate => choice(candidate) === wanted))
+    .find(matches => matches.length > 0)?.length === 1
+    ? (['always_allow', 'allow_once', 'allow'] as const)
+      .map(wanted => cardCandidates.filter(candidate => choice(candidate) === wanted))
+      .find(matches => matches.length > 0)?.[0]
+    : undefined;
   if (!button) return { status: 'not_present' };
 
   const rect = button.getBoundingClientRect();
@@ -100,7 +192,7 @@ export function serializedAppApprovalPageProbe(): string {
 export interface AppApprovalPage {
   within<T>(deadline: number, operation: () => Promise<T>): Promise<T>;
   evaluate<T>(expression: string, args?: unknown[]): Promise<T>;
-  clickAt(x: number, y: number, expectation: { label: string; context: string[] }): Promise<{
+  clickAt(x: number, y: number, expectation: { label: string; choice: AppApprovalChoice }): Promise<{
     status: 'clicked' | 'target_mismatch' | 'target_obscured' | 'click_not_received';
   }>;
   captureAround?(x: number, y: number): Promise<string>;
@@ -122,12 +214,7 @@ const MAX_APPROVAL_TABS = 3;
 const approvalTabStates = new WeakMap<AppApprovalPage, ApprovalTabState>();
 const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
-function isChatGptConversationUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.protocol === 'https:' && url.hostname === 'chatgpt.com' && /^\/c\/[A-Za-z0-9_-]+\/?$/.test(url.pathname);
-  } catch { return false; }
-}
+function isChatGptConversationUrl(value: string): boolean { return chatGptConversationIdentity(value) !== undefined; }
 
 async function inspectFreshTab(page: AppApprovalPage): Promise<Probe | 'probe_failed'> {
   const deadline = Date.now() + 5_000;
@@ -225,7 +312,7 @@ export async function checkAndAllowAppApproval(
   try {
     click = await activePage.within(Date.now() + 1_500, () => activePage.clickAt(before.target.x, before.target.y, {
       label,
-      context: ['Notion', 'Chrome'],
+      choice: attemptedChoice,
     }));
   } catch {
     if (tabControl) {

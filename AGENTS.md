@@ -2,6 +2,10 @@
 
 This repository owns the standalone utility. Keep callers repository-agnostic: all persistent state uses the XDG user locations, and public consumers use the authenticated loopback HTTP contract or CLI. Preserve the Notion Invocation lifecycle and do not automate ChatGPT login.
 
+## Repository verification
+
+Use [VERIFICATION.md](VERIFICATION.md) for verification commands, evidence limits, and the isolated smoke runtime's external-effect boundary. Keep delivery-specific evidence under `docs/ui-evidence/`.
+
 # Global Agent Instructions
 
 ## Outcome Standard

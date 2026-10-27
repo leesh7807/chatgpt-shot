@@ -3,19 +3,42 @@ import { spawn } from 'node:child_process';
 import { brokerRequest, brokerSocket } from './broker.js';
 import { paths } from './config.js';
 import { fail, isStaleBrowserSessionError } from './errors.js';
+import { chatGptConversationIdentity } from './app-approval-assist.js';
 
 export type Inspection = 'submitted' | 'not_submitted' | 'uncertain';
-export type SubmitAttempt = { outcome: 'clicked'; method?: string } | { outcome: 'not_attempted'; reason: string };
-export type SubmissionInspection = { inspection: Inspection; messageMarkerSeen?: boolean; composerMarkerPresent?: boolean; composerPresent?: boolean; sampleCount?: number; reason?: string };
+export type SubmitAttempt = { outcome: 'clicked'; method?: string; conversationUrl?: string } | { outcome: 'not_attempted'; reason: string };
+export type SubmissionInspection = { inspection: Inspection; messageMarkerSeen?: boolean; composerMarkerPresent?: boolean; composerPresent?: boolean; sampleCount?: number; reason?: string; conversationUrl?: string };
 export type InspectionOptions = { settleMs?: number };
 export type BrowserDiagnosticEntry = { offset_ms: number; stage: string; [key: string]: unknown };
-export interface BrowserTransport { withBrowser<T>(operation: () => Promise<T>): Promise<T>; ensureAvailable(): Promise<void>; ensureAuthenticated(): Promise<void>; openFreshContext(): Promise<void>; fillPrompt(prompt: string, submissionMarker: string): Promise<void>; submitPrompt(submissionMarker: string): Promise<SubmitAttempt>; inspectSubmission(submissionMarker: string, options?: InspectionOptions): Promise<SubmissionInspection | Inspection>; requestAppApprovalAssist?(): Promise<unknown>; close(): Promise<void>; diagnosticReport?(): BrowserDiagnosticEntry[]; }
+export interface BrowserTransport {
+  withBrowser<T>(operation: () => Promise<T>): Promise<T>;
+  ensureAvailable(): Promise<void>;
+  ensureAuthenticated(): Promise<void>;
+  openFreshContext(): Promise<void>;
+  fillPrompt(prompt: string, submissionMarker: string): Promise<void>;
+  submitPrompt(submissionMarker: string): Promise<SubmitAttempt>;
+  inspectSubmission(submissionMarker: string, options?: InspectionOptions): Promise<SubmissionInspection | Inspection>;
+  requestAppApprovalAssist?(observationSession?: boolean): Promise<unknown>;
+  openAppApprovalObservation?(conversationUrl: string, jobId: string): Promise<void>;
+  closeAppApprovalObservation?(): Promise<void>;
+  close(): Promise<void>;
+  diagnosticReport?(): BrowserDiagnosticEntry[];
+}
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const pendingBrokerStarts = new Map<string, Promise<void>>();
 const profilePath = (profile: string) => profile;
 const systemChrome = () => [process.env.CHATGPT_SHOT_BROWSER, '/usr/bin/google-chrome-stable', '/usr/bin/google-chrome'].find((path): path is string => Boolean(path && existsSync(path)));
-async function request(root: string, operation: string, sessionId?: string, prompt?: string, submissionMarker?: string, send: typeof brokerRequest = brokerRequest, diagnostics = false, observeApproval = false, jobId?: string) { try { return await send(root, { operation, sessionId, prompt, submissionMarker, ...(diagnostics ? { diagnostics: true } : {}), ...(observeApproval && operation === 'app-approval-assist' ? { observeApproval: true, jobId } : {}) }); } catch (error: any) { if (error.code) return fail(error.code, error.message, error); throw error; } }
+async function request(root: string, operation: string, sessionId?: string, prompt?: string, submissionMarker?: string, send: typeof brokerRequest = brokerRequest, diagnostics = false, observeApproval = false, jobId?: string, conversationUrl?: string) {
+  try {
+    return await send(root, {
+      operation, sessionId, prompt, submissionMarker,
+      ...(diagnostics ? { diagnostics: true } : {}),
+      ...(observeApproval && operation === 'app-approval-assist' ? { observeApproval: true, jobId } : {}),
+      ...(operation === 'app-approval-observation-open' ? { jobId, conversationUrl } : {}),
+    });
+  } catch (error: any) { if (error.code) return fail(error.code, error.message, error); throw error; }
+}
 export async function ensureBroker(profile: string) {
   const assertProfileAvailable = () => { if (existsSync(paths().manualOpenLockPath)) fail('SERVICE_BUSY', 'The retained browser profile is open for manual use.'); };
   const absent = (error: any) => error?.code === 'ENOENT' || error?.code === 'ECONNREFUSED';
@@ -68,6 +91,8 @@ export async function shutdownBroker(root: string): Promise<void> {
 
 export class ChatGPTBrowser implements BrowserTransport {
   private sessionId?: string;
+  private approvalObservationSessionId?: string;
+  private approvalObservationJobId?: string;
   private readonly diagnostics: BrowserDiagnosticEntry[] = [];
   private diagnosticStartedAt?: number;
   private observationTask?: Promise<void>;
@@ -160,12 +185,13 @@ export class ChatGPTBrowser implements BrowserTransport {
     const sessionId = this.sessionId;
     if (!sessionId) fail('BROWSER_UNAVAILABLE', 'Browser invocation page is unavailable.');
     try {
-      const result = await this.rpc('submit', sessionId, undefined, submissionMarker) as { method?: string; reason?: string } | undefined;
+      const result = await this.rpc('submit', sessionId, undefined, submissionMarker) as { method?: string; reason?: string; conversationUrl?: unknown } | undefined;
       this.collectDiagnostic(result, 'submit');
       if (result?.method === 'not_ready') return { outcome: 'not_attempted', reason: safeReason(result?.reason) ?? 'send_control_not_ready' };
       if (result?.method !== 'click') fail('SUBMISSION_UNCERTAIN', 'The ChatGPT Send button action could not be confirmed.', result);
       if (this.diagnosticsEnabled) this.observationTask = this.sampleAfterSubmit(sessionId!, submissionMarker);
-      return { outcome: 'clicked', method: 'click' };
+      const conversationUrl = chatGptConversationIdentity(result?.conversationUrl);
+      return { outcome: 'clicked', method: 'click', ...(conversationUrl ? { conversationUrl } : {}) };
     }
     catch (error: any) {
       if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); fail('SUBMISSION_UNCERTAIN', 'The browser session disappeared while submitting; the submission outcome is uncertain.', error); }
@@ -189,22 +215,24 @@ export class ChatGPTBrowser implements BrowserTransport {
           let observed: SubmissionInspection;
           if (this.diagnosticsEnabled && result && typeof result === 'object') {
             this.collectDiagnostic(result, 'inspection');
-            const value = result as { inspection?: unknown; messageMarkerSeen?: unknown; composerMarkerPresent?: unknown; composerPresent?: unknown; reason?: unknown };
+            const value = result as { inspection?: unknown; messageMarkerSeen?: unknown; composerMarkerPresent?: unknown; composerPresent?: unknown; reason?: unknown; conversationUrl?: unknown };
             observed = {
               inspection: value.inspection === 'submitted' || value.inspection === 'not_submitted' ? value.inspection : 'uncertain',
               ...(typeof value.messageMarkerSeen === 'boolean' ? { messageMarkerSeen: value.messageMarkerSeen } : {}),
               ...(typeof value.composerMarkerPresent === 'boolean' ? { composerMarkerPresent: value.composerMarkerPresent } : {}),
               ...(typeof value.composerPresent === 'boolean' ? { composerPresent: value.composerPresent } : {}),
               ...(typeof value.reason === 'string' ? { reason: safeReason(value.reason) ?? 'insufficient_ui_evidence' } : {}),
+              ...(chatGptConversationIdentity(value.conversationUrl) ? { conversationUrl: chatGptConversationIdentity(value.conversationUrl) } : {}),
             };
           } else if (result && typeof result === 'object') {
-            const value = result as { inspection?: unknown; messageMarkerSeen?: unknown; composerMarkerPresent?: unknown; composerPresent?: unknown; reason?: unknown };
+            const value = result as { inspection?: unknown; messageMarkerSeen?: unknown; composerMarkerPresent?: unknown; composerPresent?: unknown; reason?: unknown; conversationUrl?: unknown };
             observed = {
               inspection: value.inspection === 'submitted' || value.inspection === 'not_submitted' ? value.inspection : 'uncertain',
               ...(typeof value.messageMarkerSeen === 'boolean' ? { messageMarkerSeen: value.messageMarkerSeen } : {}),
               ...(typeof value.composerMarkerPresent === 'boolean' ? { composerMarkerPresent: value.composerMarkerPresent } : {}),
               ...(typeof value.composerPresent === 'boolean' ? { composerPresent: value.composerPresent } : {}),
               ...(typeof value.reason === 'string' ? { reason: safeReason(value.reason) ?? 'insufficient_ui_evidence' } : {}),
+              ...(chatGptConversationIdentity(value.conversationUrl) ? { conversationUrl: chatGptConversationIdentity(value.conversationUrl) } : {}),
             };
           } else observed = { inspection: result === 'submitted' || result === 'not_submitted' ? result : 'uncertain' };
           successfulSamples++;
@@ -222,13 +250,43 @@ export class ChatGPTBrowser implements BrowserTransport {
       return { ...last, inspection: last.inspection === 'not_submitted' && allNotSubmitted ? 'not_submitted' : 'uncertain', sampleCount: successfulSamples };
     } catch (error) { if (isStaleBrowserSessionError(error)) { await this.invalidateSession(); return { inspection: 'uncertain', reason: 'stale_browser_session' }; } throw error; }
   }
-  async requestAppApprovalAssist(): Promise<unknown> {
-    if (!this.sessionId) {
+  async requestAppApprovalAssist(observationSession = false): Promise<unknown> {
+    const sessionId = observationSession ? this.approvalObservationSessionId : this.sessionId;
+    if (!sessionId) {
       const error = new Error('Browser invocation page is unavailable.') as Error & { code: string };
       error.code = 'BROWSER_UNAVAILABLE';
       throw error;
     }
-    return this.rpc('app-approval-assist', this.sessionId);
+    return request(this.profile, 'app-approval-assist', sessionId, undefined, undefined, this.send, false,
+      this.observeApproval, observationSession ? this.approvalObservationJobId : this.jobId);
+  }
+  async openAppApprovalObservation(conversationUrl: string, jobId: string): Promise<void> {
+    const identity = chatGptConversationIdentity(conversationUrl);
+    if (!identity) fail('BROWSER_UNAVAILABLE', 'A verified ChatGPT conversation identity is unavailable for approval observation.');
+    if (this.approvalObservationSessionId) {
+      if (this.approvalObservationJobId === jobId) return;
+      fail('BROWSER_UNAVAILABLE', 'This browser already owns another Job approval observation session.');
+    }
+    const sessionId = await request(this.profile, 'app-approval-observation-open', undefined, undefined, undefined,
+      this.send, false, false, jobId, identity);
+    if (typeof sessionId !== 'string' || !sessionId) fail('BROWSER_UNAVAILABLE', 'Broker did not return an approval observation session.');
+    this.approvalObservationSessionId = sessionId;
+    this.approvalObservationJobId = jobId;
+  }
+  async closeAppApprovalObservation(): Promise<void> {
+    const sessionId = this.approvalObservationSessionId;
+    if (!sessionId) return;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const result = await this.rpc('close', sessionId) as { closed?: unknown; verified?: unknown } | undefined;
+        if (result?.closed !== true || result?.verified !== true) throw new Error('Broker did not confirm approval observation targets were closed.');
+        this.approvalObservationSessionId = undefined;
+        this.approvalObservationJobId = undefined;
+        return;
+      } catch (error) { lastError = error; if (attempt === 0) await wait(100); }
+    }
+    throw lastError;
   }
   diagnosticReport() { return this.diagnostics.map(entry => ({ ...entry })); }
   async close() {

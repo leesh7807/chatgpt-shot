@@ -6,7 +6,7 @@ import { performance } from 'node:perf_hooks';
 import { loadConfig, paths, type Config, type Paths } from './config.js';
 import { databaseIdFromUrl, NotionStore } from './notion.js';
 import { ChatGPTBrowser, openProfileBrowser, shutdownBroker } from './browser.js';
-import { startJob } from './service.js';
+import { startJob, stopAppApprovalObservations } from './service.js';
 import { isErrorCode, ShotError, fail } from './errors.js';
 import { JobTelemetrySession, readRecentJobTelemetry, type JobTelemetryInput } from './job-telemetry.js';
 import { buildAttemptRecoveryReport, type RemoteJobObservation } from './recovery.js';
@@ -229,7 +229,7 @@ export async function runService(): Promise<void> {
     if (!invocation) return undefined;
     return { id: invocation.id, state: invocation.state, error: invocation.error || null, result: invocation.state === 'completed' ? await (await import('./serialize.js')).markdownResult(store, invocation.pageId) : null };
   };
-  const stop = async () => { if (stopping) return; stopping = true; for (const admission of admissions) admission.abort(); if (active || admissions.size) await new Promise<void>(resolve => { const timer = setInterval(() => { if (!active && !admissions.size) { clearInterval(timer); resolve(); } }, 25); }); await shutdownBroker(config.browserProfilePath); await new Promise<void>(resolve => server.close(() => resolve())); removeDiscovery(config, credential); releaseStartup(config, startupToken); };
+  const stop = async () => { if (stopping) return; stopping = true; for (const admission of admissions) admission.abort(); if (active || admissions.size) await new Promise<void>(resolve => { const timer = setInterval(() => { if (!active && !admissions.size) { clearInterval(timer); resolve(); } }, 25); }); await stopAppApprovalObservations('service_stopping'); await shutdownBroker(config.browserProfilePath); await new Promise<void>(resolve => server.close(() => resolve())); removeDiscovery(config, credential); releaseStartup(config, startupToken); };
   server = createServer(async (req, res) => {
     const unauthorized = () => json(res, 401, { code: 'UNAUTHORIZED', message: 'A current service credential is required.' });
     if (req.headers.authorization !== `Bearer ${credential}`) return unauthorized();
@@ -275,7 +275,7 @@ export async function runService(): Promise<void> {
       // the profile, so only count the part of admission that may use it.
       if (browserProfileBusyForOpen(openingBrowser, browserAdmissions)) return json(res, 409, { code: 'SERVICE_BUSY', message: 'The browser profile is busy with an active browser admission or another manual browser session. Retry when it is idle.' });
       openingBrowser = true;
-      try { await shutdownBroker(config.browserProfilePath); return json(res, 200, { ready: true }); }
+      try { await stopAppApprovalObservations('profile_handoff'); await shutdownBroker(config.browserProfilePath); return json(res, 200, { ready: true }); }
       catch (error) { return json(res, 500, responseError(error)); }
       finally { openingBrowser = false; }
     }

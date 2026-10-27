@@ -9,6 +9,7 @@ type Snapshot = { id: string; pageId: string; state: State; error: string };
 
 class Store {
   reads = 0;
+  onRead?: (count: number) => void;
   created: Snapshot[] = [];
   deleted: Array<{ pageId: string; id: string }> = [];
   stateWrites = 0;
@@ -23,6 +24,7 @@ class Store {
   async readInvocation(pageId: string, id: string): Promise<Snapshot> {
     if (this.readDelayMs) await new Promise(resolve => setTimeout(resolve, this.readDelayMs));
     this.reads++;
+    this.onRead?.(this.reads);
     const count = this.readCounts.get(pageId) ?? 0;
     this.readCounts.set(pageId, count + 1);
     return { id, pageId, state: this.states[Math.min(count, this.states.length - 1)] ?? 'pending', error: '' };
@@ -47,7 +49,35 @@ class Browser {
   closeError?: Error;
   approvalChecks = 0;
   approvalError?: Error;
-  async requestAppApprovalAssist(): Promise<any> { this.approvalChecks++; if (this.approvalChecks === 1 && this.approvalError) throw this.approvalError; return { status: 'click_reported' as const, attemptedChoice: 'always_allow' as const }; }
+  conversationUrl?: string;
+  deferredConversationUrl?: string;
+  conversationUrlAtInspection?: number;
+  observerStarts: Array<{ conversationUrl: string; jobId: string }> = [];
+  observerChecks = 0;
+  observerCloses = 0;
+  observerOpenError?: Error;
+  observerOpenGate?: Promise<void>;
+  observerOpenEntered?: () => void;
+  observerError?: Error;
+  observerResponses: any[] = [];
+  async requestAppApprovalAssist(observationSession = false): Promise<any> {
+    if (observationSession) {
+      this.observerChecks++;
+      if (this.observerError) throw this.observerError;
+      return this.observerResponses.shift() ?? { status: 'not_present' as const };
+    }
+    this.approvalChecks++;
+    if (this.approvalChecks === 1 && this.approvalError) throw this.approvalError;
+    return { status: 'click_reported' as const, attemptedChoice: 'always_allow' as const };
+  }
+  async openAppApprovalObservation(conversationUrl: string, jobId: string) {
+    this.observerOpenEntered?.();
+    await this.observerOpenGate;
+    this.order.push('observer_open');
+    if (this.observerOpenError) throw this.observerOpenError;
+    this.observerStarts.push({ conversationUrl, jobId });
+  }
+  async closeAppApprovalObservation() { this.observerCloses++; this.order.push('observer_closed'); }
   async withBrowser<T>(operation: () => Promise<T>): Promise<T> {
     let value!: T; let operationError: unknown;
     try { value = await operation(); } catch (error) { operationError = error; }
@@ -76,7 +106,10 @@ class Browser {
   async inspectSubmission(submissionMarker: string) {
     this.submissionMarkers.push(submissionMarker); this.inspections++;
     if (this.inspectError) throw this.inspectError;
-    return this.inspected;
+    if (this.deferredConversationUrl && this.conversationUrlAtInspection !== undefined && this.inspections >= this.conversationUrlAtInspection) {
+      this.conversationUrl = this.deferredConversationUrl;
+    }
+    return this.conversationUrl ? { inspection: this.inspected, conversationUrl: this.conversationUrl } : this.inspected;
   }
   async close() { this.closes++; this.order.push('closed'); if (this.closeError) throw this.closeError; }
 }
@@ -134,7 +167,7 @@ test('pending approval assist runs only while Notion remains pending and never c
   const result = await startJob(store as any, 'db', browser as any, 'task', 'job-approval', { ...options, telemetry });
   assert.equal(result.job.state, 'in_progress');
   assert.equal(browser.approvalChecks, 2);
-  const recoveries = telemetry.events.filter(item => item.event === 'app_approval_recovery');
+  const recoveries = telemetry.events.filter(item => item.event === 'app_approval_recovery' && item.stage !== 'approval_observation');
   assert.equal(recoveries.length, 2);
   assert.equal(recoveries[0].outcome, 'approval_assist_unavailable');
   assert.deepEqual(recoveries[0].details, { reason: 'broker_unavailable' });
@@ -147,7 +180,7 @@ test('pending approval assist runs only while Notion remains pending and never c
   const noRecoveryTelemetry = new Telemetry();
   const noRecovery = await startJob(new Store(['pending', 'in_progress', 'completed']) as any, 'db', noRecoveryBrowser as any, 'task', 'job-no-recovery', { ...options, telemetry: noRecoveryTelemetry });
   assert.equal(noRecoveryBrowser.approvalChecks, 1);
-  assert.equal(noRecoveryTelemetry.events.some(item => item.event === 'app_approval_recovery'), false);
+  assert.equal(noRecoveryTelemetry.events.some(item => item.event === 'app_approval_recovery' && item.stage !== 'approval_observation'), false);
   await noRecovery.completion;
 
   const artifactBrowser = new Browser();
@@ -179,7 +212,7 @@ test('pending approval assist runs only while Notion remains pending and never c
   const repeatingBrowser = new Browser();
   const repeatingTelemetry = new Telemetry();
   const repeating = await startJob(new Store(['pending', 'pending', 'pending', 'in_progress', 'completed']) as any, 'db', repeatingBrowser as any, 'task', 'job-repeated-approval', { ...options, telemetry: repeatingTelemetry });
-  const repeatedClicks = repeatingTelemetry.events.filter(item => item.event === 'app_approval_recovery');
+  const repeatedClicks = repeatingTelemetry.events.filter(item => item.event === 'app_approval_recovery' && item.stage !== 'approval_observation');
   assert.equal(repeatingBrowser.approvalChecks, 3);
   assert.equal(repeatedClicks.length, 3);
   assert.deepEqual(repeatedClicks.map(item => item.outcome), [
@@ -200,12 +233,170 @@ test('records when a fresh conversation tab no longer shows the approval card', 
   };
   const telemetry = new Telemetry();
   const result = await startJob(new Store(['pending', 'pending', 'in_progress', 'completed']) as any, 'db', browser as any, 'task', 'job-fresh-tab-observation', { ...options, telemetry });
-  const recoveries = telemetry.events.filter(item => item.event === 'app_approval_recovery');
+  const recoveries = telemetry.events.filter(item => item.event === 'app_approval_recovery' && item.stage !== 'approval_observation');
   assert.deepEqual(recoveries.map(item => item.outcome), [
     'approval_button_click_reported',
     'approval_card_not_present_in_fresh_tab',
   ]);
   assert.deepEqual(recoveries[1].details, { tab_index: 2, opened_fresh_tab: true });
+  await result.completion;
+});
+
+test('observes the accepted Job conversation independently until terminal Notion state', async () => {
+  const browser = new Browser();
+  browser.conversationUrl = 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb?model=private';
+  browser.observerResponses = [
+    { status: 'click_reported' as const, attemptedChoice: 'always_allow' as const },
+    { status: 'click_unconfirmed' as const, attemptedChoice: 'allow_once' as const, reason: 'target_obscured' as const },
+  ];
+  const telemetry = new Telemetry();
+  const store = new Store(['in_progress', 'in_progress', 'completed'], 15);
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-observed-after-acceptance', { ...options, pollMs: 2, telemetry });
+  assert.equal(result.job.state, 'in_progress');
+  assert.ok(browser.order.indexOf('closed') < browser.order.indexOf('observer_open'));
+  assert.deepEqual(browser.observerStarts, [{
+    conversationUrl: 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb',
+    jobId: 'job-observed-after-acceptance',
+  }]);
+  await result.completion;
+  assert.ok(browser.observerChecks >= 2);
+  assert.equal(browser.observerCloses, 1);
+  const outcomes = telemetry.events.filter(item => item.stage === 'approval_observation').map(item => item.outcome);
+  assert.ok(outcomes.includes('approval_button_click_reported'));
+  assert.ok(outcomes.includes('approval_button_click_unconfirmed'));
+  assert.ok(outcomes.includes('approval_observation_closed'));
+  assert.equal(telemetry.events.find(item => item.event === 'accepted')?.state, 'in_progress');
+  assert.equal(telemetry.events.find(item => item.event === 'terminal_observed')?.state, 'completed');
+});
+
+test('captures a conversation route that appears after the initial submission inspection', async () => {
+  const browser = new Browser();
+  browser.deferredConversationUrl = 'https://chatgpt.com/c/late_route_123';
+  browser.conversationUrlAtInspection = 2;
+  const telemetry = new Telemetry();
+  const store = new Store(['pending', 'pending', 'in_progress', 'completed'], 10);
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-late-conversation-route', { ...options, telemetry });
+
+  assert.equal(result.job.state, 'in_progress');
+  assert.ok(browser.inspections >= 2);
+  assert.deepEqual(browser.observerStarts, [{
+    conversationUrl: 'https://chatgpt.com/c/late_route_123',
+    jobId: 'job-late-conversation-route',
+  }]);
+  assert.ok(telemetry.events.some(event => event.event === 'browser_stage' && event.stage === 'conversation_identity' && event.outcome === 'captured'));
+  await result.completion;
+});
+
+test('stops a Job observer after Notion reports failed', async () => {
+  const browser = new Browser();
+  browser.conversationUrl = 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb';
+  const result = await startJob(new Store(['in_progress', 'failed'], 6) as any, 'db', browser as any, 'task', 'job-terminal-failed', { ...options, pollMs: 2 });
+  assert.equal(result.job.state, 'in_progress');
+  await result.completion;
+  assert.equal(browser.observerCloses, 1);
+});
+
+test('concurrent Jobs keep approval observations on their own conversation sessions', async () => {
+  const store = new Store(['in_progress', 'completed'], 8);
+  const leftBrowser = new Browser(); const rightBrowser = new Browser();
+  leftBrowser.conversationUrl = 'https://chatgpt.com/c/left-conversation';
+  rightBrowser.conversationUrl = 'https://chatgpt.com/c/right-conversation';
+  const [left, right] = await Promise.all([
+    startJob(store as any, 'db', leftBrowser as any, 'left task', 'job-observer-left', { ...options, pollMs: 2 }),
+    startJob(store as any, 'db', rightBrowser as any, 'right task', 'job-observer-right', { ...options, pollMs: 2 }),
+  ]);
+  await Promise.all([left.completion, right.completion]);
+  assert.deepEqual(leftBrowser.observerStarts, [{ conversationUrl: 'https://chatgpt.com/c/left-conversation', jobId: 'job-observer-left' }]);
+  assert.deepEqual(rightBrowser.observerStarts, [{ conversationUrl: 'https://chatgpt.com/c/right-conversation', jobId: 'job-observer-right' }]);
+  assert.equal(leftBrowser.observerCloses, 1);
+  assert.equal(rightBrowser.observerCloses, 1);
+});
+
+test('observer startup failure and a missing conversation identity never change acceptance', async () => {
+  const unavailable = new Browser();
+  const unavailableTelemetry = new Telemetry();
+  const noIdentity = await startJob(new Store(['in_progress', 'completed'], 5) as any, 'db', unavailable as any, 'task', 'job-no-conversation', { ...options, telemetry: unavailableTelemetry });
+  assert.equal(noIdentity.job.state, 'in_progress');
+  assert.equal(unavailable.observerStarts.length, 0);
+  assert.ok(unavailableTelemetry.events.some(item => item.outcome === 'approval_observation_unavailable' && item.details?.reason === 'conversation_identity_missing'));
+  await noIdentity.completion;
+
+  const failedStart = new Browser();
+  failedStart.conversationUrl = 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb';
+  failedStart.observerOpenError = new Error('browser session unavailable');
+  const failedStartJob = await startJob(new Store(['in_progress', 'completed'], 5) as any, 'db', failedStart as any, 'task', 'job-observer-open-failed', options);
+  assert.equal(failedStartJob.job.state, 'in_progress');
+  await failedStartJob.completion;
+
+  const disabled = new Browser();
+  disabled.conversationUrl = failedStart.conversationUrl;
+  (disabled as any).requestAppApprovalAssist = undefined;
+  (disabled as any).openAppApprovalObservation = undefined;
+  (disabled as any).closeAppApprovalObservation = undefined;
+  const disabledJob = await startJob(new Store(['in_progress', 'completed'], 5) as any, 'db', disabled as any, 'task', 'job-approval-disabled', options);
+  assert.equal(disabledJob.job.state, 'in_progress');
+  await disabledJob.completion;
+});
+
+test('a slow approval observer cannot delay UUID return or terminal Notion observation', async () => {
+  let releaseOpen!: () => void;
+  const browser = new Browser();
+  browser.conversationUrl = 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb';
+  browser.observerOpenGate = new Promise<void>(resolve => { releaseOpen = resolve; });
+  const store = new Store(['in_progress', 'completed'], 2);
+  let resolveTerminalRead!: () => void;
+  const terminalRead = new Promise<void>(resolve => { resolveTerminalRead = resolve; });
+  store.onRead = count => { if (count === 2) resolveTerminalRead(); };
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-slow-observer', options);
+  assert.equal(result.job.state, 'in_progress');
+  await terminalRead;
+  assert.equal(browser.observerCloses, 0);
+  releaseOpen();
+  await result.completion;
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(browser.observerStarts.length, 1);
+  assert.equal(browser.observerCloses, 1);
+});
+
+test('profile handoff stops approval observers without waiting for remote Job completion', async () => {
+  const browser = new Browser();
+  browser.conversationUrl = 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb';
+  browser.observerResponses = [{ status: 'not_present' as const }];
+  const store = new Store(['in_progress']);
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-profile-handoff', options);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const { stopAppApprovalObservations } = await import('../src/service.js');
+  await stopAppApprovalObservations('profile_handoff');
+  assert.equal(browser.observerCloses, 1);
+  store.states.push('completed');
+  await result.completion;
+  assert.equal(result.job.state, 'in_progress');
+});
+
+test('profile handoff drains a pending observer open and closes it before returning', async () => {
+  let releaseOpen!: () => void;
+  let signalOpenEntered!: () => void;
+  const openEntered = new Promise<void>(resolve => { signalOpenEntered = resolve; });
+  const browser = new Browser();
+  browser.conversationUrl = 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb';
+  browser.observerOpenGate = new Promise<void>(resolve => { releaseOpen = resolve; });
+  browser.observerOpenEntered = signalOpenEntered;
+  const store = new Store(['in_progress']);
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-pending-observer-open', options);
+  await openEntered;
+
+  let handoffCompleted = false;
+  const { stopAppApprovalObservations } = await import('../src/service.js');
+  const handoff = stopAppApprovalObservations('profile_handoff').then(() => { handoffCompleted = true; });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(handoffCompleted, false);
+
+  releaseOpen();
+  await handoff;
+  assert.equal(browser.observerStarts.length, 1);
+  assert.equal(browser.observerCloses, 1);
+  assert.ok(browser.order.indexOf('observer_closed') > browser.order.indexOf('observer_open'));
+  store.states.push('completed');
   await result.completion;
 });
 
