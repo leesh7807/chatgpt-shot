@@ -1,23 +1,26 @@
 # App approval assist evidence
 
-## Reviewed source
+## Source and evidence type
 
-- Implementation commit: `3dbf7df606f92097f79a682050ba7eb665debc28`
-- Evidence type: automated DOM-probe, Browser/Service boundary tests, and source inspection.
+- Approval-assist implementation commit: `3dbf7df606f92097f79a682050ba7eb665debc28`.
+- Tested branch source base: `744fc6c` (`Restore active approval assist plan during review`); implementation files are unchanged from the implementation commit.
+- Evidence: automated DOM-probe and Browser/Service boundary tests, source inspection, and passive runtime diagnosis. The tests do not reproduce a real ChatGPT approval card.
 
 ## Observed and test-verified
 
-- `npm run build` passed for the implementation commit.
-- `npm test` passed: 149 tests, 0 failures. The DOM-probe cases exercise a supported request found at the third ancestor, a match only above the allowed range, sibling-card leakage, ambiguous cards and choices, hidden ancestors, and the trusted-input adapter. Service and Browser tests cover `pending` and `in_progress`, repeated attempts, terminal cleanup, missing conversation identity, optional observer absence/failure, profile handoff, delayed observer startup, and concurrent Jobs.
-- `git diff --check` passed before the implementation commit.
-- The implementation captures only a validated ChatGPT `/c/<id>` route and uses it to open a separate observer page. Code and tests establish this intended route binding and lifecycle behavior; they do not establish that a real ChatGPT approval card rendered or that a real permission was granted.
+- `npm run build` passed at the tested branch source base.
+- `TMPDIR=/tmp XDG_CONFIG_HOME=/tmp/chatgpt-shot-test-config XDG_DATA_HOME=/tmp/chatgpt-shot-test-data XDG_CACHE_HOME=/tmp/chatgpt-shot-test-cache npm test` passed: 149 tests, 0 failures.
+- The first test run inherited `TMPDIR=/home/lees/.cache/leesh-loop-build-tmp-20261027`; the existing deep-cache-path test then constructed a temporary path over its 104-byte socket limit. Setting `TMPDIR=/tmp` made its intended short-path condition explicit, and the full suite passed. No product code or test was changed for this environment issue.
+- The DOM-probe cases exercise a supported request found at the third ancestor, a match only above the allowed range, sibling-card leakage, ambiguous cards and choices, hidden ancestors, and the trusted-input adapter. Service and Browser tests cover `pending` and `in_progress`, repeated attempts, terminal cleanup, missing conversation identity, optional observer absence/failure, profile handoff, delayed observer startup, and concurrent Jobs.
+- A passive `node dist/cli.js doctor` using the default user configuration confirmed the existing Service was accepting requests (PID `432936`) and its authenticated Service Job read and Notion read succeeded (`visible_jobs: 100`). The diagnosis did not check the private browser, inspect the running Service artifact, submit a Job, or inspect private Notion content.
+- `git diff --check` passed before delivery preparation.
 
 ## Direct UI evidence and limits
 
-- No Notion or Chrome approval card was reproduced in a browser session for this delivery. No approval-button click, resulting app permission, or real in-progress Job transition was directly observed. No screenshot or private conversation content is included.
-- A passive `node dist/cli.js doctor` attempt in the worker workspace stopped while trying to change permissions on `/home/lees/.config/chatgpt-shot` (`EROFS`). The workspace does not have authority to administer the Service. A readable worker-interface discovery file exists, but its contents and running Service artifact were not inspected or tied to this implementation commit; using it would not prove the changed code's live browser path.
-- Therefore VR6's actual-card and actual-permission outcome remains unverified. The automated tests are synthetic/test evidence and are reported as such, not as direct browser evidence or proof of an app permission grant.
+- No Notion or Chrome approval card was reproduced in a browser session for this delivery. No approval-button click, resulting app permission, or real `in_progress` Job approval was directly observed. No screenshot or private conversation content is included.
+- The passive diagnosis establishes that a Service and Notion read are reachable; it does not establish that the running Service contains this branch's implementation or that the changed browser observation path executed.
+- Therefore VR6's actual-card and actual-permission outcome remains unverified. Automated DOM, Service, and Browser tests are synthetic/test evidence, not direct browser evidence or proof that an app permission was granted.
 
 ## Delivery identity
 
-This record identifies the implementation source commit above. The final PR and delivery HEAD are recorded in the task Workpad after independent review preparation and delivery are complete.
+The implementation source commit is identified above. The final PR and exact delivery HEAD are recorded in the task Workpad after independent review and delivery preparation.
