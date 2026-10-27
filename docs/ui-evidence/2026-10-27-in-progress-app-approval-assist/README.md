@@ -21,7 +21,7 @@
 - User-driven manual sign-in succeeded in the separate smoke Chrome profile. Smoke submitted Job `90d7eaf5-d0b8-4b4a-b523-5a6a38a1dc79` and its `jobs` readback passed.
 - Sanitized telemetry in [`runtime-smoke-2026-10-27.jsonl`](runtime-smoke-2026-10-27.jsonl) records `conversation_identity=captured` while pending, Notion `in_progress` acceptance, confirmed submission-tab closure, `approval_observation_started`, `approval_card_not_present`, Notion `completed`, and observer stop/close.
 - The initial branch-matched smoke run before the fix showed `conversation_identity_missing`; the added pending-phase background read captured the route without delaying Notion acceptance. The later successful run was executed at the fix commit above.
-- The smoke isolates local XDG/Service/browser state only. It uses the repository `.env`'s real Notion configuration and the manually authenticated ChatGPT account. See [smoke isolation boundary](../../verification/smoke-isolation.md).
+- The smoke isolates local XDG/Service/browser state only. It uses the repository `.env`'s real Notion configuration and the manually authenticated ChatGPT account. See the repository [verification guide](../../../VERIFICATION.md).
 
 ## Direct UI evidence and limits
 
