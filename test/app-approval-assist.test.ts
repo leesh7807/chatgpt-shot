@@ -1,15 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { recoverPendingAppApproval, checkAndAllowAppApproval, appApprovalPageProbe, serializedAppApprovalPageProbe } from '../src/app-approval-assist.js';
+import { requestAppApproval, checkAndAllowAppApproval, appApprovalPageProbe, serializedAppApprovalPageProbe, chatGptConversationIdentity } from '../src/app-approval-assist.js';
 import { dispatchTrustedClick } from '../src/broker.js';
 
-function element(tagName: string, text = '', children: any[] = [], options: { role?: string; disabled?: boolean; rect?: { left: number; top: number; width: number; height: number }; onClick?: () => void } = {}): any {
+function element(tagName: string, text = '', children: any[] = [], options: { role?: string; disabled?: boolean; hidden?: boolean; rect?: { left: number; top: number; width: number; height: number }; onClick?: () => void } = {}): any {
   const node: any = {
     tagName,
     parentElement: undefined,
     children,
     disabled: options.disabled ?? false,
     getAttribute(name: string) { return name === 'role' ? options.role ?? null : null; },
+    hidden: options.hidden ?? false,
     closest(selector: string) {
       let current: any = this;
       while (current) { if (selector === 'form' && current.tagName === 'FORM') return current; current = current.parentElement; }
@@ -20,10 +21,13 @@ function element(tagName: string, text = '', children: any[] = [], options: { ro
       const descendants = (parent: any): any[] => parent.children.flatMap((child: any) => [child, ...descendants(child)]);
       return descendants(this).filter(child => selector === 'form'
         ? child.tagName === 'FORM'
+        : selector === '*'
+          ? true
         : selector.includes('button') && (child.tagName === 'BUTTON' || child.getAttribute('role') === 'button'));
     },
     click() { options.onClick?.(); },
   };
+  node.ownText = text;
   Object.defineProperty(node, 'textContent', { get: () => `${text} ${children.map(child => child.textContent).join(' ')}`.trim() });
   Object.defineProperty(node, 'innerText', { get: () => `${text} ${children.map(child => child.innerText).join(' ')}`.trim() });
   for (const child of children) child.parentElement = node;
@@ -51,7 +55,7 @@ function withDom<T>(root: any, run: () => T): T {
   const originalGetComputedStyle = global.getComputedStyle;
   global.document = { body: root, querySelectorAll: (selector: string) => root.querySelectorAll(selector) };
   global.window = { innerWidth: 1280, innerHeight: 800 };
-  global.getComputedStyle = () => ({ visibility: 'visible', display: 'block' });
+  global.getComputedStyle = (element: any) => ({ visibility: element.hidden ? 'hidden' : 'visible', display: element.hidden ? 'none' : 'block', opacity: '1' });
   try { return run(); }
   finally {
     if (originalDocument === undefined) delete global.document;
@@ -98,6 +102,67 @@ test('probe prefers Always allow and falls back to an enabled Allow once button'
   });
 });
 
+test('probe accepts the third ancestor when it contains one supported approval action group', () => {
+  const actions = element('FORM', '', [element('BUTTON', 'Always allow'), element('BUTTON', 'Deny Esc')]);
+  const card = element('DIV', 'Allow ChatGPT to use Notion? ChatGPT will call its Update page tool.', [element('DIV', '', [actions])]);
+  assert.deepEqual(withDom(card, () => appApprovalPageProbe()), {
+    status: 'ready', choice: 'always_allow', target: { x: 50, y: 10 },
+  });
+});
+
+test('probe rejects app context found only above the third ancestor', () => {
+  const actions = element('FORM', '', [element('BUTTON', 'Always allow'), element('BUTTON', 'Deny Esc')]);
+  const tooDeep = element('DIV', 'Notion', [element('DIV', '', [element('DIV', '', [element('DIV', '', [actions])])])]);
+  assert.deepEqual(withDom(tooDeep, () => appApprovalPageProbe()), { status: 'not_present' });
+});
+
+test('conversation identity is limited to a concrete ChatGPT conversation route', () => {
+  assert.equal(chatGptConversationIdentity('https://chatgpt.com/c/abc_123?model=private'), 'https://chatgpt.com/c/abc_123');
+  assert.equal(chatGptConversationIdentity('https://chatgpt.com/'), undefined);
+  assert.equal(chatGptConversationIdentity('https://chatgpt.example/c/abc_123'), undefined);
+  assert.equal(chatGptConversationIdentity('https://chatgpt.com/c/abc_123/settings'), undefined);
+});
+
+test('probe rejects a button hidden by a distant ancestor', () => {
+  const match = notionCard();
+  const hidden = element('DIV', '', [element('DIV', '', [element('DIV', '', [match.card])])], { hidden: true });
+  assert.deepEqual(withDom(hidden, () => appApprovalPageProbe()), { status: 'not_present' });
+});
+
+test('probe rejects app text from a sibling approval card and ambiguous approval cards', () => {
+  const notion = notionCard({ actionLabels: ['Always allow', 'Deny Esc'] }).card;
+  const otherApp = element('DIV', 'Allow ChatGPT to use Calendar?', [element('FORM', '', [
+    element('BUTTON', 'Allow once'), element('BUTTON', 'Deny Esc'),
+  ])]);
+  const root = element('DIV', '', [notion, otherApp]);
+  assert.deepEqual(withDom(root, () => appApprovalPageProbe()), {
+    status: 'ready', choice: 'always_allow', target: { x: 100, y: 80 },
+  });
+
+  const requestFromSibling = element('DIV', '', [
+    element('DIV', 'Allow ChatGPT to use Notion?'),
+    element('DIV', 'Allow ChatGPT to use Calendar?', [element('FORM', '', [
+      element('BUTTON', 'Allow once'), element('BUTTON', 'Deny Esc'),
+    ])]),
+  ]);
+  assert.deepEqual(withDom(requestFromSibling, () => appApprovalPageProbe()), { status: 'not_present' });
+
+  const chrome = element('DIV', 'Allow ChatGPT to use Chrome?', [element('FORM', '', [
+    element('BUTTON', 'Allow once'), element('BUTTON', 'Deny Esc'),
+  ])]);
+  assert.deepEqual(withDom(element('DIV', '', [notion, chrome]), () => appApprovalPageProbe()), { status: 'not_present' });
+
+  const unrelated = element('DIV', 'Notion is available in this conversation.', [element('FORM', '', [
+    element('BUTTON', 'Allow'), element('BUTTON', 'Deny'),
+  ])]);
+  assert.deepEqual(withDom(unrelated, () => appApprovalPageProbe()), { status: 'not_present' });
+
+  const plainAllow = element('DIV', 'Allow ChatGPT to use Notion?', [element('FORM', '', [
+    element('BUTTON', 'Allow'), element('BUTTON', 'Deny'),
+  ])]);
+  assert.deepEqual(withDom(plainAllow, () => appApprovalPageProbe()), { status: 'ready', choice: 'allow', target: { x: 50, y: 10 } });
+});
+
 test('serialized probe is self-contained and accepts Allow once when Always allow is absent', () => {
   const match = notionCard({ actionLabels: ['Allow once ⏎', 'Deny Esc'] });
   const root = element('DIV', '', [match.card]);
@@ -109,11 +174,10 @@ test('serialized probe is self-contained and accepts Allow once when Always allo
   assert.deepEqual(result, { status: 'ready', choice: 'allow_once', target: { x: 350, y: 80 } });
 });
 
-test('probe selects the first matching Always allow button', () => {
+test('probe refuses to guess when a card has multiple equally prioritized buttons', () => {
   const ambiguous = notionCard({ secondAlwaysAllow: true });
   const result = withDom(element('DIV', '', [ambiguous.card]), () => appApprovalPageProbe());
-  assert.equal(result.status, 'ready');
-  assert.deepEqual(result.target, { x: 100, y: 80 });
+  assert.deepEqual(result, { status: 'not_present' });
 });
 
 test('assist reports the trusted click and leaves retry timing to the pending service loop', async () => {
@@ -245,7 +309,7 @@ test('a missing card in a fresh tab returns to the original tab for later approv
 });
 
 test('service-facing assist adapter keeps browser failures best-effort', async () => {
-  assert.deepEqual(await recoverPendingAppApproval({ async requestAppApprovalAssist() { throw new Error('broker unavailable'); } }), { status: 'unavailable', reason: 'broker_unavailable' });
+  assert.deepEqual(await requestAppApproval({ async requestAppApprovalAssist() { throw new Error('broker unavailable'); } }), { status: 'unavailable', reason: 'broker_unavailable' });
 });
 
 test('trusted approval click dispatches mouse movement, press, and release in order', async () => {

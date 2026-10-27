@@ -3,7 +3,7 @@ import { fail, ShotError } from './errors.js';
 import type { BrowserTransport, Inspection, SubmissionInspection, SubmitAttempt } from './browser.js';
 import type { Invocation, NotionStore } from './notion.js';
 import { JobTelemetrySession, LocalJobTelemetryWriter, type JobTelemetryInput, type JobTelemetryWriter } from './job-telemetry.js';
-import { recoverPendingAppApproval } from './app-approval-assist.js';
+import { chatGptConversationIdentity, requestAppApproval, type AppApprovalCheck } from './app-approval-assist.js';
 
 export type SubmitOptions = { acknowledgementMs?: number; pollMs?: number; telemetry?: JobTelemetryWriter; telemetrySession?: JobTelemetrySession; signal?: AbortSignal; diagnostics?: boolean };
 export type JobExecution = { job: Invocation; completion: Promise<void> };
@@ -46,6 +46,148 @@ const telemetryError = (error: unknown) => {
 };
 const inspectionResult = (value: Inspection | SubmissionInspection): SubmissionInspection => typeof value === 'string' ? { inspection: value } : value;
 
+type ApprovalObservationBrowser = Pick<BrowserTransport, 'openAppApprovalObservation' | 'closeAppApprovalObservation'>;
+type ApprovalObservationEntry = {
+  jobId: string;
+  browser: BrowserTransport & ApprovalObservationBrowser;
+  intervalMs: number;
+  record: (fields: Omit<JobTelemetryInput, 'event'>) => void;
+  controller: AbortController;
+  opening: Promise<void>;
+  loop?: Promise<void>;
+  opened: boolean;
+  stopped: boolean;
+  close?: Promise<void>;
+};
+
+/** Owns optional, per-Job approval sessions without owning remote Job state. */
+class AppApprovalObservationManager {
+  private readonly jobs = new Map<string, ApprovalObservationEntry>();
+
+  start(jobId: string, browser: BrowserTransport, conversationUrl: string | undefined, intervalMs: number,
+    record: (fields: Omit<JobTelemetryInput, 'event'>) => void): void {
+    const identity = chatGptConversationIdentity(conversationUrl);
+    if (!identity) {
+      record({ stage: 'approval_observation', outcome: 'approval_observation_unavailable', details: { reason: 'conversation_identity_missing' } });
+      return;
+    }
+    const optional = browser as BrowserTransport & Partial<ApprovalObservationBrowser>;
+    if (!optional.openAppApprovalObservation || !optional.closeAppApprovalObservation || !optional.requestAppApprovalAssist || this.jobs.has(jobId)) {
+      record({ stage: 'approval_observation', outcome: this.jobs.has(jobId) ? 'approval_observation_duplicate' : 'approval_observation_unavailable', details: { reason: 'browser_capability_unavailable' } });
+      return;
+    }
+    const entry: ApprovalObservationEntry = {
+      jobId, browser: optional as BrowserTransport & ApprovalObservationBrowser, intervalMs, record,
+      controller: new AbortController(), opening: Promise.resolve(), opened: false, stopped: false,
+    };
+    this.jobs.set(jobId, entry);
+    entry.opening = Promise.resolve().then(() => entry.browser.openAppApprovalObservation!(identity, jobId)).then(() => { entry.opened = true; });
+    entry.loop = this.run(entry);
+  }
+
+  private async run(entry: ApprovalObservationEntry): Promise<void> {
+    let absenceReported = false;
+    try {
+      await entry.opening;
+      if (entry.stopped) return;
+      entry.record({ stage: 'approval_observation', outcome: 'approval_observation_started' });
+      while (!entry.stopped) {
+        const started = performance.now();
+        const check = await requestAppApproval(entry.browser, true);
+        if (entry.stopped) break;
+        if (!check) {
+          entry.record({ stage: 'approval_observation', outcome: 'approval_observation_unavailable', error: { code: 'BROWSER_UNAVAILABLE' } });
+          break;
+        }
+        if (check.status === 'not_present') {
+          if (!absenceReported) {
+            this.recordCheck(entry, check, performance.now() - started);
+            absenceReported = true;
+          }
+        } else {
+          this.recordCheck(entry, check, performance.now() - started);
+          if (check.status === 'unavailable') break;
+          absenceReported = false;
+        }
+        await this.pause(entry);
+      }
+    } catch (error) {
+      if (!entry.stopped) entry.record({ stage: 'approval_observation', outcome: 'approval_observation_unavailable', error: telemetryError(error) });
+    } finally {
+      await this.closeSession(entry);
+      if (this.jobs.get(entry.jobId) === entry) this.jobs.delete(entry.jobId);
+    }
+  }
+
+  private recordCheck(entry: ApprovalObservationEntry, check: AppApprovalCheck, durationMs: number): void {
+    const attemptedChoice = 'attemptedChoice' in check ? check.attemptedChoice : undefined;
+    const clickAttempted = check.status === 'click_reported' || check.status === 'click_unconfirmed' || attemptedChoice !== undefined;
+    entry.record({
+      stage: 'approval_observation',
+      outcome: check.status === 'click_reported' ? 'approval_button_click_reported'
+        : check.status === 'click_unconfirmed' ? 'approval_button_click_unconfirmed'
+          : check.status === 'not_present' ? 'approval_card_not_present'
+            : 'approval_assist_unavailable',
+      duration_ms: durationMs,
+      details: {
+        ...(clickAttempted ? { button_found: true, click_attempted: true } : {}),
+        ...(attemptedChoice ? { attempted_choice: attemptedChoice } : {}),
+        ...('reason' in check ? { reason: check.reason } : {}),
+        ...(check.tabIndex !== undefined ? { tab_index: check.tabIndex } : {}),
+        ...(check.openedFreshTab !== undefined ? { opened_fresh_tab: check.openedFreshTab } : {}),
+        ...(check.beforeArtifact ? { before_artifact: check.beforeArtifact } : {}),
+        ...(check.afterArtifact ? { after_artifact: check.afterArtifact } : {}),
+        ...(check.postClickProbe ? { post_click_probe: check.postClickProbe } : {}),
+      },
+    });
+  }
+
+  private pause(entry: ApprovalObservationEntry): Promise<void> {
+    return new Promise(resolve => {
+      const finish = () => {
+        clearTimeout(timer);
+        entry.controller.signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, entry.intervalMs);
+      entry.controller.signal.addEventListener('abort', finish, { once: true });
+    });
+  }
+
+  private async closeSession(entry: ApprovalObservationEntry): Promise<void> {
+    if (!entry.opened) return;
+    if (entry.close) return entry.close;
+    entry.opened = false;
+    entry.close = (async () => {
+      try {
+        await entry.browser.closeAppApprovalObservation!();
+        entry.record({ stage: 'approval_observation', outcome: 'approval_observation_closed' });
+      } catch (error) {
+        entry.record({ stage: 'approval_observation', outcome: 'approval_observation_cleanup_failed', error: telemetryError(error) });
+      }
+    })();
+    return entry.close;
+  }
+
+  async stop(jobId: string, reason: string): Promise<void> {
+    const entry = this.jobs.get(jobId);
+    if (!entry) return;
+    entry.stopped = true;
+    entry.controller.abort();
+    entry.record({ stage: 'approval_observation', outcome: `approval_observation_${reason}` });
+    await this.closeSession(entry);
+  }
+
+  async stopAll(reason: string): Promise<void> {
+    await Promise.all([...this.jobs.keys()].map(jobId => this.stop(jobId, reason)));
+  }
+}
+
+const appApprovalObservationManager = new AppApprovalObservationManager();
+export async function stopAppApprovalObservations(reason = 'profile_handoff'): Promise<void> {
+  await appApprovalObservationManager.stopAll(reason);
+}
+
 export const wrapPrompt = (prompt: string, pageId: string) => `<task>\n${prompt}\n</task>\n\n<chatgpt-shot>\nThis block is supplied by chatgpt-shot and defines how to return the result.\n\nInvocation record:\nhttps://www.notion.so/${pageId.replace(/-/g, '')}\n\nThe user authorizes the Notion updates required for this Invocation only: set its State to \`in_progress\`, write this task's result to its page, and set the final State as specified below. Do not modify other pages or settings.\n\n1. Before starting the task, set State to \`in_progress\`.\n2. Complete the task in <task>.\n3. Write the complete result to the invocation page body.\n4. As the final action:\n   - success → set State to \`completed\`\n   - failure → write the reason to Error and set State to \`failed\`\n</chatgpt-shot>`;
 
 /**
@@ -54,7 +196,8 @@ export const wrapPrompt = (prompt: string, pageId: string) => `<task>\n${prompt}
  * Job has had its submission tab closed; terminal observation is Notion-only.
  *
  * Control flow: browser admission and submission → Notion acceptance polling
- * (approval recovery while pending) → accepted-job terminal observation.
+ * (approval recovery while pending) → accepted-job terminal observation, with
+ * an independent optional approval observer during accepted in_progress work.
  */
 export async function startJob(store: NotionStore, databaseId: string, browser: BrowserTransport, prompt: string, id: string, options: SubmitOptions = {}): Promise<JobExecution> {
   const acknowledgementMs = options.acknowledgementMs ?? DEFAULT_ACKNOWLEDGEMENT_MS;
@@ -67,6 +210,8 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
   else options.signal?.addEventListener('abort', relayCancellation, { once: true });
   let invocation: Invocation | undefined;
   let observedAcceptance: Invocation | undefined;
+  let submittedConversationUrl: string | undefined;
+  let acceptedConversationUrl: string | undefined;
   let acceptedRemotely = false;
   let lateAcceptanceObserved = false;
   let readUnresolved = false;
@@ -91,6 +236,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
     try {
       if (!invocation) return 'uncertain';
       const result = inspectionResult(await raceAdmission(browser.inspectSubmission(invocation.pageId.replace(/-/g, ''), { settleMs: 0 }), deadline, options.signal));
+      submittedConversationUrl = chatGptConversationIdentity(result.conversationUrl) ?? submittedConversationUrl;
       delivery = result.inspection;
       event('submission_inspected', {
         stage: inspectionStage,
@@ -202,6 +348,9 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
         event('submit_action_returned', { stage, outcome: submitResult.outcome, details: { reason: submitResult.reason } });
         return await failUndelivered(submitResult.reason);
       }
+      if (submitResult?.outcome === 'clicked') {
+        submittedConversationUrl = chatGptConversationIdentity(submitResult.conversationUrl) ?? submittedConversationUrl;
+      }
       if (submitResult) event('submit_action_returned', { stage, outcome: submitResult.outcome, details: { method: submitResult.method ?? 'click' } });
 
       // Acceptance polling starts: Notion state is authoritative; approval recovery
@@ -273,6 +422,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
         // Observation time is when this process received the Notion response.
         if (accepted(current.state) && observedInTime) {
           observedAcceptance = current;
+          acceptedConversationUrl = submittedConversationUrl;
           acceptedRemotely = true;
           store.setRequestTelemetryEnabled?.(false);
           event('accepted', { state: current.state, stage, details: { admission_elapsed_ms: performance.now() - acknowledgementStarted } });
@@ -282,7 +432,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
         if (current.state !== 'pending') fail('INVALID_INVOCATION_STATE', `Invocation ${id} has invalid State ${current.state}.`);
         const recoveryStartedAt = performance.now();
         // Retry while pending; fresh-tab absence is logged, and clicks never end this loop.
-        const recovery = await recoverPendingAppApproval(browser);
+        const recovery = await requestAppApproval(browser);
         if (recovery && (recovery.status !== 'not_present' || recovery.openedFreshTab === true)) {
           const attemptedChoice = 'attemptedChoice' in recovery ? recovery.attemptedChoice : undefined;
           const buttonFound = recovery.status === 'click_reported'
@@ -342,6 +492,10 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
     if (!firstAcceptedState) fail('INTERNAL_ERROR', 'Job admission finished without an accepted Invocation.');
     const acceptedState = firstAcceptedState as Invocation;
     event('browser_context_closed', { stage: 'acceptance_handoff', outcome: 'confirmed', details: { target_open: false } });
+    if (acceptedState.state === 'in_progress') {
+      appApprovalObservationManager.start(id, browser, acceptedConversationUrl, pollMs,
+        fields => event('app_approval_recovery', fields));
+    }
     resolveAcceptance(acceptedState);
     if (acceptedState.state === 'completed' || acceptedState.state === 'failed') {
       event('terminal_observed', { state: acceptedState.state, stage: 'acceptance_observation' });
@@ -386,7 +540,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
       event('observer_failed', { stage, error: telemetryError(error) });
     }
     throw error;
-  });
+  }).finally(async () => { await appApprovalObservationManager.stop(id, 'job_observation_ended'); });
 
   void completion.catch(() => {});
   // Return boundary: wait for confirmed remote acceptance; completion remains asynchronous.

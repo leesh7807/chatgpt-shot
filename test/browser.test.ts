@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { ChatGPTBrowser } from '../src/browser.js';
 import { STALE_BROWSER_SESSION_MESSAGE, ShotError, isStaleBrowserSessionError } from '../src/errors.js';
 
-type Operation = { operation: string; sessionId?: string; prompt?: string; submissionMarker?: string; diagnostics?: boolean };
+type Operation = { operation: string; sessionId?: string; prompt?: string; submissionMarker?: string; diagnostics?: boolean; observeApproval?: boolean; jobId?: string; conversationUrl?: string };
 
 const stale = () => Object.assign(new Error(STALE_BROWSER_SESSION_MESSAGE), { code: 'INTERNAL_ERROR' });
 
@@ -133,6 +133,48 @@ test('approval observation opt-in reaches only the approval-assist broker reques
     { operation: 'open', observeApproval: undefined, jobId: undefined },
     { operation: 'app-approval-assist', observeApproval: true, jobId: '456fae40-f8fb-4657-94ce-b791835e93d2' },
   ]);
+});
+
+test('post-acceptance observation uses a separate verified conversation session', async () => {
+  const operations: Operation[] = [];
+  const browser = new ChatGPTBrowser('profile', async (_root, request) => {
+    operations.push(request);
+    if (request.operation === 'open') return 'submission-session';
+    if (request.operation === 'app-approval-observation-open') return 'approval-session';
+    if (request.operation === 'close') return { closed: true, verified: true };
+    if (request.operation === 'app-approval-assist') return { status: 'not_present' };
+    return undefined;
+  }, false, true, '456fae40-f8fb-4657-94ce-b791835e93d2');
+
+  await browser.openFreshContext();
+  await browser.openAppApprovalObservation('https://chatgpt.com/c/abc_123?model=private', '456fae40-f8fb-4657-94ce-b791835e93d2');
+  await browser.close();
+  await browser.requestAppApprovalAssist(true);
+  await browser.closeAppApprovalObservation();
+
+  assert.deepEqual(operations.map(({ operation, sessionId, jobId, conversationUrl, observeApproval }) => ({ operation, sessionId, jobId, conversationUrl, observeApproval })), [
+    { operation: 'open', sessionId: undefined, jobId: undefined, conversationUrl: undefined, observeApproval: undefined },
+    { operation: 'app-approval-observation-open', sessionId: undefined, jobId: '456fae40-f8fb-4657-94ce-b791835e93d2', conversationUrl: 'https://chatgpt.com/c/abc_123', observeApproval: undefined },
+    { operation: 'close', sessionId: 'submission-session', jobId: undefined, conversationUrl: undefined, observeApproval: undefined },
+    { operation: 'app-approval-assist', sessionId: 'approval-session', jobId: '456fae40-f8fb-4657-94ce-b791835e93d2', conversationUrl: undefined, observeApproval: true },
+    { operation: 'close', sessionId: 'approval-session', jobId: undefined, conversationUrl: undefined, observeApproval: undefined },
+  ]);
+});
+
+test('captures only the ChatGPT conversation route during submission reads', async () => {
+  const browser = new ChatGPTBrowser('profile', async (_root, request) => {
+    if (request.operation === 'open') return 'session-1';
+    if (request.operation === 'submit') return { method: 'click', conversationUrl: 'https://chatgpt.com/c/abc_123?model=private' };
+    if (request.operation === 'inspect') return { inspection: 'submitted', conversationUrl: 'https://chatgpt.com/c/abc_123?other=private' };
+    return undefined;
+  });
+  await browser.openFreshContext();
+  assert.deepEqual(await browser.submitPrompt('marker'), {
+    outcome: 'clicked', method: 'click', conversationUrl: 'https://chatgpt.com/c/abc_123',
+  });
+  assert.deepEqual(await browser.inspectSubmission('marker'), {
+    inspection: 'submitted', conversationUrl: 'https://chatgpt.com/c/abc_123', sampleCount: 1,
+  });
 });
 
 test('simultaneous jobs use separate browser sessions and close their own tabs', async () => {
