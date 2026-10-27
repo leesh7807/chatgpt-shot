@@ -48,6 +48,8 @@ class Browser {
   approvalChecks = 0;
   approvalError?: Error;
   conversationUrl?: string;
+  deferredConversationUrl?: string;
+  conversationUrlAtInspection?: number;
   observerStarts: Array<{ conversationUrl: string; jobId: string }> = [];
   observerChecks = 0;
   observerCloses = 0;
@@ -100,6 +102,9 @@ class Browser {
   async inspectSubmission(submissionMarker: string) {
     this.submissionMarkers.push(submissionMarker); this.inspections++;
     if (this.inspectError) throw this.inspectError;
+    if (this.deferredConversationUrl && this.conversationUrlAtInspection !== undefined && this.inspections >= this.conversationUrlAtInspection) {
+      this.conversationUrl = this.deferredConversationUrl;
+    }
     return this.conversationUrl ? { inspection: this.inspected, conversationUrl: this.conversationUrl } : this.inspected;
   }
   async close() { this.closes++; this.order.push('closed'); if (this.closeError) throw this.closeError; }
@@ -258,6 +263,24 @@ test('observes the accepted Job conversation independently until terminal Notion
   assert.ok(outcomes.includes('approval_observation_closed'));
   assert.equal(telemetry.events.find(item => item.event === 'accepted')?.state, 'in_progress');
   assert.equal(telemetry.events.find(item => item.event === 'terminal_observed')?.state, 'completed');
+});
+
+test('captures a conversation route that appears after the initial submission inspection', async () => {
+  const browser = new Browser();
+  browser.deferredConversationUrl = 'https://chatgpt.com/c/late_route_123';
+  browser.conversationUrlAtInspection = 2;
+  const telemetry = new Telemetry();
+  const store = new Store(['pending', 'pending', 'in_progress', 'completed'], 10);
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-late-conversation-route', { ...options, telemetry });
+
+  assert.equal(result.job.state, 'in_progress');
+  assert.ok(browser.inspections >= 2);
+  assert.deepEqual(browser.observerStarts, [{
+    conversationUrl: 'https://chatgpt.com/c/late_route_123',
+    jobId: 'job-late-conversation-route',
+  }]);
+  assert.ok(telemetry.events.some(event => event.event === 'browser_stage' && event.stage === 'conversation_identity' && event.outcome === 'captured'));
+  await result.completion;
 });
 
 test('stops a Job observer after Notion reports failed', async () => {

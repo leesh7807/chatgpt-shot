@@ -236,7 +236,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
     try {
       if (!invocation) return 'uncertain';
       const result = inspectionResult(await raceAdmission(browser.inspectSubmission(invocation.pageId.replace(/-/g, ''), { settleMs: 0 }), deadline, options.signal));
-      submittedConversationUrl = chatGptConversationIdentity(result.conversationUrl) ?? submittedConversationUrl;
+      rememberSubmittedConversation(result.conversationUrl);
       delivery = result.inspection;
       event('submission_inspected', {
         stage: inspectionStage,
@@ -257,6 +257,12 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
       event('submission_inspected', { stage: inspectionStage, inspection: 'uncertain', duration_ms: performance.now() - started, error: telemetryError(error) });
       return 'uncertain';
     }
+  };
+  const rememberSubmittedConversation = (candidate: unknown): void => {
+    const identity = chatGptConversationIdentity(candidate);
+    if (!identity || submittedConversationUrl || acceptedRemotely) return;
+    submittedConversationUrl = identity;
+    event('browser_stage', { stage: 'conversation_identity', outcome: 'captured' });
   };
   const cleanup = async (): Promise<void> => {
     if (!invocation || cleanedUp) return;
@@ -349,7 +355,7 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
         return await failUndelivered(submitResult.reason);
       }
       if (submitResult?.outcome === 'clicked') {
-        submittedConversationUrl = chatGptConversationIdentity(submitResult.conversationUrl) ?? submittedConversationUrl;
+        rememberSubmittedConversation(submitResult.conversationUrl);
       }
       if (submitResult) event('submit_action_returned', { stage, outcome: submitResult.outcome, details: { method: submitResult.method ?? 'click' } });
 
@@ -358,6 +364,30 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
       // UI evidence is diagnostic. Remote Notion state owns admission and is polled
       // even when the browser call or its evidence probe is uncertain.
       void inspect('post_submit', acknowledgementDeadline);
+      let conversationProbeRunning = false;
+      const probeSubmittedConversation = (): void => {
+        const currentInvocation = invocation;
+        if (!currentInvocation || submittedConversationUrl || acceptedRemotely || conversationProbeRunning) return;
+        conversationProbeRunning = true;
+        void (async () => {
+          try {
+            // ChatGPT can assign the concrete conversation route after the Send
+            // action and its first inspection. Sample it while Notion is still
+            // pending; this probe never delays the authoritative acceptance read.
+            const result = inspectionResult(await raceAdmission(
+              browser.inspectSubmission(currentInvocation.pageId.replace(/-/g, ''), { settleMs: 0 }),
+              acknowledgementDeadline,
+              options.signal,
+            ));
+            rememberSubmittedConversation(result.conversationUrl);
+          } catch {
+            // Conversation identity is optional evidence. Failure leaves the
+            // Notion-owned admission and terminal observation paths unchanged.
+          } finally {
+            conversationProbeRunning = false;
+          }
+        })();
+      };
       let lastObservationError: unknown;
       let transientReadFailures = 0;
       while (true) {
@@ -464,6 +494,9 @@ export async function startJob(store: NotionStore, databaseId: string, browser: 
             },
           });
         }
+        // Keep the identity read outside the approval action's browser RPC. It is
+        // background-only so the next Notion read and acceptance remain responsive.
+        probeSubmittedConversation();
         const afterReadMs = acknowledgementDeadline - performance.now();
         if (afterReadMs <= 0) break;
         await sleep(Math.min(pollMs, afterReadMs));
