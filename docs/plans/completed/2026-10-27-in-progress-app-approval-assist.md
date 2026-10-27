@@ -125,6 +125,7 @@ VR6. 실제 결과와 검토 가능한 증거
 - Private Chrome Broker/CDP의 대화 탭 관측, 신뢰된 마우스 입력 및 탭 종료 확인: 실제 카드 식별과 클릭 시도, 브라우저 세션 격리·정리 확인.
 - 승인 보조 telemetry 및 `--observe-approval`: Job별 버튼 선택·시도·불확실성, 탭 인덱스, 클릭 전후 화면 증거 확보. 이 기록은 원격 권위 상태를 대체하지 않는다.
 - 로컬 격리 실행 또는 `npm run smoke`가 허용되는 환경: 실제 Service/브라우저/Notion 연결의 대표 경로 확인.
+- `npm run smoke`의 격리는 XDG Service와 Chrome 프로필 등 로컬 런타임 경계에 한정한다. 복사된 `.env`의 Notion 자격정보·Invocation 데이터베이스와 수동 로그인한 ChatGPT 계정은 실제 외부 계정이므로, 범위와 남는 민감정보를 `docs/verification/smoke-isolation.md`에 명시한다.
 
 ## Planned Units
 

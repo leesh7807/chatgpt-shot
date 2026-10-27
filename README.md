@@ -93,7 +93,7 @@ For `NOTION_SCHEMA_INVALID` or configuration errors, check the configured databa
 | `doctor` / `doctor --browser` | Passive checks by default; `--browser` explicitly checks the private browser runtime and authentication, even when Notion configuration is unavailable. Neither mode opens visible Chrome or submits a Job. |
 | `start`, `status`, `port`, `stop` | Explicitly start, inspect, or stop the local Service. `submit` and `jobs` start it when needed. |
 
-The optional `npm run smoke` command is an end-to-end verification, not routine setup. It performs a real external submission and Job read using the repository's ignored `.env`. If manual authentication is needed, an interactive run asks before opening the isolated profile; an unattended run stops without opening a browser. See [smoke and runtime details](docs/technical-reference.md#sandbox-smoke).
+The optional `npm run smoke` command is an end-to-end verification, not routine setup. It isolates the local Service and Chrome profile, but performs a real external submission using the repository's ignored `.env` and configured Notion database. If manual authentication is needed, an interactive run asks before opening the isolated profile; an unattended run stops without opening a browser. Read the [smoke isolation boundary](docs/verification/smoke-isolation.md) before running it.
 
 For the authenticated loopback HTTP interface, detailed submission semantics, local diagnostics, and smoke cleanup behavior, see the [technical reference](docs/technical-reference.md).
 
