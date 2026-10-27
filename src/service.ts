@@ -81,7 +81,11 @@ class AppApprovalObservationManager {
       controller: new AbortController(), opening: Promise.resolve(), opened: false, stopped: false,
     };
     this.jobs.set(jobId, entry);
-    entry.opening = Promise.resolve().then(() => entry.browser.openAppApprovalObservation!(identity, jobId)).then(() => { entry.opened = true; });
+    entry.opening = Promise.resolve().then(async () => {
+      if (entry.stopped) return;
+      await entry.browser.openAppApprovalObservation!(identity, jobId);
+      entry.opened = true;
+    });
     entry.loop = this.run(entry);
   }
 
@@ -175,7 +179,11 @@ class AppApprovalObservationManager {
     entry.stopped = true;
     entry.controller.abort();
     entry.record({ stage: 'approval_observation', outcome: `approval_observation_${reason}` });
+    // Drain a bounded in-flight open before profile handoff; it may create the
+    // session only after stop was requested, so close it before returning.
+    await entry.opening.catch(() => {});
     await this.closeSession(entry);
+    await entry.loop;
   }
 
   async stopAll(reason: string): Promise<void> {

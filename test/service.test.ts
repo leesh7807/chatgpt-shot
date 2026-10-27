@@ -9,6 +9,7 @@ type Snapshot = { id: string; pageId: string; state: State; error: string };
 
 class Store {
   reads = 0;
+  onRead?: (count: number) => void;
   created: Snapshot[] = [];
   deleted: Array<{ pageId: string; id: string }> = [];
   stateWrites = 0;
@@ -23,6 +24,7 @@ class Store {
   async readInvocation(pageId: string, id: string): Promise<Snapshot> {
     if (this.readDelayMs) await new Promise(resolve => setTimeout(resolve, this.readDelayMs));
     this.reads++;
+    this.onRead?.(this.reads);
     const count = this.readCounts.get(pageId) ?? 0;
     this.readCounts.set(pageId, count + 1);
     return { id, pageId, state: this.states[Math.min(count, this.states.length - 1)] ?? 'pending', error: '' };
@@ -55,6 +57,7 @@ class Browser {
   observerCloses = 0;
   observerOpenError?: Error;
   observerOpenGate?: Promise<void>;
+  observerOpenEntered?: () => void;
   observerError?: Error;
   observerResponses: any[] = [];
   async requestAppApprovalAssist(observationSession = false): Promise<any> {
@@ -68,6 +71,7 @@ class Browser {
     return { status: 'click_reported' as const, attemptedChoice: 'always_allow' as const };
   }
   async openAppApprovalObservation(conversationUrl: string, jobId: string) {
+    this.observerOpenEntered?.();
     await this.observerOpenGate;
     this.order.push('observer_open');
     if (this.observerOpenError) throw this.observerOpenError;
@@ -339,10 +343,16 @@ test('a slow approval observer cannot delay UUID return or terminal Notion obser
   const browser = new Browser();
   browser.conversationUrl = 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb';
   browser.observerOpenGate = new Promise<void>(resolve => { releaseOpen = resolve; });
-  const result = await startJob(new Store(['in_progress', 'completed'], 2) as any, 'db', browser as any, 'task', 'job-slow-observer', options);
+  const store = new Store(['in_progress', 'completed'], 2);
+  let resolveTerminalRead!: () => void;
+  const terminalRead = new Promise<void>(resolve => { resolveTerminalRead = resolve; });
+  store.onRead = count => { if (count === 2) resolveTerminalRead(); };
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-slow-observer', options);
   assert.equal(result.job.state, 'in_progress');
-  await result.completion;
+  await terminalRead;
+  assert.equal(browser.observerCloses, 0);
   releaseOpen();
+  await result.completion;
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(browser.observerStarts.length, 1);
   assert.equal(browser.observerCloses, 1);
@@ -361,6 +371,33 @@ test('profile handoff stops approval observers without waiting for remote Job co
   store.states.push('completed');
   await result.completion;
   assert.equal(result.job.state, 'in_progress');
+});
+
+test('profile handoff drains a pending observer open and closes it before returning', async () => {
+  let releaseOpen!: () => void;
+  let signalOpenEntered!: () => void;
+  const openEntered = new Promise<void>(resolve => { signalOpenEntered = resolve; });
+  const browser = new Browser();
+  browser.conversationUrl = 'https://chatgpt.com/c/6ac9f22d-77c0-83ec-b2ad-9f3b91d2a5bb';
+  browser.observerOpenGate = new Promise<void>(resolve => { releaseOpen = resolve; });
+  browser.observerOpenEntered = signalOpenEntered;
+  const store = new Store(['in_progress']);
+  const result = await startJob(store as any, 'db', browser as any, 'task', 'job-pending-observer-open', options);
+  await openEntered;
+
+  let handoffCompleted = false;
+  const { stopAppApprovalObservations } = await import('../src/service.js');
+  const handoff = stopAppApprovalObservations('profile_handoff').then(() => { handoffCompleted = true; });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(handoffCompleted, false);
+
+  releaseOpen();
+  await handoff;
+  assert.equal(browser.observerStarts.length, 1);
+  assert.equal(browser.observerCloses, 1);
+  assert.ok(browser.order.indexOf('observer_closed') > browser.order.indexOf('observer_open'));
+  store.states.push('completed');
+  await result.completion;
 });
 
 test('only confirmed non-delivery permits Invocation cleanup', async () => {
