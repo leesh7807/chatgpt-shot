@@ -104,7 +104,8 @@ test('probe prefers Always allow and falls back to an enabled Allow once button'
 
 test('probe accepts the third ancestor when it contains one supported approval action group', () => {
   const actions = element('FORM', '', [element('BUTTON', 'Always allow'), element('BUTTON', 'Deny Esc')]);
-  const card = element('DIV', 'Allow ChatGPT to use Notion? ChatGPT will call its Update page tool.', [element('DIV', '', [actions])]);
+  const requestBranch = element('DIV', 'Allow ChatGPT to use Notion? ChatGPT will call its Update page tool.', [actions]);
+  const card = element('DIV', '', [requestBranch]);
   assert.deepEqual(withDom(card, () => appApprovalPageProbe()), {
     status: 'ready', choice: 'always_allow', target: { x: 50, y: 10 },
   });
@@ -147,9 +148,24 @@ test('probe rejects app text from a sibling approval card and ambiguous approval
   ]);
   assert.deepEqual(withDom(requestFromSibling, () => appApprovalPageProbe()), { status: 'not_present' });
 
-  const chrome = element('DIV', 'Allow ChatGPT to use Chrome?', [element('FORM', '', [
-    element('BUTTON', 'Allow once'), element('BUTTON', 'Deny Esc'),
+  const supportedPhraseBesideOtherApp = element('SECTION', '', [
+    element('DIV', 'Allow ChatGPT to use Notion?'),
+    element('FORM', 'Allow ChatGPT to use Calendar?', [
+      element('BUTTON', 'Always allow'), element('BUTTON', 'Deny'),
+    ]),
+  ]);
+  assert.deepEqual(withDom(supportedPhraseBesideOtherApp, () => appApprovalPageProbe()), { status: 'not_present' });
+
+  const mixedRequestsInOneBranch = element('DIV', '', [element('DIV', '', [
+    element('DIV', 'Allow ChatGPT to use Notion?'),
+    element('DIV', 'Allow ChatGPT to use Calendar?'),
+    element('FORM', '', [element('BUTTON', 'Always allow'), element('BUTTON', 'Deny')]),
   ])]);
+  assert.deepEqual(withDom(mixedRequestsInOneBranch, () => appApprovalPageProbe()), { status: 'not_present' });
+
+  const chrome = element('DIV', '', [element('DIV', 'Allow ChatGPT to use Chrome?', [element('FORM', '', [
+    element('BUTTON', 'Allow once'), element('BUTTON', 'Deny Esc'),
+  ])])]);
   assert.deepEqual(withDom(element('DIV', '', [notion, chrome]), () => appApprovalPageProbe()), { status: 'not_present' });
 
   const unrelated = element('DIV', 'Notion is available in this conversation.', [element('FORM', '', [
@@ -157,9 +173,9 @@ test('probe rejects app text from a sibling approval card and ambiguous approval
   ])]);
   assert.deepEqual(withDom(unrelated, () => appApprovalPageProbe()), { status: 'not_present' });
 
-  const plainAllow = element('DIV', 'Allow ChatGPT to use Notion?', [element('FORM', '', [
+  const plainAllow = element('DIV', '', [element('DIV', 'Allow ChatGPT to use Notion?', [element('FORM', '', [
     element('BUTTON', 'Allow'), element('BUTTON', 'Deny'),
-  ])]);
+  ])])]);
   assert.deepEqual(withDom(plainAllow, () => appApprovalPageProbe()), { status: 'ready', choice: 'allow', target: { x: 50, y: 10 } });
 });
 

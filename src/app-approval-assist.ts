@@ -107,28 +107,14 @@ export function appApprovalPageProbe(): Probe {
     while (branch.parentElement && branch.parentElement !== root) branch = branch.parentElement;
     return branch === root ? undefined : branch;
   }
-  function ownText(element: Element): string {
-    const children = (element as any).childNodes;
-    if (!children) return normalize((element as any).ownText || '');
-    return normalize([...children].filter((node: any) => node.nodeType === 3).map((node: any) => node.textContent || '').join(' '));
-  }
-  function isExplicitCardScope(element: Element): boolean {
-    const tag = element.tagName.toLocaleLowerCase();
-    const role = element.getAttribute('role')?.toLocaleLowerCase();
-    const label = normalize(element.getAttribute('aria-label') || '');
-    const testId = normalize(element.getAttribute('data-testid') || '');
-    return ['article', 'section', 'li', 'dialog'].includes(tag)
-      || role === 'dialog' || role === 'group'
-      || /\b(?:approval|permission|tool|app)\b/.test(label)
-      || /\b(?:approval|permission|tool|app)[-_ ]?(?:card|request|dialog)\b/.test(testId);
-  }
   function describesSupportedRequest(text: string): boolean {
     const value = normalize(text);
-    const hasNotion = /\bnotion\b/.test(value);
-    const hasChrome = /\bchrome\b/.test(value);
-    if (hasNotion === hasChrome) return false;
-    return /\ballow\s+chatgpt\b.{0,60}\b(?:to use|access)\b/.test(value)
-      || /\bchatgpt\b.{0,80}\b(?:will call|wants? to use|requests? (?:access|permission))\b/.test(value);
+    const targets = new Set<string>();
+    for (const match of value.matchAll(/\ballow\s+chatgpt\b.{0,60}?\b(?:to use|access(?:\s+to)?)\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) targets.add(match[1]);
+    for (const match of value.matchAll(/\bchatgpt\b.{0,80}?\bwants? to use\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) targets.add(match[1]);
+    for (const match of value.matchAll(/\bchatgpt\b.{0,80}?\brequests? (?:access|permission)(?:\s+to\s+(?:use|access))?\s+(?:the\s+)?([a-z][a-z0-9_-]*)\b/g)) targets.add(match[1]);
+    for (const match of value.matchAll(/\bchatgpt\b.{0,80}?\bwill call\s+(notion|chrome)\b/g)) targets.add(match[1]);
+    return targets.size === 1 && ['notion', 'chrome'].includes([...targets][0]);
   }
   function actionGroups(root: Element): Element[] {
     const groups = new Set<Element>();
@@ -149,12 +135,10 @@ export function appApprovalPageProbe(): Probe {
       const hasChrome = /\bchrome\b/.test(text);
       if (hasNotion === hasChrome) continue;
       const branch = directBranch(parent, group);
-      const requestIsStructurallyRelated = describesSupportedRequest(ownText(parent))
-        || (branch !== undefined && describesSupportedRequest((branch as HTMLElement).innerText || branch.textContent || ''))
-        || (isExplicitCardScope(parent) && [...parent.querySelectorAll('*')]
-          .filter(child => child !== branch)
-          .some(child => describesSupportedRequest((child as HTMLElement).innerText || child.textContent || '')));
-      if (!requestIsStructurallyRelated) continue;
+      // App identity and request wording must live in the same child branch as
+      // this action group. Text in a sibling section or broad card ancestor
+      // cannot authorize a generic Allow button for another app.
+      if (!branch || !describesSupportedRequest((branch as HTMLElement).innerText || branch.textContent || '')) continue;
       const groups = actionGroups(parent);
       if (groups.length === 1 && groups[0] === group) return parent;
     }
